@@ -1,0 +1,2 @@
+--require-hashes
+https://github.com/cleocn/agent-workboard/releases/download/v0.1.0/agent_workboard-0.1.0-py3-none-any.whl#egg=agent-workboard --hash=sha256:9554dd41654ffa5bb809e15373ca287b7df96aeeaaefb94b87badd9235208786

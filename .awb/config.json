@@ -1,0 +1,11 @@
+{
+  "configVersion": 1,
+  "database": ".awb/workboard.db",
+  "projectId": "project-d7d298a45bee469596327629054687bd",
+  "repositoryKey": "agent-workboard-public",
+  "requiredPackageVersion": "0.1.0",
+  "requiredSourceCommit": "133365c0cd7583f2cadf21f10dcc82d9fc7bba7f",
+  "requiredSourceTag": "v0.1.0",
+  "requiredSourceTree": "e142182c64845fb64e09814e5fcb85b693a21d2c",
+  "runtimeMode": "stable"
+}
