@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 import sys
@@ -7,38 +6,38 @@ import unittest
 
 
 class ReleaseGateTest(unittest.TestCase):
-    def test_export_root_has_no_parent_and_rejected_only_blob_is_unreachable(self):
-        with tempfile.TemporaryDirectory() as root:
-            source = os.path.join(root, "source")
-            os.mkdir(source)
-            with open(os.path.join(source, "approved.txt"), "w", encoding="utf-8") as handle:
-                handle.write("approved tree")
-            subprocess.check_call(["git", "init"], cwd=source)
-            subprocess.check_call(["git", "add", "approved.txt"], cwd=source)
-            subprocess.check_call(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
-                                   "commit", "-m", "private source"], cwd=source)
-            with open(os.path.join(source, "ignored-private.txt"), "w", encoding="utf-8") as handle:
-                handle.write("/" + "Users/private/rejected-only fixture")
-            rejected = subprocess.check_output(["git", "hash-object", "-w", "--stdin"], cwd=source,
-                                               input=b"rejected-only fixture").decode("ascii").strip()
-            output = os.path.join(root, "public-root")
+    def _git(self, repository, *args):
+        return subprocess.check_output(["git"] + list(args), cwd=repository).decode("ascii").strip()
+
+    def test_release_gate_requires_allowlisted_direct_public_successor(self):
+        with tempfile.TemporaryDirectory() as repository:
+            subprocess.check_call(["git", "init"], cwd=repository, stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "config", "user.name", "test"], cwd=repository)
+            subprocess.check_call(["git", "config", "user.email", "test@example.invalid"], cwd=repository)
+            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
+                handle.write("0.1.0\n")
+            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
+            subprocess.check_call(["git", "commit", "-m", "v0.1.0"], cwd=repository, stdout=subprocess.DEVNULL)
+            v01 = self._git(repository, "rev-parse", "HEAD")
+            subprocess.check_call(["git", "tag", "v0.1.0"], cwd=repository)
+            with open(os.path.join(repository, "stable.txt"), "w", encoding="utf-8") as handle:
+                handle.write("stable self-hosting\n")
+            subprocess.check_call(["git", "add", "--", "stable.txt"], cwd=repository)
+            subprocess.check_call(["git", "commit", "-m", "stable"], cwd=repository, stdout=subprocess.DEVNULL)
+            base = self._git(repository, "rev-parse", "HEAD")
+            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
+                handle.write("0.2.0\n")
+            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
+            subprocess.check_call(["git", "commit", "-m", "v0.2.0"], cwd=repository, stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "tag", "v0.2.0"], cwd=repository)
             script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools", "release_gate.py")
-            encoded = subprocess.check_output([sys.executable, script, "export-root", "--tree", source,
-                                                "--output", output])
-            manifest = json.loads(encoded.decode("utf-8"))
-            self.assertEqual(["refs/heads/main"], manifest["refs"])
-            self.assertTrue(manifest["objects"])
-            for item in manifest["objects"]:
-                self.assertIn(item["type"], ("blob", "commit", "tree", "tag"))
-                self.assertEqual(64, len(item["sha256"]))
-                self.assertIsInstance(item["size"], int)
-            parent_count = subprocess.check_output(["git", "rev-list", "--parents", "-n", "1", "HEAD"],
-                                                   cwd=output).split()
-            reachable = subprocess.check_output(["git", "rev-list", "--objects", "--all"], cwd=output)
-            self.assertEqual(1, len(parent_count))
-            self.assertNotIn(rejected.encode("ascii"), reachable)
-            self.assertFalse(os.path.exists(os.path.join(output, "ignored-private.txt")))
-            self.assertEqual(b"", subprocess.check_output(["git", "status", "--porcelain"], cwd=output))
+            subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
+                                   "--base", base, "--v0.1-commit", v01, "--path", "release.txt"],
+                                  stdout=subprocess.DEVNULL)
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
+                                       "--base", base, "--v0.1-commit", v01, "--path", "stable.txt"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

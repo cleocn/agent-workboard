@@ -1,12 +1,36 @@
 {
   "files": [
     {
+      "path": ".codex/agents/convergence-reviewer.toml",
+      "sha256": "f17658e090ef2fef3e0e323db4ca1d3f9c1bda7c32ef9f82c52023e57a275e65"
+    },
+    {
+      "path": ".codex/agents/fast-worker.toml",
+      "sha256": "d1773ed6243fc2402bd6ef41651a3bbf17654d95c2ebc1a9ab7c8640bfacf651"
+    },
+    {
+      "path": ".codex/agents/implementer.toml",
+      "sha256": "b9545e2ebccab2ba360a16871ffa70725cadb1aa92facf9ff246f484fe7724d9"
+    },
+    {
+      "path": ".codex/agents/planner.toml",
+      "sha256": "6240af995fe8ff13ff7b4aea02c8b0dde974dd9a6eb88c0a155666ffd7b9593a"
+    },
+    {
+      "path": ".codex/agents/reviewer.toml",
+      "sha256": "8e8f36e45c6ef756943656fdab1c71b38f9df31a5df3139610d1eee453d2aa15"
+    },
+    {
+      "path": ".codex/skills/awb-orchestrator/SKILL.md",
+      "sha256": "cd2b4a784a318b341bb4e70239b45800b04021cb634e46ba1a1d06500fd0d9ff"
+    },
+    {
       "path": ".gitignore",
-      "sha256": "75e59181f1b4b019d8feebe695862dc2af473b478ce87b60512d6cd884088015"
+      "sha256": "1dbd6f30eb65492d2a9c3dd6b98ef9181bb76a297f41c1acf5050009564681d2"
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "f5dcc045d9c046264e7a5287f2641f8ab3946d98af334e3cc68f58a57b0c71fd"
+      "sha256": "aec442b048477f25c96469e7dc2d4662e65ceebe4bbb2a46e5488cbd583351f5"
     },
     {
       "path": "CONTRIBUTING.md",
@@ -18,15 +42,11 @@
     },
     {
       "path": "README.md",
-      "sha256": "cf8e805cd4bc3b5dcf6412c85d29e3ab005913a04e892b2556b10dbbe0b051ca"
+      "sha256": "82b31283f6f4e0530c586a3ab8f3a33e894c260d52fa78f652927c7e0fd04772"
     },
     {
-      "path": "pyproject.toml",
-      "sha256": "cebba9645edcff207badd511fc6bc2492e3971d91422d964b9812306f2dfda50"
-    },
-    {
-      "path": "setup.py",
-      "sha256": "f5dfbd5b284f7933f5a7aa5735f7930c68fdf94eb61d3b872dda6737050fa969"
+      "path": "docs/evidence/awb-004-release.md",
+      "sha256": "c6506928cf4ea701eb31c6acf6fd9ed9aba8a87b41627db3f291cad6e0937a9f"
     },
     {
       "path": "docs/history.md",
@@ -34,15 +54,51 @@
     },
     {
       "path": "docs/publication-plan.md",
-      "sha256": "f24a96893bd38a07524db272bda7e1970406bfde45edf2e0bd433a16e78e8b29"
+      "sha256": "83cf25a25db64ed071a8c69908e200bf719774e36bba7ee10dbdf3296bbcc17e"
     },
     {
       "path": "docs/usage/quickstart.md",
-      "sha256": "fa741928355a50fb65f2fe6cd46b98a14a3a7874be17aae4e5f58c4d98c68e1c"
+      "sha256": "dbdc5738114a98c745a93d97c653548bc43eee69c265efcf6cf0d580e5519ce2"
+    },
+    {
+      "path": "docs/work-item-templates/README.md",
+      "sha256": "ac1c7db7a075d19011cfb9e22dd6b292aaaa4a84151e8bc54beeb3686f3eb980"
+    },
+    {
+      "path": "docs/work-item-templates/awb-template.md",
+      "sha256": "d89598b2e66f61423dd0bed44cab89e495c2444c5e64e7ef99d8b26a794c179f"
+    },
+    {
+      "path": "docs/work-item-templates/fe-template.md",
+      "sha256": "a2756a7ab6267f396a73bad62938384e836594ea0c55da1455df22600e2631dd"
+    },
+    {
+      "path": "docs/work-item-templates/remediation-plan-template.md",
+      "sha256": "dcd193ac4e3ece3794b1d4f51bdbbc245ac8546c1d98287f84360de3831e45a3"
+    },
+    {
+      "path": "docs/work-item-templates/test-issue-template.md",
+      "sha256": "b817f1874c8f56497e0d53ce49f93475fd71fa6541be032ff6fafd248a32e3d4"
+    },
+    {
+      "path": "docs/work-item-templates/test-issue-trigger-rules.md",
+      "sha256": "3fa4da310fa46dcf40fa518f2b1115ff1181c26982df06848934674ae5f93068"
+    },
+    {
+      "path": "docs/work-item-templates/wa-template.md",
+      "sha256": "e6ae0214e15b6c71dc00f5d8ce5f488c7a27985fd0c142067f2bb96229d77d16"
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "cebba9645edcff207badd511fc6bc2492e3971d91422d964b9812306f2dfda50"
+    },
+    {
+      "path": "setup.py",
+      "sha256": "36bcb7008761f3e3ef30ab02200207d3f9fde8d4b46656bf764b8c3d30431fc1"
     },
     {
       "path": "src/agent_workboard/__init__.py",
-      "sha256": "088a4bba871d83dcb05aa9ff655fe4325067b2782bb6a6bb0de654bb365a6ce6"
+      "sha256": "f3c2853f29c878ace6fddbc970b42666115d0eaa1384b2b490bc90d72b168e25"
     },
     {
       "path": "src/agent_workboard/__main__.py",
@@ -50,19 +106,23 @@
     },
     {
       "path": "src/agent_workboard/_build.py",
-      "sha256": "d50c1f0de580d933fcaf63edd8a00eaaae3e75d38ad8c304724ff2b982daaa7e"
+      "sha256": "16d1031c5ad134b9aee750f4a7ac10482b21dae5abd6268f9cbfa7f64b0e6045"
     },
     {
       "path": "src/agent_workboard/cli.py",
-      "sha256": "425f9f93e8debc5f5b756788f970e15e5ac8c084d054e8cc5062a6a5b2459032"
+      "sha256": "7d29b2c8f6cf88cb896fda02c55b869b3265725fd496b296c276b9d72f89061a"
     },
     {
       "path": "src/agent_workboard/lite.py",
-      "sha256": "84baa311cb6743b359bc14461212e4cec299474df593e37d6b00d620da8d54aa"
+      "sha256": "99e6825bdb832dbe2e3da4ec3f641bec71b6045471fca15f6a527b4ddafd4a24"
     },
     {
       "path": "src/agent_workboard/project.py",
-      "sha256": "31846982c93c84a117be387fdf39f291fcefcccda140c2e656fb60261642d72d"
+      "sha256": "8a391ca10e8f5abc4df9798490713362070e7be194c7b0bbc7e7699f034d9d41"
+    },
+    {
+      "path": "src/agent_workboard/resources/codex/agents/convergence-reviewer.toml",
+      "sha256": "f17658e090ef2fef3e0e323db4ca1d3f9c1bda7c32ef9f82c52023e57a275e65"
     },
     {
       "path": "src/agent_workboard/resources/codex/agents/fast-worker.toml",
@@ -70,31 +130,31 @@
     },
     {
       "path": "src/agent_workboard/resources/codex/agents/implementer.toml",
-      "sha256": "8dfb65a36a0a7f7c4afe1f4ab9212739136d642923235f557536066ac37aac66"
+      "sha256": "b9545e2ebccab2ba360a16871ffa70725cadb1aa92facf9ff246f484fe7724d9"
     },
     {
       "path": "src/agent_workboard/resources/codex/agents/planner.toml",
-      "sha256": "69d9ba084dd01b5bb774fb1979c9f95d2e2ad9747096ad237e4fc299ddec553b"
+      "sha256": "6240af995fe8ff13ff7b4aea02c8b0dde974dd9a6eb88c0a155666ffd7b9593a"
     },
     {
       "path": "src/agent_workboard/resources/codex/agents/reviewer.toml",
-      "sha256": "e16a42144918cc63102e5d1889c474b8feae6c87ba1ee138c46788e13bae9c40"
+      "sha256": "8e8f36e45c6ef756943656fdab1c71b38f9df31a5df3139610d1eee453d2aa15"
     },
     {
       "path": "src/agent_workboard/resources/codex/skills/awb-orchestrator/SKILL.md",
-      "sha256": "c4b8273a5c7725de780cdd03b8f754018261e3a6703dada75ca1c14932a90d58"
+      "sha256": "cd2b4a784a318b341bb4e70239b45800b04021cb634e46ba1a1d06500fd0d9ff"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/AGENT-GUIDE.md",
-      "sha256": "aa2b9d80ca3520b4ada7b918d8d82049c4fd652e6f17ead578f0dd69dcc34585"
+      "sha256": "f4f922d4471595410b8d1b9bca0b903586c632a4ca8bd23ffa2a2d446afd4107"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/acceptance-cases.yaml",
-      "sha256": "8911a8de543db7ab25adb300e9c05a5666796d0d4fcc29c071cfbc45f90b03d7"
+      "sha256": "e5f68bfe0e8fe4b91bd2445b6a93af1843d0301d2942a8a9332a3b144d8c8657"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/manifest.json",
-      "sha256": "39c95caff847312e75f025cb545287ef888fb19a861e8be09665992478898cbc"
+      "sha256": "5cf336cdbca08a68865c6dc44c36ee81833d7da372ed967866d6ae4f927ac61d"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/schema.sql",
@@ -102,11 +162,11 @@
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/workflow.yaml",
-      "sha256": "77977e93552ac7a8a78b271a34836722db68d5214e0bee6b5391a9e9515437dd"
+      "sha256": "c3c507a8b364f31cb0f64a5b281a7fe78334c5a76b07468f8e1306d552d3e547"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/workitem.schema.json",
-      "sha256": "b73e5f09e950a21113c62e8904f92548cfb3620fe8c1b26aef4c2bc06290993f"
+      "sha256": "6d2499647da3577173ff6c930b5197bc03a191fdb7d40695d88c840e3be38e24"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_original/AGENT-GUIDE.md",
@@ -133,27 +193,31 @@
       "sha256": "b73e5f09e950a21113c62e8904f92548cfb3620fe8c1b26aef4c2bc06290993f"
     },
     {
-      "path": "tests/test_lite.py",
-      "sha256": "f2a39aac6bd1504ea8b04482bf75f1437cd578ab0504374441d96761924e5426"
-    },
-    {
-      "path": "tests/test_project.py",
-      "sha256": "18ec34cf56e4983755ba6a3f49be39db4b52b7a6b3a1b017983d3ef0d13c9247"
-    },
-    {
-      "path": "tests/test_release_gate.py",
-      "sha256": "879623e4b364a90ad982b17301f13fc7c9a6f8298409d1c0942f253df20b3044"
-    },
-    {
       "path": "tests/fixtures/requirements-local-wheel.txt",
       "sha256": "33ebce6a9982a867094d21a72e9a3730c29d0f8115c70fd59f3647ec9da16c5c"
     },
     {
+      "path": "tests/test_lite.py",
+      "sha256": "54142aafb1ee71122b5ba5fba2317ec007460c3554a14a5ccc4c42f7cd3a22a2"
+    },
+    {
+      "path": "tests/test_project.py",
+      "sha256": "3774f0a983e0b4a73e5534d7d1be322e43b58a67f32da7977fafe3ec6a72b20e"
+    },
+    {
+      "path": "tests/test_release_build.py",
+      "sha256": "ea2536a5cb2657481e9ab13076552fb4379ec68e27fd667e3485612f6d303d85"
+    },
+    {
+      "path": "tests/test_release_gate.py",
+      "sha256": "1272ef2a55587d3ddf46afbc496329ecfcdb0a29b2a56809078b0389c4f12605"
+    },
+    {
       "path": "tools/release_gate.py",
-      "sha256": "2397c2aad13912911124d9df2e0ad4923bea19a21154ac7a34147454a8080d97"
+      "sha256": "6b34d4683a2530824a5a8ab7cbd5f52236d9b04bb8036cefaf92d97eb4adc9f8"
     }
   ],
-  "manifestVersion": "AWB-004-public-v1",
-  "scope": "public source files; root manifest excluded to avoid recursive hash",
-  "status": "PUBLIC RELEASE TREE"
+  "manifestVersion": "AWB-004-public-v2",
+  "scope": "tracked public source files excluding .awb consumer state and this non-recursive manifest",
+  "status": "AGENT WORKBOARD 0.2.0 RELEASE TREE"
 }

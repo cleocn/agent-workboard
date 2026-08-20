@@ -1,34 +1,36 @@
-version: MVP-LITE-v1.1
-owner: AWB-001
+version: AWB-005-v1
+owner: AWB-005
+managementContract: AWB-WORKITEM-MGMT-v1
+templateContract: AWB-MANAGEMENT-v1
 cases:
-  - {id: LITE-AC-001, priority: P0, title: clean SQLite 初始化成功且重复初始化拒绝}
-  - {id: LITE-AC-002, priority: P0, title: TI 创建时同步创建同 ID WorkItem}
-  - {id: LITE-AC-003, priority: P0, title: FE 创建时同步创建同 ID WorkItem}
-  - {id: LITE-AC-004, priority: P0, title: R 创建时同步创建同 ID WorkItem}
-  - {id: LITE-AC-005, priority: P0, title: WA 创建时同步创建同 ID WorkItem}
-  - {id: LITE-AC-006, priority: P0, title: 内部任务不会成为顶层看板卡}
-  - {id: LITE-AC-007, priority: P0, title: P0 到 P3 优先级稳定排序}
-  - {id: LITE-AC-008, priority: P0, title: 同一 WorkItem 并发认领仅一个成功}
-  - {id: LITE-AC-009, priority: P0, title: 认领租约过期后 generation 单调递增}
-  - {id: LITE-AC-010, priority: P0, title: 同一仓库同时只有一个活动写锁}
-  - {id: LITE-AC-011, priority: P0, title: HELD 项不可自动认领}
-  - {id: LITE-AC-012, priority: P0, title: 每个非终态都可搁置并恢复}
-  - {id: LITE-AC-013, priority: P0, title: BLOCKED 项不可自动认领}
-  - {id: LITE-AC-014, priority: P0, title: 规划提交后进入待规划复审}
-  - {id: LITE-AC-015, priority: P0, title: 规划 Agent 驳回返回草稿}
-  - {id: LITE-AC-016, priority: P0, title: 规划 Agent 不能自审}
-  - {id: LITE-AC-017, priority: P0, title: STANDARD 规划 Agent 通过后等待人工}
-  - {id: LITE-AC-018, priority: P0, title: 人工规划批准后进入规划复审通过}
-  - {id: LITE-AC-019, priority: P0, title: 人工规划驳回返回草稿}
-  - {id: LITE-AC-020, priority: P0, title: 未经规划批准不能开始实施}
-  - {id: LITE-AC-021, priority: P0, title: 实施提交要求实施任务完成}
-  - {id: LITE-AC-022, priority: P0, title: 实施提交要求本地测试通过}
-  - {id: LITE-AC-023, priority: P0, title: 实施提交后进入实施完成}
-  - {id: LITE-AC-024, priority: P0, title: 最终 Agent 驳回返回实施中}
-  - {id: LITE-AC-025, priority: P0, title: 最终 Agent 不能自审}
-  - {id: LITE-AC-026, priority: P0, title: STANDARD 最终 Agent 通过后等待人工}
-  - {id: LITE-AC-027, priority: P0, title: 人工最终驳回返回实施中}
-  - {id: LITE-AC-028, priority: P0, title: 人工最终批准原子进入最终验收通过并搁置}
-  - {id: LITE-AC-029, priority: P1, title: READ_ONLY_DIAGNOSIS 按目标停止且不创建实施任务}
-  - {id: LITE-AC-030, priority: P1, title: STANDARD 仅通过公开接口完成端到端主路径}
-  - {id: LITE-AC-031, priority: P0, title: 提交时持有 claim，先释放 writer lock，transition 原子释放 claim}
+  - {id: AWB-005-AC-001, priority: P0, title: 五类型 create 原子写入完整 management envelope 和 T01+ tasks}
+  - {id: AWB-005-AC-002, priority: P0, title: schema 与 runtime 覆盖统一管理字段}
+  - {id: AWB-005-AC-003, priority: P0, title: 双层状态、合法 task 边和单 IN_PROGRESS 被强制}
+  - {id: AWB-005-AC-004, priority: P0, title: task 编号、owner、acceptance 和 evidence 契约稳定}
+  - {id: AWB-005-AC-005, priority: P0, title: progress、currentTask 和唯一 nextStep 可重算}
+  - {id: AWB-005-AC-006, priority: P0, title: show timeline HTTP board 投影一致且写入原子}
+  - {id: AWB-005-AC-007, priority: P0, title: management amendment 追加 delta 和人工授权}
+  - {id: AWB-005-AC-008, priority: P0, title: 历史读取兼容且实质工作前必须 backfill}
+  - {id: AWB-005-AC-009, priority: P0, title: 阻塞验收完成取消缺证据时拒绝}
+  - {id: AWB-005-AC-010, priority: P0, title: 最终 closure 要求 tasks acceptance review 和 Finding 闭环}
+  - {id: AWB-005-AC-011, priority: P0, title: TI FE R WA AWB 共享模型且模式兼容}
+  - {id: AWB-005-AC-012, priority: P0, title: 只有非阻断建议的两阶段复审必须 PASS}
+  - {id: AWB-005-AC-013, priority: P0, title: 不完整无证据 Finding 不驱动修改}
+  - {id: AWB-005-AC-014, priority: P0, title: 返工和复杂度只能追溯开放 Finding 或 acceptance}
+  - {id: AWB-005-AC-015, priority: P0, title: 封闭复审禁止无新证据重开或新增 Finding}
+  - {id: AWB-005-AC-016, priority: P0, title: 第三轮 REVISE 冻结并路由唯一 convergence review}
+  - {id: AWB-005-AC-017, priority: P0, title: convergence 结果和职责范围受限}
+  - {id: AWB-005-AC-018, priority: P0, title: convergence 仅授权一次最小返工且第五轮后停机}
+  - {id: AWB-005-AC-019, priority: P0, title: 第四五轮 PASS REVISE WAITING_HUMAN BLOCKED 路径覆盖}
+  - {id: AWB-005-AC-020, priority: P0, title: PLAN 与 IMPLEMENTATION 轮次分别累计}
+  - {id: AWB-005-AC-021, priority: P0, title: Reviewer claim 重提偏差人工退回均不重置计数}
+  - {id: AWB-005-AC-022, priority: P0, title: convergence Agent 安装检查且不引入 RunnerAuthority}
+  - {id: AWB-005-AC-023, priority: P0, title: 规划扩项人工裁决且实施偏差返回 Planner}
+  - {id: AWB-005-AC-024, priority: P0, title: 实施质量棘轮拒绝弱化测试和回归}
+  - {id: AWB-005-AC-025, priority: P0, title: 全结果路径和人工分歧材料可核验}
+  - {id: AWB-005-AC-026, priority: P0, title: STANDARD READ_ONLY gates claim writer author review HTTP 主路径不回归}
+  - {id: AWB-005-AC-027, priority: P0, title: 七个正式模板存在且五类型路由唯一}
+  - {id: AWB-005-AC-028, priority: P0, title: 模板必备输入只用 T01+ 且 emoji 不是状态枚举}
+  - {id: AWB-005-AC-029, priority: P0, title: FE 默认任务进度且显式冻结权重严格校验}
+  - {id: AWB-005-AC-030, priority: P0, title: TI WA R 业务语义和授权不越权}
+  - {id: AWB-005-AC-031, priority: P0, title: 模板 schema runtime workflow guide Agent 和测试版本同步}

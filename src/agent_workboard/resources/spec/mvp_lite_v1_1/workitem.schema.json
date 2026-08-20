@@ -1,24 +1,70 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent-workboard/mvp-lite-v1/workitem",
-  "title": "Agent Workboard MVP-LITE WorkItem",
+  "$id": "agent-workboard/mvp-lite-v1.1/workitem",
+  "title": "Agent Workboard WorkItem with AWB-WORKITEM-MGMT-v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["workItemId", "type", "title", "mode", "priority"],
+  "required": ["workItemId", "type", "title", "mode", "priority", "management"],
   "properties": {
     "workItemId": {"type": "string", "pattern": "^(TI|FE|R|WA|AWB)-[A-Za-z0-9-]+$", "maxLength": 80},
     "type": {"enum": ["TI", "FE", "R", "WA", "AWB"]},
     "title": {"type": "string", "minLength": 1, "maxLength": 200},
     "mode": {"enum": ["STANDARD", "READ_ONLY_DIAGNOSIS"]},
     "priority": {"enum": ["P0", "P1", "P2", "P3"]},
+    "management": {"$ref": "#/$defs/management"},
     "target": {"enum": ["PLAN_REVIEW_PENDING", "PLAN_REVIEW_APPROVED", "IMPLEMENTATION_COMPLETED", "FINAL_ACCEPTANCE_APPROVED"]},
     "modelOverrides": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "properties": {
         "PLANNER": {"enum": ["balanced", "frontier"]},
         "IMPLEMENTER": {"enum": ["balanced", "frontier"]},
         "REVIEWER": {"enum": ["balanced", "frontier"]}
+      }
+    }
+  },
+  "$defs": {
+    "nonEmptyStrings": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "criterion": {
+      "type": "object", "additionalProperties": false, "required": ["id", "criterion"],
+      "properties": {"id": {"type": "string", "minLength": 1}, "criterion": {"type": "string", "minLength": 1}}
+    },
+    "task": {
+      "type": "object", "additionalProperties": false,
+      "required": ["taskId", "seq", "title", "ownerRole", "required", "acceptance", "closureEvidenceRequired"],
+      "properties": {
+        "taskId": {"type": "string", "pattern": "^(TI|FE|R|WA|AWB)-[A-Za-z0-9-]+-T[0-9]{2,}$"},
+        "seq": {"type": "integer", "minimum": 1},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "ownerRole": {"enum": ["PLANNER", "IMPLEMENTER", "REVIEWER"]},
+        "required": {"type": "boolean"},
+        "status": {"enum": ["NOT_STARTED", "IN_PROGRESS", "BLOCKED", "WAITING_ACCEPTANCE", "COMPLETED", "CANCELLED"]},
+        "acceptance": {"$ref": "#/$defs/nonEmptyStrings"},
+        "closureEvidenceRequired": {"$ref": "#/$defs/nonEmptyStrings"}
+      }
+    },
+    "management": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "templateContractVersion", "scope", "outOfScope", "authorization", "safetyConstraints", "tasks", "acceptance", "closure"],
+      "properties": {
+        "contractVersion": {"const": "AWB-WORKITEM-MGMT-v1"},
+        "templateContractVersion": {"const": "AWB-MANAGEMENT-v1"},
+        "scope": {"$ref": "#/$defs/nonEmptyStrings"},
+        "outOfScope": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "authorization": {
+          "type": "object", "additionalProperties": false, "required": ["allowed", "forbidden"],
+          "properties": {"allowed": {"$ref": "#/$defs/nonEmptyStrings"}, "forbidden": {"$ref": "#/$defs/nonEmptyStrings"}}
+        },
+        "safetyConstraints": {"$ref": "#/$defs/nonEmptyStrings"},
+        "tasks": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/task"}},
+        "acceptance": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/criterion"}},
+        "closure": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/criterion"}},
+        "progressMethod": {"enum": ["REQUIRED_TASKS", "WEIGHTED"]},
+        "stages": {
+          "type": "array", "items": {
+            "type": "object", "additionalProperties": false, "required": ["id", "weight"],
+            "properties": {"id": {"type": "string", "minLength": 1}, "weight": {"type": "integer", "minimum": 1, "maximum": 100}, "completion": {"type": "integer", "minimum": 0, "maximum": 100}}
+          }
+        }
       }
     }
   }

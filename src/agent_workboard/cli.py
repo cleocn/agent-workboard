@@ -8,7 +8,8 @@ import sys
 from . import __version__
 from . import lite
 from .project import (backup, bootstrap, codex_check, codex_install, doctor,
-                      init_project, migrate, transfer_export, transfer_import)
+                      init_project, migrate, transfer_export, transfer_import,
+                      upgrade_project)
 
 
 def _print(value):
@@ -61,6 +62,10 @@ def main(argv=None):
     migration = sub.add_parser("migrate")
     migration.add_argument("--project", default=".")
     migration.add_argument("--check", action="store_true")
+    upgrade = sub.add_parser("upgrade")
+    upgrade.add_argument("--project", default=".")
+    upgrade.add_argument("--wheel", required=True)
+    upgrade.add_argument("--with-codex", action="store_true")
     codex = sub.add_parser("codex")
     codex_sub = codex.add_subparsers(dest="codex_command", required=True)
     for name in ("install", "check"):
@@ -99,6 +104,8 @@ def main(argv=None):
             _print(backup(args.project))
         elif args.command == "migrate":
             _print(migrate(args.project, args.check))
+        elif args.command == "upgrade":
+            _print(upgrade_project(args.project, args.wheel, args.with_codex))
         elif args.command == "codex":
             _print(codex_install(args.project) if args.codex_command == "install" else codex_check(args.project))
         elif args.command == "transfer":

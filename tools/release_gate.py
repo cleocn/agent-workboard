@@ -1,13 +1,11 @@
-"""Offline AWB-004 release-root constructor and reachable-object scanner."""
+"""Offline public-lineage and reachable-object release gate."""
 
 import argparse
 import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
-import tempfile
 
 
 FORBIDDEN_CONTENT = (
@@ -20,32 +18,8 @@ def run(cwd, *args):
     return subprocess.check_output(["git"] + list(args), cwd=cwd).decode("utf-8")
 
 
-def run_bytes(cwd, *args):
-    return subprocess.check_output(["git"] + list(args), cwd=cwd)
-
-
-def _copy_tree(source, destination):
-    if run(source, "status", "--porcelain", "--untracked-files=no").strip():
-        raise ValueError("source working tree must be clean")
-    for record in run_bytes(source, "ls-tree", "-r", "-z", "HEAD").split(b"\0"):
-        if not record:
-            continue
-        metadata, relative_bytes = record.split(b"\t", 1)
-        relative = relative_bytes.decode("utf-8")
-        mode, kind, _ = metadata.decode("ascii").split()
-        if kind != "blob" or mode not in ("100644", "100755"):
-            raise ValueError("approved tree contains unsupported entry: " + relative)
-        target = os.path.join(destination, relative)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "wb") as handle:
-            handle.write(run_bytes(source, "show", "HEAD:" + relative))
-
-
-def scan(repository, allowlist):
-    refs = [line.split()[1] for line in run(
-        repository, "for-each-ref", "--format=%(objectname) %(refname)").splitlines()]
-    if sorted(refs) != sorted(allowlist):
-        raise ValueError("ref allowlist mismatch")
+def scan(repository):
+    refs = sorted(line.strip() for line in run(repository, "for-each-ref", "--format=%(refname)").splitlines())
     objects = []
     for line in run(repository, "rev-list", "--objects", "--all").splitlines():
         object_id, _, path = line.partition(" ")
@@ -55,59 +29,54 @@ def scan(repository, allowlist):
             raise ValueError("forbidden content in reachable object")
         objects.append({"object": object_id, "type": kind, "path": path,
                         "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)})
-    return {"refs": sorted(refs), "objects": sorted(objects, key=lambda item: (item["type"], item["object"]))}
+    return {"refs": refs, "objects": sorted(objects, key=lambda item: (item["type"], item["object"]))}
 
 
-def export_root(source, destination, branch):
-    source = os.path.realpath(source)
-    destination = os.path.realpath(destination)
-    if os.path.exists(destination):
-        raise ValueError("destination already exists")
-    if os.path.commonpath((source, destination)) == source:
-        raise ValueError("destination must not be inside source tree")
-    staging = tempfile.mkdtemp(prefix="awb-release-root-", dir=os.path.dirname(destination))
-    try:
-        _copy_tree(source, staging)
-        run(staging, "init")
-        run(staging, "add", ".")
-        env = os.environ.copy()
-        env.update({"GIT_AUTHOR_NAME": "AWB Release Gate", "GIT_AUTHOR_EMAIL": "release@example.invalid",
-                    "GIT_COMMITTER_NAME": "AWB Release Gate", "GIT_COMMITTER_EMAIL": "release@example.invalid"})
-        # Do not let Git's human-oriented commit chatter corrupt the CLI's
-        # single JSON document on stdout.  Preserve stdout and stderr
-        # separately for a caller inspecting a failed subprocess.
-        committed = subprocess.run(["git", "commit", "--no-gpg-sign", "-m", "AWB approved file tree"],
-                                   cwd=staging, env=env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-        if committed.returncode:
-            raise subprocess.CalledProcessError(committed.returncode, committed.args,
-                                                output=committed.stdout, stderr=committed.stderr)
-        run(staging, "branch", "-M", branch)
-        if len(run(staging, "rev-list", "--parents", "-n", "1", "HEAD").split()) != 1:
-            raise ValueError("public root must have no parent")
-        manifest = scan(staging, ["refs/heads/" + branch])
-        os.rename(staging, destination)
-        return manifest
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+def check_successor(repository, base, candidate, v01_commit, allowlist):
+    repository = os.path.realpath(repository)
+    base = run(repository, "rev-parse", base + "^{commit}").strip()
+    candidate = run(repository, "rev-parse", candidate + "^{commit}").strip()
+    v01_commit = run(repository, "rev-parse", v01_commit + "^{commit}").strip()
+    if subprocess.call(["git", "merge-base", "--is-ancestor", base, candidate], cwd=repository):
+        raise ValueError("candidate is not a descendant of the verified public main")
+    parents = run(repository, "rev-list", "--parents", "-n", "1", candidate).split()
+    if len(parents) != 2 or parents[1] != base:
+        raise ValueError("release candidate must be the direct normal successor of public main")
+    if subprocess.call(["git", "merge-base", "--is-ancestor", v01_commit, candidate], cwd=repository):
+        raise ValueError("v0.1.0 history is not preserved")
+    if run(repository, "rev-parse", "v0.1.0^{commit}").strip() != v01_commit:
+        raise ValueError("v0.1.0 tag moved")
+    if run(repository, "rev-parse", "v0.2.0^{commit}").strip() != candidate:
+        raise ValueError("v0.2.0 tag does not identify the candidate")
+    changed = sorted(line for line in run(repository, "diff", "--name-only", base, candidate).splitlines() if line)
+    unexpected = sorted(set(changed) - set(allowlist))
+    if unexpected:
+        raise ValueError("candidate changes files outside the release allowlist: " + ", ".join(unexpected))
+    if run(repository, "status", "--porcelain").strip():
+        raise ValueError("release candidate worktree is not clean")
+    scanned = scan(repository)
+    return {"base": base, "candidate": candidate, "v0.1.0": v01_commit,
+            "changedPaths": changed, "reachableObjectCount": len(scanned["objects"]),
+            "refs": scanned["refs"]}
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="offline release-root constructor; never pushes")
+    parser = argparse.ArgumentParser(description="offline public successor gate; never pushes")
     sub = parser.add_subparsers(dest="command", required=True)
-    export = sub.add_parser("export-root")
-    export.add_argument("--tree", required=True)
-    export.add_argument("--output", required=True)
-    export.add_argument("--branch", default="main")
-    check = sub.add_parser("scan")
+    check = sub.add_parser("check-successor")
     check.add_argument("--repository", required=True)
-    check.add_argument("--ref", action="append", required=True)
+    check.add_argument("--base", required=True)
+    check.add_argument("--candidate", default="HEAD")
+    check.add_argument("--v0.1-commit", dest="v01_commit", required=True)
+    check.add_argument("--path", action="append", required=True)
+    scan_parser = sub.add_parser("scan")
+    scan_parser.add_argument("--repository", required=True)
     args = parser.parse_args(argv)
-    if args.command == "export-root":
-        print(json.dumps(export_root(args.tree, args.output, args.branch), sort_keys=True))
+    if args.command == "check-successor":
+        result = check_successor(args.repository, args.base, args.candidate, args.v01_commit, args.path)
     else:
-        print(json.dumps(scan(args.repository, args.ref), sort_keys=True))
+        result = scan(args.repository)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

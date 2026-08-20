@@ -1,5 +1,7 @@
 version: MVP-LITE-v1
 owner: AWB-001
+managementContract: AWB-WORKITEM-MGMT-v1
+templateContract: AWB-MANAGEMENT-v1
 
 roles:
   ORCHESTRATOR: {model: balanced, reasoning: medium}
@@ -101,6 +103,38 @@ reviewPolicy:
   implementerCannotReviewOwnDelivery: true
   oneBatchReviewAfterImplementationTasks: true
   noPerTaskIndependentReview: true
+  findingProtocol: AWB-REVIEW-v1
+  blockingFindingRequiredFields: [id, stage, violatedContract, evidence, impact, closeCondition]
+  suggestionsCannotRevise: true
+  laterReviewScope: [open_findings, direct_revision_regressions, newly_available_evidence]
+  stagesIndependent: true
+  rounds:
+    ordinary: [1, 2, 3, 5]
+    convergence: 4
+    maximum: 5
+    afterThirdRevise: freeze_and_convergence_review
+    afterConvergenceRevise: one_minimal_author_revision
+    afterFifthRevise: WAITING_HUMAN
+  convergenceResults: [PASS, CONVERGENCE_REVISE, WAITING_HUMAN, BLOCKED]
+
+managementPolicy:
+  runtimeAuthority: sqlite_projection
+  createRequiresCompleteEnvelope: true
+  createEnvelopeAndTasksAtomic: true
+  historicalReadWithoutEnvelope: true
+  backfillBeforeReopenOrExpansion: true
+  amendmentsAreAppendOnlyEvents: true
+  humanAuthorizationRequiredForScopeAuthorizationAcceptanceExpansion: true
+  oneInProgressTaskPerWorkItem: true
+  defaultProgress: required_completed_over_required_total
+  weightedProgress: {type: FE, explicit: true, stableStageIds: true, weightsTotal: 100}
+
+implementationQualityPolicy:
+  baselineFields: [passedAcceptance, tests, modifiedScope, knownNonBlockingIssues,
+                   addressedFindingIds, complexityChanges, regressions]
+  stopOn: [acceptance_regression, test_weakening, same_or_worse_defect,
+           material_scope_expansion, plan_invalid]
+  planDeviation: {state: DRAFT, queue: BLOCKED, role: PLANNER, resetReviewRounds: false}
 
 phase2Only:
   - mysql_storage_adapter

@@ -48,6 +48,11 @@ def _file_sha(path):
     return digest.hexdigest()
 
 
+def _file_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
 def _resource(name):
     data = pkgutil.get_data("agent_workboard", "resources/" + name)
     if data is None:
@@ -315,7 +320,9 @@ def _validate_project_contract(root):
         actual = _file_sha(wheel_path)
         if actual != digest:
             raise LiteError("requirements-awb.txt wheel hash does not match")
-    elif parsed.scheme != "https" or parsed.netloc != "github.com" or not parsed.path.startswith("/cleocn/agent-workboard/releases/download/v0.1.0/"):
+    elif (parsed.scheme != "https" or parsed.netloc != "github.com" or
+          not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
+                  for tag in ("v0.1.0", "v0.2.0"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -458,7 +465,7 @@ def init_project(path, with_codex=False, development=False, wheel_path=None):
         with open(os.path.join(awb, "project.md"), "w", encoding="utf-8") as handle:
             handle.write(_project_markdown(config))
         with open(os.path.join(awb, ".gitignore"), "w", encoding="utf-8") as handle:
-            handle.write("workboard.db\nworkboard.db-*\n*.backup.db\nartifacts/\n")
+            handle.write("workboard.db\nworkboard.db-*\n*.backup.db\nartifacts/\nbackups/\n")
         requirements = binding["requirements"]
         if binding["temporary"]:
             artifacts = os.path.join(awb, "artifacts")
@@ -551,6 +558,148 @@ def backup(path):
     return {"status": "ok", "backup": target, "sha256": _file_sha(target)}
 
 
+def _locked_wheel(root, fallback_directory):
+    requirements = os.path.join(_awb(root), "requirements-awb.txt")
+    with open(requirements, "r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")]
+    package_lines = [line for line in lines if (line.startswith("file://") or line.startswith("https://")) and
+                     "#egg=agent-workboard " in line]
+    if len(package_lines) != 1 or "--hash=sha256:" not in package_lines[0]:
+        raise LiteError("upgrade requires an available hash-locked old wheel")
+    package, digest = package_lines[0].rsplit("--hash=sha256:", 1)
+    parsed = urlparse(package.split("#egg=agent-workboard", 1)[0])
+    wheel = unquote(parsed.path) if parsed.scheme == "file" else os.path.join(fallback_directory,
+                                                                               os.path.basename(parsed.path))
+    if not os.path.isfile(wheel) or _file_sha(wheel) != digest:
+        raise LiteError("upgrade old wheel is unavailable or its hash changed")
+    return wheel, digest
+
+
+def _wheel_resource(wheel, resource):
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            return archive.read("agent_workboard/resources/" + resource)
+    except Exception:
+        raise LiteError("upgrade cannot verify old package resource: " + resource)
+
+
+def _atomic_bytes(path, value):
+    temporary = path + ".upgrade-" + uuid.uuid4().hex
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(temporary, "wb") as handle:
+            handle.write(value)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def upgrade_project(path, wheel_path, with_codex=False):
+    """Upgrade a verified 0.1.0 stable project to this exact 0.2.0 wheel."""
+    root = _project_root(path)
+    config, database = _load_config(root)
+    if config["runtimeMode"] != "stable" or config["requiredPackageVersion"] != "0.1.0":
+        raise LiteError("upgrade requires a stable 0.1.0 project")
+    if config["requiredSourceTag"] != "v0.1.0":
+        raise LiteError("upgrade requires the v0.1.0 release identity")
+    _validate_project_contract(root)
+    target_wheel = os.path.realpath(os.path.abspath(wheel_path))
+    old_wheel, old_digest = _locked_wheel(root, os.path.dirname(target_wheel))
+    old_identity = _wheel_identity(old_wheel)
+    if not old_identity or old_identity.get("packageVersion") != "0.1.0" or old_identity.get("sourceTag") != "v0.1.0":
+        raise LiteError("upgrade old wheel identity is invalid")
+    for key in ("sourceCommit", "sourceTree", "sourceTag"):
+        if config["required" + key[0].upper() + key[1:]] != old_identity[key]:
+            raise LiteError("upgrade old wheel does not match the project lock")
+    target_identity = _wheel_identity(target_wheel) if os.path.isfile(target_wheel) else None
+    if target_identity != BUILD_IDENTITY or BUILD_IDENTITY.get("packageVersion") != "0.2.0" or BUILD_IDENTITY.get("sourceTag") != "v0.2.0":
+        raise LiteError("upgrade target wheel does not match the running 0.2.0 release")
+    connection = open_database(database)
+    try:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+        claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
+        writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
+    finally:
+        connection.close()
+    if integrity != "ok" or foreign_keys:
+        raise LiteError("upgrade refuses an invalid database")
+    if claims or writers:
+        raise LiteError("upgrade refuses active claim or repository writer")
+
+    codex_changes = []
+    if with_codex:
+        for target, resource in _codex_targets(root).items():
+            replacement = _resource(resource)
+            if os.path.exists(target):
+                with open(target, "rb") as handle:
+                    current = handle.read()
+                if current != _wheel_resource(old_wheel, resource):
+                    raise LiteError("upgrade refuses customized Codex file: " + os.path.relpath(target, root))
+            codex_changes.append((target, replacement))
+
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    backup_root = os.path.join(_awb(root), "backups", "upgrade-" + stamp)
+    os.makedirs(backup_root)
+    backup_files = {}
+    managed_paths = [os.path.join(_awb(root), name) for name in MANAGED]
+    if with_codex:
+        managed_paths += [target for target, unused in codex_changes if os.path.exists(target)]
+    for source in managed_paths:
+        relative = os.path.relpath(source, root)
+        destination = os.path.join(backup_root, relative)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.copyfile(source, destination)
+        backup_files[source] = destination
+    database_backup = os.path.join(backup_root, ".awb", "workboard.db")
+    os.makedirs(os.path.dirname(database_backup), exist_ok=True)
+    source_database = open_database(database)
+    destination_database = sqlite3.connect(database_backup)
+    try:
+        source_database.backup(destination_database)
+    finally:
+        destination_database.close()
+        source_database.close()
+
+    updated = dict(config)
+    updated["requiredPackageVersion"] = "0.2.0"
+    updated["requiredSourceCommit"] = BUILD_IDENTITY["sourceCommit"]
+    updated["requiredSourceTree"] = BUILD_IDENTITY["sourceTree"]
+    updated["requiredSourceTag"] = BUILD_IDENTITY["sourceTag"]
+    replacements = [
+        (_config_path(root), (json.dumps(updated, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")),
+        (os.path.join(_awb(root), "requirements-awb.txt"),
+         _requirement_lock(target_wheel, _file_sha(target_wheel)).encode("utf-8")),
+        (os.path.join(_awb(root), ".gitignore"),
+         (_file_bytes(os.path.join(_awb(root), ".gitignore")).rstrip(b"\n") + b"\nbackups/\n")),
+    ] + codex_changes
+    created = [target for target, unused in codex_changes if not os.path.exists(target)]
+    try:
+        for target, value in replacements:
+            _atomic_bytes(target, value)
+    except Exception:
+        for target, saved in backup_files.items():
+            shutil.copyfile(saved, target)
+        for target in created:
+            if os.path.exists(target):
+                os.unlink(target)
+        raise
+    return {
+        "status": "ok",
+        "project": root,
+        "fromVersion": "0.1.0",
+        "toVersion": "0.2.0",
+        "oldWheel": old_wheel,
+        "oldWheelSha256": old_digest,
+        "newWheel": target_wheel,
+        "newWheelSha256": _file_sha(target_wheel),
+        "backup": backup_root,
+        "databaseBackup": database_backup,
+        "codexUpdated": with_codex,
+    }
+
+
 def migrate(path, check=False):
     root = _project_root(path)
     config, database = _load_config(root)
@@ -578,6 +727,7 @@ def _codex_targets(root):
         os.path.join(root, ".codex", "agents", "planner.toml"): "codex/agents/planner.toml",
         os.path.join(root, ".codex", "agents", "implementer.toml"): "codex/agents/implementer.toml",
         os.path.join(root, ".codex", "agents", "reviewer.toml"): "codex/agents/reviewer.toml",
+        os.path.join(root, ".codex", "agents", "convergence-reviewer.toml"): "codex/agents/convergence-reviewer.toml",
         os.path.join(root, ".codex", "agents", "fast-worker.toml"): "codex/agents/fast-worker.toml",
     }
 
@@ -610,8 +760,13 @@ def codex_check(path):
         raise LiteError("Codex templates missing: " + ", ".join(sorted(missing)))
     with open(os.path.join(root, ".codex", "skills", "awb-orchestrator", "SKILL.md"), "r", encoding="utf-8") as handle:
         skill = handle.read()
-    if "AGENTS.md" not in skill or ".awb/project.md" not in skill or "human" not in skill.lower():
+    if ("AGENTS.md" not in skill or ".awb/project.md" not in skill or
+            "convergence-reviewer" not in skill or "human" not in skill.lower()):
         raise LiteError("Codex Skill contract is incomplete")
+    with open(os.path.join(root, ".codex", "agents", "convergence-reviewer.toml"), "r", encoding="utf-8") as handle:
+        convergence = handle.read()
+    if "gpt-5.6-sol" not in convergence or "CONVERGENCE_REVISE" not in convergence:
+        raise LiteError("convergence reviewer contract is incomplete")
     return {"status": "ok"}
 
 
