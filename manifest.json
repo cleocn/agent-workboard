@@ -1,0 +1,159 @@
+{
+  "files": [
+    {
+      "path": ".gitignore",
+      "sha256": "75e59181f1b4b019d8feebe695862dc2af473b478ce87b60512d6cd884088015"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "f5dcc045d9c046264e7a5287f2641f8ab3946d98af334e3cc68f58a57b0c71fd"
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "sha256": "15c57c88508e0695b2512b3781be351100113364e95369d907b49b5b08e6aae3"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "bdd84c4200e4e9954cfb3708197e5eef9886d427f574c8953ab5930b0aff2a66"
+    },
+    {
+      "path": "README.md",
+      "sha256": "cf8e805cd4bc3b5dcf6412c85d29e3ab005913a04e892b2556b10dbbe0b051ca"
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "cebba9645edcff207badd511fc6bc2492e3971d91422d964b9812306f2dfda50"
+    },
+    {
+      "path": "setup.py",
+      "sha256": "f5dfbd5b284f7933f5a7aa5735f7930c68fdf94eb61d3b872dda6737050fa969"
+    },
+    {
+      "path": "docs/history.md",
+      "sha256": "17a3c1ea157045b75b27151b4c25d6b6f0f5cc9758adbaa92875decf07988b18"
+    },
+    {
+      "path": "docs/publication-plan.md",
+      "sha256": "f24a96893bd38a07524db272bda7e1970406bfde45edf2e0bd433a16e78e8b29"
+    },
+    {
+      "path": "docs/usage/quickstart.md",
+      "sha256": "fa741928355a50fb65f2fe6cd46b98a14a3a7874be17aae4e5f58c4d98c68e1c"
+    },
+    {
+      "path": "src/agent_workboard/__init__.py",
+      "sha256": "088a4bba871d83dcb05aa9ff655fe4325067b2782bb6a6bb0de654bb365a6ce6"
+    },
+    {
+      "path": "src/agent_workboard/__main__.py",
+      "sha256": "3d2438ae92f4746e9ffaa1f837b1fe803f6281091d1f31f8c95643716f257d9a"
+    },
+    {
+      "path": "src/agent_workboard/_build.py",
+      "sha256": "d50c1f0de580d933fcaf63edd8a00eaaae3e75d38ad8c304724ff2b982daaa7e"
+    },
+    {
+      "path": "src/agent_workboard/cli.py",
+      "sha256": "425f9f93e8debc5f5b756788f970e15e5ac8c084d054e8cc5062a6a5b2459032"
+    },
+    {
+      "path": "src/agent_workboard/lite.py",
+      "sha256": "84baa311cb6743b359bc14461212e4cec299474df593e37d6b00d620da8d54aa"
+    },
+    {
+      "path": "src/agent_workboard/project.py",
+      "sha256": "31846982c93c84a117be387fdf39f291fcefcccda140c2e656fb60261642d72d"
+    },
+    {
+      "path": "src/agent_workboard/resources/codex/agents/fast-worker.toml",
+      "sha256": "d1773ed6243fc2402bd6ef41651a3bbf17654d95c2ebc1a9ab7c8640bfacf651"
+    },
+    {
+      "path": "src/agent_workboard/resources/codex/agents/implementer.toml",
+      "sha256": "8dfb65a36a0a7f7c4afe1f4ab9212739136d642923235f557536066ac37aac66"
+    },
+    {
+      "path": "src/agent_workboard/resources/codex/agents/planner.toml",
+      "sha256": "69d9ba084dd01b5bb774fb1979c9f95d2e2ad9747096ad237e4fc299ddec553b"
+    },
+    {
+      "path": "src/agent_workboard/resources/codex/agents/reviewer.toml",
+      "sha256": "e16a42144918cc63102e5d1889c474b8feae6c87ba1ee138c46788e13bae9c40"
+    },
+    {
+      "path": "src/agent_workboard/resources/codex/skills/awb-orchestrator/SKILL.md",
+      "sha256": "c4b8273a5c7725de780cdd03b8f754018261e3a6703dada75ca1c14932a90d58"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/AGENT-GUIDE.md",
+      "sha256": "aa2b9d80ca3520b4ada7b918d8d82049c4fd652e6f17ead578f0dd69dcc34585"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/acceptance-cases.yaml",
+      "sha256": "8911a8de543db7ab25adb300e9c05a5666796d0d4fcc29c071cfbc45f90b03d7"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/manifest.json",
+      "sha256": "39c95caff847312e75f025cb545287ef888fb19a861e8be09665992478898cbc"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/schema.sql",
+      "sha256": "cbb5032c4d6d73ac2dff318b215f467663e5b82973b6a4635d4a0d47607a4468"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/workflow.yaml",
+      "sha256": "77977e93552ac7a8a78b271a34836722db68d5214e0bee6b5391a9e9515437dd"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/workitem.schema.json",
+      "sha256": "b73e5f09e950a21113c62e8904f92548cfb3620fe8c1b26aef4c2bc06290993f"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_original/AGENT-GUIDE.md",
+      "sha256": "8a4628b8cac858b6679476d844650b72463b64887c10215e45555479859fa5fc"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_original/acceptance-cases.yaml",
+      "sha256": "7962ea376d51a6838b676cc1831c52a13575f1cc622d8615a1e6ca5d854e978e"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_original/manifest.json",
+      "sha256": "9d15a81d3dc4afa6f994f89c03884595553deebc1761853de45fb08840348f90"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_original/schema.sql",
+      "sha256": "cbb5032c4d6d73ac2dff318b215f467663e5b82973b6a4635d4a0d47607a4468"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_original/workflow.yaml",
+      "sha256": "77977e93552ac7a8a78b271a34836722db68d5214e0bee6b5391a9e9515437dd"
+    },
+    {
+      "path": "src/agent_workboard/resources/spec/mvp_lite_v1_original/workitem.schema.json",
+      "sha256": "b73e5f09e950a21113c62e8904f92548cfb3620fe8c1b26aef4c2bc06290993f"
+    },
+    {
+      "path": "tests/test_lite.py",
+      "sha256": "f2a39aac6bd1504ea8b04482bf75f1437cd578ab0504374441d96761924e5426"
+    },
+    {
+      "path": "tests/test_project.py",
+      "sha256": "18ec34cf56e4983755ba6a3f49be39db4b52b7a6b3a1b017983d3ef0d13c9247"
+    },
+    {
+      "path": "tests/test_release_gate.py",
+      "sha256": "879623e4b364a90ad982b17301f13fc7c9a6f8298409d1c0942f253df20b3044"
+    },
+    {
+      "path": "tests/fixtures/requirements-local-wheel.txt",
+      "sha256": "33ebce6a9982a867094d21a72e9a3730c29d0f8115c70fd59f3647ec9da16c5c"
+    },
+    {
+      "path": "tools/release_gate.py",
+      "sha256": "2397c2aad13912911124d9df2e0ad4923bea19a21154ac7a34147454a8080d97"
+    }
+  ],
+  "manifestVersion": "AWB-004-public-v1",
+  "scope": "public source files; root manifest excluded to avoid recursive hash",
+  "status": "PUBLIC RELEASE TREE"
+}

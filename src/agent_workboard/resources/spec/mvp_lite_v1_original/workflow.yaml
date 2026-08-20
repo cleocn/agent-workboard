@@ -1,0 +1,115 @@
+version: MVP-LITE-v1
+owner: AWB-001
+
+roles:
+  ORCHESTRATOR: {model: balanced, reasoning: medium}
+  PLANNER: {model: frontier, reasoning: high}
+  IMPLEMENTER: {model: balanced, reasoning: high}
+  REVIEWER: {model: frontier, reasoning: high}
+
+states:
+  - DRAFT
+  - PLAN_REVIEW_PENDING
+  - PLAN_REVIEW_APPROVED
+  - IMPLEMENTING
+  - IMPLEMENTATION_COMPLETED
+  - FINAL_ACCEPTANCE_APPROVED
+
+queues: [CLAIMABLE, CLAIMED, WAITING_HUMAN, HELD, BLOCKED]
+priorities: [P0, P1, P2, P3]
+taskStates: [NOT_STARTED, IN_PROGRESS, BLOCKED, WAITING_ACCEPTANCE, COMPLETED, CANCELLED]
+
+humanGatePolicy:
+  STANDARD: {plan: required, final: required}
+  READ_ONLY_DIAGNOSIS: {plan: optional, final: not_applicable}
+
+transitions:
+  submit_plan:
+    from: DRAFT
+    to: PLAN_REVIEW_PENDING
+    actor: PLANNER
+    requires: [active_work_item_claim, planning_tasks_completed]
+  agent_approve_plan:
+    from: PLAN_REVIEW_PENDING
+    to: PLAN_REVIEW_PENDING
+    actor: REVIEWER
+    queueAfter: WAITING_HUMAN
+  agent_reject_plan:
+    from: PLAN_REVIEW_PENDING
+    to: DRAFT
+    actor: REVIEWER
+    queueAfter: CLAIMABLE
+  human_approve_plan:
+    from: PLAN_REVIEW_PENDING
+    to: PLAN_REVIEW_APPROVED
+    actor: HUMAN
+    requires: [latest_agent_plan_review_approved]
+  human_reject_plan:
+    from: PLAN_REVIEW_PENDING
+    to: DRAFT
+    actor: HUMAN
+  start_implementation:
+    from: PLAN_REVIEW_APPROVED
+    to: IMPLEMENTING
+    actor: IMPLEMENTER
+    requires: [active_work_item_claim]
+  submit_implementation:
+    from: IMPLEMENTING
+    to: IMPLEMENTATION_COMPLETED
+    actor: IMPLEMENTER
+    requires: [implementation_tasks_completed, local_tests_passed]
+  agent_approve_final:
+    from: IMPLEMENTATION_COMPLETED
+    to: IMPLEMENTATION_COMPLETED
+    actor: REVIEWER
+    queueAfter: WAITING_HUMAN
+  agent_reject_final:
+    from: IMPLEMENTATION_COMPLETED
+    to: IMPLEMENTING
+    actor: REVIEWER
+    queueAfter: CLAIMABLE
+  human_approve_final:
+    from: IMPLEMENTATION_COMPLETED
+    to: FINAL_ACCEPTANCE_APPROVED
+    actor: HUMAN
+    requires: [latest_agent_final_review_approved]
+    queueAfter: HELD
+  human_reject_final:
+    from: IMPLEMENTATION_COMPLETED
+    to: IMPLEMENTING
+    actor: HUMAN
+    queueAfter: CLAIMABLE
+
+claimPolicy:
+  oneActiveClaimPerWorkItem: true
+  leaseSeconds: 900
+  expiredClaimMayBeReacquired: true
+  generationMustIncrease: true
+
+repositoryWritePolicy:
+  oneActiveWriterPerRepository: true
+  roles: [PLANNER, IMPLEMENTER]
+  releaseBeforeReview: true
+
+holdPolicy:
+  supportedInEveryNonTerminalState: true
+  heldItemsAreNotDispatchable: true
+  resumeRestoresPriorQueueOrRecomputesSafely: true
+
+reviewPolicy:
+  plannerCannotReviewOwnPlan: true
+  implementerCannotReviewOwnDelivery: true
+  oneBatchReviewAfterImplementationTasks: true
+  noPerTaskIndependentReview: true
+
+phase2Only:
+  - mysql_storage_adapter
+  - authenticated_remote_command_ingress
+  - pause_resume_and_steer
+
+notPlannedUnlessEvidenceRequiresIt:
+  - runner_authority_and_operation_leases
+  - process_quiescence_proofs
+  - cryptographic_git_snapshot_binding
+  - adversarial_database_tamper_resistance
+  - distributed_projection_recovery

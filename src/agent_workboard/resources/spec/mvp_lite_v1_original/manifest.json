@@ -1,0 +1,21 @@
+{
+  "manifestVersion": "MVP-LITE-v1",
+  "planRevision": "PLAN-MVP-LITE-v1",
+  "specification": "agent-workboard-sqlite-single-machine-mvp-lite",
+  "ownerRecord": "AWB-001",
+  "composition": {
+    "databaseSchema": "schema.sql",
+    "workItemSchema": "workitem.schema.json",
+    "workflow": "workflow.yaml",
+    "agentGuide": "AGENT-GUIDE.md",
+    "acceptanceSuite": "acceptance-cases.yaml",
+    "acceptanceCaseCount": 30
+  },
+  "artifacts": [
+    {"kind": "sqlite-clean-schema", "version": "MVP-LITE-v1", "path": "schema.sql", "sha256": "cbb5032c4d6d73ac2dff318b215f467663e5b82973b6a4635d4a0d47607a4468"},
+    {"kind": "workitem-json-schema", "version": "MVP-LITE-v1", "path": "workitem.schema.json", "sha256": "b73e5f09e950a21113c62e8904f92548cfb3620fe8c1b26aef4c2bc06290993f"},
+    {"kind": "workflow-definition", "version": "MVP-LITE-v1", "path": "workflow.yaml", "sha256": "77977e93552ac7a8a78b271a34836722db68d5214e0bee6b5391a9e9515437dd"},
+    {"kind": "agent-operation-guide", "version": "MVP-LITE-v1", "path": "AGENT-GUIDE.md", "sha256": "8a4628b8cac858b6679476d844650b72463b64887c10215e45555479859fa5fc"},
+    {"kind": "acceptance-suite", "version": "MVP-LITE-v1", "path": "acceptance-cases.yaml", "sha256": "7962ea376d51a6838b676cc1831c52a13575f1cc622d8615a1e6ca5d854e978e"}
+  ]
+}

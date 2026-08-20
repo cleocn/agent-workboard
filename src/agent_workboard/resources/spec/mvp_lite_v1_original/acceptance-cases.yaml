@@ -1,0 +1,33 @@
+version: MVP-LITE-v1
+owner: AWB-001
+cases:
+  - {id: LITE-AC-001, priority: P0, title: clean SQLite 初始化成功且重复初始化拒绝}
+  - {id: LITE-AC-002, priority: P0, title: TI 创建时同步创建同 ID WorkItem}
+  - {id: LITE-AC-003, priority: P0, title: FE 创建时同步创建同 ID WorkItem}
+  - {id: LITE-AC-004, priority: P0, title: R 创建时同步创建同 ID WorkItem}
+  - {id: LITE-AC-005, priority: P0, title: WA 创建时同步创建同 ID WorkItem}
+  - {id: LITE-AC-006, priority: P0, title: 内部任务不会成为顶层看板卡}
+  - {id: LITE-AC-007, priority: P0, title: P0 到 P3 优先级稳定排序}
+  - {id: LITE-AC-008, priority: P0, title: 同一 WorkItem 并发认领仅一个成功}
+  - {id: LITE-AC-009, priority: P0, title: 认领租约过期后 generation 单调递增}
+  - {id: LITE-AC-010, priority: P0, title: 同一仓库同时只有一个活动写锁}
+  - {id: LITE-AC-011, priority: P0, title: HELD 项不可自动认领}
+  - {id: LITE-AC-012, priority: P0, title: 每个非终态都可搁置并恢复}
+  - {id: LITE-AC-013, priority: P0, title: BLOCKED 项不可自动认领}
+  - {id: LITE-AC-014, priority: P0, title: 规划提交后进入待规划复审}
+  - {id: LITE-AC-015, priority: P0, title: 规划 Agent 驳回返回草稿}
+  - {id: LITE-AC-016, priority: P0, title: 规划 Agent 不能自审}
+  - {id: LITE-AC-017, priority: P0, title: STANDARD 规划 Agent 通过后等待人工}
+  - {id: LITE-AC-018, priority: P0, title: 人工规划批准后进入规划复审通过}
+  - {id: LITE-AC-019, priority: P0, title: 人工规划驳回返回草稿}
+  - {id: LITE-AC-020, priority: P0, title: 未经规划批准不能开始实施}
+  - {id: LITE-AC-021, priority: P0, title: 实施提交要求实施任务完成}
+  - {id: LITE-AC-022, priority: P0, title: 实施提交要求本地测试通过}
+  - {id: LITE-AC-023, priority: P0, title: 实施提交后进入实施完成}
+  - {id: LITE-AC-024, priority: P0, title: 最终 Agent 驳回返回实施中}
+  - {id: LITE-AC-025, priority: P0, title: 最终 Agent 不能自审}
+  - {id: LITE-AC-026, priority: P0, title: STANDARD 最终 Agent 通过后等待人工}
+  - {id: LITE-AC-027, priority: P0, title: 人工最终驳回返回实施中}
+  - {id: LITE-AC-028, priority: P0, title: 人工最终批准原子进入最终验收通过并搁置}
+  - {id: LITE-AC-029, priority: P1, title: READ_ONLY_DIAGNOSIS 按目标停止且不创建实施任务}
+  - {id: LITE-AC-030, priority: P1, title: STANDARD 仅通过公开接口完成端到端主路径}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-workboard/mvp-lite-v1/workitem",
+  "title": "Agent Workboard MVP-LITE WorkItem",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["workItemId", "type", "title", "mode", "priority"],
+  "properties": {
+    "workItemId": {"type": "string", "pattern": "^(TI|FE|R|WA|AWB)-[A-Za-z0-9-]+$", "maxLength": 80},
+    "type": {"enum": ["TI", "FE", "R", "WA", "AWB"]},
+    "title": {"type": "string", "minLength": 1, "maxLength": 200},
+    "mode": {"enum": ["STANDARD", "READ_ONLY_DIAGNOSIS"]},
+    "priority": {"enum": ["P0", "P1", "P2", "P3"]},
+    "target": {"enum": ["PLAN_REVIEW_PENDING", "PLAN_REVIEW_APPROVED", "IMPLEMENTATION_COMPLETED", "FINAL_ACCEPTANCE_APPROVED"]},
+    "modelOverrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "PLANNER": {"enum": ["balanced", "frontier"]},
+        "IMPLEMENTER": {"enum": ["balanced", "frontier"]},
+        "REVIEWER": {"enum": ["balanced", "frontier"]}
+      }
+    }
+  }
+}

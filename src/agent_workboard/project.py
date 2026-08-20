@@ -1,0 +1,689 @@
+"""Project lifecycle helpers for the standalone, local-only RC.
+
+This module intentionally has no network or third-party dependency.  It does
+not publish, configure remotes, or alter an existing project's AWB setup.
+"""
+
+import ast
+import base64
+import csv
+import datetime
+import hashlib
+import json
+import os
+import pkgutil
+import shutil
+import sqlite3
+import tempfile
+import uuid
+import zipfile
+from urllib.parse import quote, unquote, urlparse
+
+from . import __version__
+from ._build import BUILD_IDENTITY
+from .lite import LiteError, SCHEMA_VERSION, initialize_database, open_database
+
+
+CONFIG_VERSION = 1
+MANAGED = ("config.json", "project.md", ".gitignore", "requirements-awb.txt")
+TABLES = ("work_items", "tasks", "claims", "repository_locks", "reviews",
+          "human_gates", "events")
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha(value):
+    if not isinstance(value, bytes):
+        value = value.encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
+def _file_sha(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _resource(name):
+    data = pkgutil.get_data("agent_workboard", "resources/" + name)
+    if data is None:
+        raise LiteError("required package resource is missing: {0}".format(name))
+    return data
+
+
+def _project_root(path):
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _direct_wheel():
+    """Return the local wheel recorded by pip's direct-url installation data.
+
+    Older pip versions (including the supported Python 3.7 one) omit
+    ``archive_info.hash`` for a local wheel.  The local artifact is still a
+    trustworthy binding input only after this module re-hashes it and checks
+    that it is the wheel that produced the currently loaded package.
+    """
+    try:
+        try:
+            from importlib import metadata
+            direct = metadata.distribution("agent-workboard").read_text("direct_url.json")
+        except ImportError:
+            import pkg_resources
+            direct = open(os.path.join(pkg_resources.get_distribution("agent-workboard").egg_info,
+                                       "direct_url.json"), encoding="utf-8").read()
+    except Exception:
+        return None
+    if not direct:
+        return None
+    try:
+        data = json.loads(direct)
+        parsed = urlparse(data["url"])
+        if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+            return False
+        declared = data.get("archive_info", {}).get("hash")
+        if declared:
+            algorithm, separator, digest = declared.partition("=")
+            if algorithm != "sha256" or separator != "=" or len(digest) != 64:
+                return False
+        else:
+            digest = None
+        return unquote(parsed.path), digest
+    except Exception:
+        return False
+
+
+def _wheel_identity(path):
+    try:
+        with zipfile.ZipFile(path) as archive:
+            statement = archive.read("agent_workboard/_build.py").decode("utf-8").split("=", 1)[1].strip()
+        return ast.literal_eval(statement)
+    except Exception:
+        return None
+
+
+def _requirement_lock(wheel_path, digest):
+    # pip 18.1 (the Python 3.7 bootstrap pip) does not support PEP 508's
+    # ``name @ file://`` form in requirements files.  Its URL+egg form is
+    # also accepted by current pip and still binds the exact local artifact.
+    return "--require-hashes\nfile://{0}#egg=agent-workboard --hash=sha256:{1}\n".format(quote(wheel_path), digest)
+
+
+def _installed_wheel_rebuild():
+    """Build a deterministic wheel from a verified non-editable installation.
+
+    pip 18.1 on Python 3.7 does not create direct_url.json for a local wheel.
+    This deliberately narrow fallback is only for that case: source files are
+    copied from the loaded installed package, environment-generated metadata
+    is excluded, and RECORD is regenerated from the bytes written.
+    """
+    import agent_workboard
+    if _is_editable() or not BUILD_IDENTITY["sourceCommit"] or not BUILD_IDENTITY["sourceTree"]:
+        raise LiteError("init cannot rebuild an editable or unverified installed package; pass --wheel or set AWB_WHEEL")
+    package = os.path.realpath(os.path.dirname(agent_workboard.__file__))
+    installation = os.path.realpath(os.path.dirname(package))
+    if os.path.islink(package) or os.path.commonpath((installation, package)) != installation:
+        raise LiteError("init cannot rebuild an unsafe installed package; pass --wheel or set AWB_WHEEL")
+    prefix = "agent_workboard-{0}.dist-info".format(__version__)
+    metadata = os.path.join(installation, prefix)
+    if not os.path.isdir(metadata) or os.path.islink(metadata):
+        raise LiteError("init cannot locate installed package metadata; pass --wheel or set AWB_WHEEL")
+    try:
+        with open(os.path.join(metadata, "METADATA"), encoding="utf-8") as handle:
+            headers = handle.read().split("\n\n", 1)[0].splitlines()
+        values = dict(line.split(": ", 1) for line in headers if ": " in line)
+    except (IOError, ValueError):
+        raise LiteError("init cannot validate installed package metadata; pass --wheel or set AWB_WHEEL")
+    if values.get("Name", "").lower().replace("_", "-") != "agent-workboard" or values.get("Version") != __version__:
+        raise LiteError("init cannot validate installed package name/version; pass --wheel or set AWB_WHEEL")
+    record_path = os.path.join(metadata, "RECORD")
+    try:
+        with open(record_path, newline="", encoding="utf-8") as handle:
+            record_rows = list(csv.reader(handle))
+    except (IOError, csv.Error):
+        raise LiteError("init cannot validate installed package RECORD; pass --wheel or set AWB_WHEEL")
+    approved = {}
+    record_name = prefix + "/RECORD"
+    ignored_metadata = set((prefix + "/INSTALLER", prefix + "/REQUESTED", prefix + "/direct_url.json"))
+    for row in record_rows:
+        if len(row) != 3:
+            raise LiteError("init rejects malformed installed package RECORD; pass --wheel or set AWB_WHEEL")
+        name, encoded_hash, size = row
+        # pip records the generated console script outside site-packages.
+        # It is not package input and is never copied into a rebuilt wheel.
+        if name == "../../../bin/awb":
+            continue
+        if name.startswith("agent_workboard/__pycache__/") and name.endswith((".pyc", ".pyo")):
+            continue
+        parts = name.split("/")
+        if not name or "\\" in name or os.path.isabs(name) or any(part in ("", ".", "..") for part in parts):
+            raise LiteError("init rejects unsafe installed package RECORD path; pass --wheel or set AWB_WHEEL")
+        if not (name.startswith("agent_workboard/") or name.startswith(prefix + "/")) or name in approved:
+            raise LiteError("init rejects unowned or duplicate installed package RECORD path; pass --wheel or set AWB_WHEEL")
+        if name == record_name:
+            if encoded_hash or size:
+                raise LiteError("init rejects nonstandard installed package RECORD entry; pass --wheel or set AWB_WHEEL")
+            approved[name] = None
+            continue
+        if name in ignored_metadata:
+            # pip's environment facts must be absent from the rebuilt wheel.
+            approved[name] = None
+            continue
+        if not encoded_hash.startswith("sha256=") or not size.isdecimal():
+            raise LiteError("init rejects incomplete installed package RECORD entry; pass --wheel or set AWB_WHEEL")
+        encoded_digest = encoded_hash[len("sha256="):]
+        if len(encoded_digest) != 43 or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for character in encoded_digest):
+            raise LiteError("init rejects malformed installed package RECORD hash; pass --wheel or set AWB_WHEEL")
+        try:
+            expected = base64.urlsafe_b64decode(encoded_digest + "=")
+        except Exception:
+            raise LiteError("init rejects malformed installed package RECORD hash; pass --wheel or set AWB_WHEEL")
+        if len(expected) != 32 or base64.urlsafe_b64encode(expected).decode("ascii").rstrip("=") != encoded_digest:
+            raise LiteError("init rejects unsupported installed package RECORD hash; pass --wheel or set AWB_WHEEL")
+        source = os.path.realpath(os.path.join(installation, *parts))
+        if os.path.commonpath((installation, source)) != installation or os.path.islink(source) or not os.path.isfile(source):
+            raise LiteError("init rejects unsafe installed package RECORD file; pass --wheel or set AWB_WHEEL")
+        with open(source, "rb") as handle:
+            raw = handle.read()
+        if hashlib.sha256(raw).digest() != expected or len(raw) != int(size):
+            raise LiteError("init rejects modified installed package RECORD file; pass --wheel or set AWB_WHEEL")
+        approved[name] = source
+    if record_name not in approved:
+        raise LiteError("init rejects installed package without RECORD; pass --wheel or set AWB_WHEEL")
+    actual = set()
+    for directory, prefix_name, ignore in ((package, "agent_workboard", set()), (metadata, prefix, ignored_metadata)):
+        for base, directories, names in os.walk(directory):
+            if any(os.path.islink(os.path.join(base, name)) for name in directories + names):
+                raise LiteError("init rejects installed package symbolic links; pass --wheel or set AWB_WHEEL")
+            directories[:] = sorted(name for name in directories if name != "__pycache__")
+            for name in names:
+                if name.endswith((".pyc", ".pyo")) or name == "RECORD" or prefix_name + "/" + os.path.relpath(os.path.join(base, name), directory).replace(os.sep, "/") in ignore:
+                    continue
+                actual.add(prefix_name + "/" + os.path.relpath(os.path.join(base, name), directory).replace(os.sep, "/"))
+    allowed = set(name for name, source in approved.items() if source is not None)
+    if actual != allowed:
+        raise LiteError("init rejects installed package files outside RECORD; pass --wheel or set AWB_WHEEL")
+    files = sorted((name, source) for name, source in approved.items() if source is not None)
+    if not files or prefix + "/WHEEL" not in approved:
+        raise LiteError("init cannot rebuild incomplete installed package; pass --wheel or set AWB_WHEEL")
+    temporary = tempfile.mkdtemp(prefix="awb-installed-wheel-")
+    artifact = os.path.join(temporary, "agent_workboard-{0}-py3-none-any.whl".format(__version__))
+    try:
+        records = []
+        with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for archive_name, source in sorted(files):
+                with open(source, "rb") as handle:
+                    raw = handle.read()
+                info = zipfile.ZipInfo(archive_name, (2000, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, raw)
+                records.append("{0},sha256={1},{2}".format(
+                    archive_name, base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("="), len(raw)))
+            record_name = prefix + "/RECORD"
+            record = "\n".join(sorted(records) + [record_name + ",,"]) + "\n"
+            info = zipfile.ZipInfo(record_name, (2000, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, record.encode("utf-8"))
+        if _wheel_identity(artifact) != BUILD_IDENTITY:
+            raise LiteError("init rebuilt wheel identity mismatch; pass --wheel or set AWB_WHEEL")
+        return temporary, artifact, _file_sha(artifact)
+    except Exception:
+        shutil.rmtree(temporary)
+        raise
+
+
+def _wheel_binding(wheel_path=None):
+    explicit = wheel_path or os.environ.get("AWB_WHEEL")
+    direct = None if explicit else _direct_wheel()
+    if direct is False:
+        raise LiteError("init cannot trust installed direct-url metadata; pass --wheel or set AWB_WHEEL")
+    if direct:
+        wheel_path, expected = direct
+    else:
+        wheel_path = explicit or os.path.join(os.getcwd(), "dist", "agent_workboard-{0}-py3-none-any.whl".format(__version__))
+        expected = None
+    wheel_path = os.path.realpath(os.path.abspath(wheel_path))
+    if not os.path.isfile(wheel_path):
+        if not explicit and direct is None:
+            temporary, artifact, digest = _installed_wheel_rebuild()
+            return {"requirements": None, "temporary": temporary, "artifact": artifact, "sha256": digest}
+        raise LiteError("init cannot discover a verified installed wheel; pass --wheel or set AWB_WHEEL")
+    actual = _file_sha(wheel_path)
+    if expected and actual != expected:
+        raise LiteError("installed wheel metadata hash does not match its artifact")
+    basename = os.path.basename(wheel_path)
+    expected_prefix = "agent_workboard-{0}-".format(__version__)
+    if not explicit and (not basename.startswith(expected_prefix) or not basename.endswith(".whl")):
+        raise LiteError("init cannot verify the installed wheel name/version; pass --wheel or set AWB_WHEEL")
+    if not explicit and _wheel_identity(wheel_path) != BUILD_IDENTITY:
+        raise LiteError("init cannot verify the current wheel; pass --wheel or set AWB_WHEEL")
+    return {"requirements": _requirement_lock(wheel_path, actual), "temporary": None}
+
+
+def _awb(root):
+    return os.path.join(root, ".awb")
+
+
+def _config_path(root):
+    return os.path.join(_awb(root), "config.json")
+
+
+def _load_config(root):
+    try:
+        with open(_config_path(root), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (IOError, ValueError) as exc:
+        raise LiteError("invalid or missing .awb/config.json: {0}".format(exc))
+    required = ("configVersion", "projectId", "repositoryKey", "database",
+                "runtimeMode", "requiredPackageVersion", "requiredSourceCommit",
+                "requiredSourceTree", "requiredSourceTag")
+    if any(key not in data for key in required) or data["configVersion"] != CONFIG_VERSION:
+        raise LiteError("AWB configuration is incomplete or unsupported")
+    if data["runtimeMode"] not in ("stable", "development"):
+        raise LiteError("AWB runtimeMode is invalid")
+    database = os.path.realpath(os.path.join(root, data["database"]))
+    if os.path.commonpath((root, database)) != root:
+        raise LiteError("AWB database escapes project root")
+    return data, database
+
+
+def _validate_project_contract(root):
+    requirements = os.path.join(_awb(root), "requirements-awb.txt")
+    try:
+        with open(requirements, "r", encoding="utf-8") as handle:
+            locked = handle.read()
+    except IOError:
+        raise LiteError("required .awb/requirements-awb.txt is missing")
+    lines = [line.strip() for line in locked.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    package_lines = [line for line in lines if (line.startswith("file://") or line.startswith("https://")) and "#egg=agent-workboard " in line]
+    if "--require-hashes" not in lines or len(package_lines) != 1 or "--hash=sha256:" not in package_lines[0]:
+        raise LiteError("requirements-awb.txt is not a bound hash lock")
+    package, digest = package_lines[0].rsplit("--hash=sha256:", 1)
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise LiteError("requirements-awb.txt has an invalid wheel hash")
+    wheel_url = package.split("#egg=agent-workboard", 1)[0].strip()
+    parsed = urlparse(wheel_url)
+    if parsed.scheme == "file":
+        wheel_path = unquote(parsed.path)
+        if not os.path.isfile(wheel_path):
+            raise LiteError("requirements-awb.txt wheel is unavailable")
+        actual = _file_sha(wheel_path)
+        if actual != digest:
+            raise LiteError("requirements-awb.txt wheel hash does not match")
+    elif parsed.scheme != "https" or parsed.netloc != "github.com" or not parsed.path.startswith("/cleocn/agent-workboard/releases/download/v0.1.0/"):
+        raise LiteError("requirements-awb.txt is not an approved release wheel URL")
+    try:
+        with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
+            project = handle.read()
+    except IOError:
+        raise LiteError("required .awb/project.md is missing")
+    headings = ("项目身份", "WorkItem 路由表", "权威库/文档位置", "角色映射", "默认授权与禁止的远程动作")
+    for heading in headings:
+        marker = "## " + heading
+        start = project.find(marker)
+        if start < 0:
+            raise LiteError("project.md is missing required section: " + heading)
+        following = project.find("\n## ", start + len(marker))
+        if not project[start + len(marker):following if following >= 0 else len(project)].strip():
+            raise LiteError("project.md has empty required section: " + heading)
+
+
+def _is_editable():
+    def loaded_outside(location):
+        import agent_workboard
+        try:
+            return os.path.commonpath((os.path.realpath(location),
+                                       os.path.realpath(agent_workboard.__file__))) != os.path.realpath(location)
+        except ValueError:
+            return True
+    try:
+        import importlib_metadata
+    except ImportError:
+        try:
+            from importlib import metadata as importlib_metadata
+        except ImportError:
+            try:
+                import pkg_resources
+                dist = pkg_resources.get_distribution("agent-workboard")
+                if str(getattr(dist, "egg_info", "")).endswith(".egg-info"):
+                    return True
+                for entry in list(__import__("sys").path):
+                    if os.path.isfile(os.path.join(entry, "agent-workboard.egg-link")):
+                        return True
+                return not bool(dist.location) or loaded_outside(dist.location)
+            except Exception:
+                return True
+    try:
+        dist = importlib_metadata.distribution("agent-workboard")
+        direct = dist.read_text("direct_url.json")
+    except Exception:
+        return True
+    if not direct:
+        return loaded_outside(str(dist.locate_file("")))
+    try:
+        return bool(json.loads(direct).get("dir_info", {}).get("editable")) or loaded_outside(str(dist.locate_file("")))
+    except ValueError:
+        return True
+
+
+def _validate_identity(config, database, require_database=True):
+    if config["requiredPackageVersion"] != __version__:
+        raise LiteError("installed package version does not match project lock")
+    for key in ("sourceCommit", "sourceTree", "sourceTag"):
+        if config["required" + key[0].upper() + key[1:]] != BUILD_IDENTITY[key]:
+            raise LiteError("package build identity does not match project lock")
+    mode = config["runtimeMode"]
+    if mode == "stable":
+        if not BUILD_IDENTITY["sourceCommit"] or not BUILD_IDENTITY["sourceTree"]:
+            raise LiteError("stable mode requires a wheel built from a frozen commit and tree")
+        if _is_editable():
+            raise LiteError("stable mode refuses editable or unverified package source")
+        if require_database and not os.path.isfile(database):
+            raise LiteError("stable database is missing; run awb bootstrap")
+    else:
+        awb_root = os.path.realpath(os.path.join(os.path.dirname(database), ".."))
+        expected = os.path.join(awb_root, "dev")
+        if os.path.commonpath((expected, database)) != expected:
+            raise LiteError("development database must stay under .awb/dev")
+        stable_database = os.path.join(awb_root, "workboard.db")
+        if os.path.exists(stable_database) and os.path.samefile(stable_database, database):
+            raise LiteError("development database aliases stable database")
+
+
+def config_for(root, development=False):
+    mode = "development" if development else "stable"
+    db = ".awb/dev/workboard.db" if development else ".awb/workboard.db"
+    return {
+        "configVersion": CONFIG_VERSION,
+        "projectId": "project-" + uuid.uuid4().hex,
+        "repositoryKey": os.path.basename(root) or "project",
+        "database": db,
+        "runtimeMode": mode,
+        "requiredPackageVersion": __version__,
+        "requiredSourceCommit": BUILD_IDENTITY["sourceCommit"],
+        "requiredSourceTree": BUILD_IDENTITY["sourceTree"],
+        "requiredSourceTag": BUILD_IDENTITY["sourceTag"],
+    }
+
+
+def _project_markdown(config):
+    return """# Agent Workboard project contract
+
+> Generated by the installed Agent Workboard package.
+
+## 项目身份
+
+- projectId: `{projectId}`
+- repositoryKey: `{repositoryKey}`
+
+## WorkItem 路由表
+
+TI、FE、R、WA 和 AWB 是兼容 MVP-LITE-v1 的中性顶层类型。项目可在本文件补充自己的业务路由。
+
+## 权威库/文档位置
+
+数据库由 `.awb/config.json` 的相对路径指定；项目文档由项目自己维护。
+
+## 角色映射
+
+ORCHESTRATOR、PLANNER、IMPLEMENTER、REVIEWER 与 HUMAN 依照活动规格执行。
+
+## 默认授权与禁止的远程动作
+
+默认只允许本地工作。远程仓库、push、部署、发布和远程数据写入都需要项目的明确人工授权。
+""".format(**config)
+
+
+def init_project(path, with_codex=False, development=False, wheel_path=None):
+    root = _project_root(path)
+    awb = _awb(root)
+    config = config_for(root, development)
+    targets = [awb]
+    if with_codex:
+        targets.append(os.path.join(root, ".codex"))
+    if any(os.path.lexists(target) for target in targets):
+        raise LiteError("init refuses existing managed target")
+    binding = _wheel_binding(wheel_path)
+    created = []
+    try:
+        os.makedirs(awb)
+        created.append(awb)
+        with open(_config_path(root), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+        with open(os.path.join(awb, "project.md"), "w", encoding="utf-8") as handle:
+            handle.write(_project_markdown(config))
+        with open(os.path.join(awb, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("workboard.db\nworkboard.db-*\n*.backup.db\nartifacts/\n")
+        requirements = binding["requirements"]
+        if binding["temporary"]:
+            artifacts = os.path.join(awb, "artifacts")
+            os.makedirs(artifacts)
+            artifact = os.path.join(artifacts, os.path.basename(binding["artifact"]))
+            incomplete = artifact + ".tmp-" + uuid.uuid4().hex
+            shutil.copyfile(binding["artifact"], incomplete)
+            if _file_sha(incomplete) != binding["sha256"]:
+                raise LiteError("init rebuilt wheel hash changed before installation")
+            os.replace(incomplete, artifact)
+            requirements = _requirement_lock(artifact, binding["sha256"])
+        with open(os.path.join(awb, "requirements-awb.txt"), "w", encoding="utf-8") as handle:
+            handle.write(requirements)
+        database = os.path.join(root, config["database"])
+        initialize_database(database)
+        if with_codex:
+            codex_install(root)
+        return {"status": "ok", "project": root, "database": database, "runtimeMode": config["runtimeMode"]}
+    except Exception:
+        for target in reversed(created):
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+        raise
+    finally:
+        if binding["temporary"]:
+            shutil.rmtree(binding["temporary"])
+
+
+def bootstrap(path):
+    root = _project_root(path)
+    config, database = _load_config(root)
+    _validate_project_contract(root)
+    _validate_identity(config, database, require_database=False)
+    for name in MANAGED:
+        if not os.path.isfile(os.path.join(_awb(root), name)):
+            raise LiteError("bootstrap requires existing .awb/{0}".format(name))
+    if os.path.lexists(database):
+        try:
+            open_database(database).close()
+        except LiteError:
+            raise LiteError("bootstrap refuses invalid existing database")
+        return {"status": "no-op", "database": database}
+    parent = os.path.dirname(database)
+    os.makedirs(parent, exist_ok=True)
+    temporary = database + ".bootstrap-" + uuid.uuid4().hex
+    try:
+        initialize_database(temporary)
+        open_database(temporary).close()
+        os.replace(temporary, database)
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.lexists(temporary + suffix):
+                os.unlink(temporary + suffix)
+    return {"status": "ok", "database": database}
+
+
+def doctor(path):
+    root = _project_root(path)
+    config, database = _load_config(root)
+    _validate_project_contract(root)
+    _validate_identity(config, database)
+    connection = open_database(database)
+    try:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+        active_claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
+        writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
+    finally:
+        connection.close()
+    if integrity != "ok" or foreign_keys:
+        raise LiteError("database integrity or foreign key check failed")
+    return {"status": "ok", "database": database, "schemaVersion": SCHEMA_VERSION,
+            "buildIdentity": BUILD_IDENTITY, "activeClaims": active_claims, "activeWriters": writers}
+
+
+def backup(path):
+    root = _project_root(path)
+    config, database = _load_config(root)
+    _validate_project_contract(root)
+    _validate_identity(config, database)
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    target = database + "." + stamp + ".backup.db"
+    source = open_database(database)
+    destination = sqlite3.connect(target)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    return {"status": "ok", "backup": target, "sha256": _file_sha(target)}
+
+
+def migrate(path, check=False):
+    root = _project_root(path)
+    config, database = _load_config(root)
+    _validate_project_contract(root)
+    _validate_identity(config, database)
+    connection = open_database(database)
+    try:
+        claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
+        writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
+    finally:
+        connection.close()
+    result = {"current": SCHEMA_VERSION, "target": SCHEMA_VERSION, "pending": [], "activeClaims": claims, "activeWriters": writers}
+    if check:
+        return result
+    if claims or writers:
+        raise LiteError("migrate refuses active claim or repository writer")
+    result["backup"] = backup(root)["backup"]
+    result["status"] = "no-op"
+    return result
+
+
+def _codex_targets(root):
+    return {
+        os.path.join(root, ".codex", "skills", "awb-orchestrator", "SKILL.md"): "codex/skills/awb-orchestrator/SKILL.md",
+        os.path.join(root, ".codex", "agents", "planner.toml"): "codex/agents/planner.toml",
+        os.path.join(root, ".codex", "agents", "implementer.toml"): "codex/agents/implementer.toml",
+        os.path.join(root, ".codex", "agents", "reviewer.toml"): "codex/agents/reviewer.toml",
+        os.path.join(root, ".codex", "agents", "fast-worker.toml"): "codex/agents/fast-worker.toml",
+    }
+
+
+def codex_install(path):
+    root = _project_root(path)
+    targets = _codex_targets(root)
+    if any(os.path.lexists(target) for target in targets):
+        raise LiteError("codex install refuses existing managed target")
+    created = []
+    try:
+        for target, resource in targets.items():
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(_resource(resource))
+            created.append(target)
+    except Exception:
+        for target in reversed(created):
+            if os.path.exists(target):
+                os.unlink(target)
+        raise
+    return {"status": "ok", "files": sorted(os.path.relpath(path, root) for path in created)}
+
+
+def codex_check(path):
+    root = _project_root(path)
+    _validate_project_contract(root)
+    missing = [os.path.relpath(target, root) for target in _codex_targets(root) if not os.path.isfile(target)]
+    if missing:
+        raise LiteError("Codex templates missing: " + ", ".join(sorted(missing)))
+    with open(os.path.join(root, ".codex", "skills", "awb-orchestrator", "SKILL.md"), "r", encoding="utf-8") as handle:
+        skill = handle.read()
+    if "AGENTS.md" not in skill or ".awb/project.md" not in skill or "human" not in skill.lower():
+        raise LiteError("Codex Skill contract is incomplete")
+    return {"status": "ok"}
+
+
+def _row_hash(row):
+    return _sha(_json(row))
+
+
+def transfer_export(database, work_item_ids, destination):
+    source = open_database(database)
+    try:
+        active = source.execute("SELECT count(*) FROM claims WHERE work_item_id IN ({0}) AND status='ACTIVE'".format(
+            ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
+        writers = source.execute("SELECT count(*) FROM repository_locks WHERE work_item_id IN ({0}) AND status='ACTIVE'".format(
+            ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
+        if active or writers:
+            raise LiteError("transfer export refuses active claim or writer")
+        bundle = {"schemaVersion": SCHEMA_VERSION, "bundleId": "bundle-" + uuid.uuid4().hex,
+                  "sourceDatabaseId": _sha(os.path.realpath(database)),
+                  "workItemIds": sorted(work_item_ids), "tables": {}}
+        for table in TABLES:
+            rows = [dict(row) for row in source.execute(
+                "SELECT * FROM {0} WHERE work_item_id IN ({1}) ORDER BY rowid".format(table, ",".join("?" for _ in work_item_ids)), work_item_ids)]
+            bundle["tables"][table] = rows
+        bundle["eventWatermark"] = max([row["event_id"] for row in bundle["tables"]["events"]] or [0])
+        encoded = _json(bundle)
+        bundle["sha256"] = _sha(encoded)
+    finally:
+        source.close()
+    with open(destination, "w", encoding="utf-8") as handle:
+        json.dump(bundle, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+    return {"status": "ok", "bundle": destination, "sha256": bundle["sha256"]}
+
+
+def _bundle(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        bundle = json.load(handle)
+    expected = bundle.pop("sha256", None)
+    actual = _sha(_json(bundle))
+    if expected != actual or bundle.get("schemaVersion") != SCHEMA_VERSION:
+        raise LiteError("invalid transfer bundle")
+    bundle["sha256"] = expected
+    return bundle
+
+
+def transfer_import(database, bundle_path, check=False):
+    bundle = _bundle(bundle_path)
+    target = open_database(database)
+    try:
+        target.execute("BEGIN IMMEDIATE")
+        changes = []
+        for table in TABLES:
+            for row in bundle["tables"].get(table, []):
+                key = {"work_items": "work_item_id", "tasks": "task_id", "claims": "claim_id",
+                       "repository_locks": "lock_id", "reviews": "review_id", "human_gates": "gate_id",
+                       "events": "event_id"}[table]
+                existing = target.execute("SELECT * FROM {0} WHERE {1}=?".format(table, key), (row[key],)).fetchone()
+                if existing is not None and _row_hash(dict(existing)) != _row_hash(row):
+                    raise LiteError("transfer conflict in {0}:{1}".format(table, row[key]))
+                if existing is None:
+                    changes.append((table, row))
+        if check:
+            target.rollback()
+            return {"status": "check", "bundle": bundle["bundleId"], "pendingRows": len(changes)}
+        for table, row in changes:
+            columns = sorted(row)
+            target.execute("INSERT INTO {0} ({1}) VALUES ({2})".format(
+                table, ",".join(columns), ",".join("?" for _ in columns)), [row[column] for column in columns])
+        target.commit()
+        return {"status": "no-op" if not changes else "ok", "bundle": bundle["bundleId"], "insertedRows": len(changes)}
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        target.close()

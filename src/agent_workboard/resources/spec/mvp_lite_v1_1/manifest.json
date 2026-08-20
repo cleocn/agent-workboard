@@ -1,0 +1,21 @@
+{
+  "manifestVersion": "MVP-LITE-v1.1",
+  "status": "CANDIDATE / NOT AUTHORITATIVE",
+  "databaseSchemaVersion": "MVP-LITE-v1",
+  "planRevision": "AWB-003 local RC",
+  "composition": {
+    "databaseSchema": "schema.sql",
+    "workItemSchema": "workitem.schema.json",
+    "workflow": "workflow.yaml",
+    "agentGuide": "AGENT-GUIDE.md",
+    "acceptanceSuite": "acceptance-cases.yaml",
+    "acceptanceCaseCount": 31
+  },
+  "artifacts": [
+    {"path": "schema.sql", "sha256": "cbb5032c4d6d73ac2dff318b215f467663e5b82973b6a4635d4a0d47607a4468"},
+    {"path": "workitem.schema.json", "sha256": "b73e5f09e950a21113c62e8904f92548cfb3620fe8c1b26aef4c2bc06290993f"},
+    {"path": "workflow.yaml", "sha256": "77977e93552ac7a8a78b271a34836722db68d5214e0bee6b5391a9e9515437dd"},
+    {"path": "AGENT-GUIDE.md", "sha256": "aa2b9d80ca3520b4ada7b918d8d82049c4fd652e6f17ead578f0dd69dcc34585"},
+    {"path": "acceptance-cases.yaml", "sha256": "8911a8de543db7ab25adb300e9c05a5666796d0d4fcc29c071cfbc45f90b03d7"}
+  ]
+}
