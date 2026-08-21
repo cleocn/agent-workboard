@@ -64,7 +64,10 @@ def main(argv=None):
     migration.add_argument("--check", action="store_true")
     upgrade = sub.add_parser("upgrade")
     upgrade.add_argument("--project", default=".")
-    upgrade.add_argument("--wheel", required=True)
+    upgrade_source = upgrade.add_mutually_exclusive_group(required=True)
+    upgrade_source.add_argument("--wheel")
+    upgrade_source.add_argument("--rollback")
+    upgrade.add_argument("--check", action="store_true")
     upgrade.add_argument("--with-codex", action="store_true")
     codex = sub.add_parser("codex")
     codex_sub = codex.add_subparsers(dest="codex_command", required=True)
@@ -105,7 +108,12 @@ def main(argv=None):
         elif args.command == "migrate":
             _print(migrate(args.project, args.check))
         elif args.command == "upgrade":
-            _print(upgrade_project(args.project, args.wheel, args.with_codex))
+            if args.rollback and args.with_codex:
+                parser.error("--with-codex is only valid with --wheel")
+            result = upgrade_project(args.project, args.wheel, args.with_codex,
+                                     check=args.check, rollback_manifest=args.rollback)
+            _print(result)
+            return 2 if result["status"] in ("REFUSED", "BLOCKED") else 0
         elif args.command == "codex":
             _print(codex_install(args.project) if args.codex_command == "install" else codex_check(args.project))
         elif args.command == "transfer":

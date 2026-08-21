@@ -12,6 +12,16 @@ implementer → independent reviewer → human final gate.  Do not replace a
 reviewer or human gate, and do not perform remote actions without explicit
 approval.
 
+When an existing managed project has `.awb/config.json` and its package lock,
+installed AWB version, requested target wheel, or prior upgrade result indicates
+that an upgrade or rollback may be needed, read the adjacent
+`references/upgrade-and-rollback.md` (`AWB-UPGRADE-RUNBOOK-v1`) completely before
+acting.  Follow its `PREFLIGHT_FIRST` route: check before every write, stop on
+`REFUSED` or `BLOCKED`, and consume exactly the one structured `nextStep` in the
+`AWB-UPGRADE-v1` result.  Also read it before interpreting a rollback manifest,
+recovering an interrupted rollback, or advising that an unsupported version pair
+can proceed.
+
 Every new WorkItem must include a validated `AWB-WORKITEM-MGMT-v1` envelope and
 continuous T01+ task board at create time.  Historical records must be backfilled
 through the public command before reopened or materially expanded.  Treat SQLite

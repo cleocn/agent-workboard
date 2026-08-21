@@ -1,6 +1,22 @@
 {
   "files": [
     {
+      "path": ".awb/.gitignore",
+      "sha256": "e328e7acc068354ebc94ab9d164d268d15692facf7cd02d717ab003c2f126190"
+    },
+    {
+      "path": ".awb/config.json",
+      "sha256": "c7026425a074dec4fb685c68397d401dabd6513f760e261e3ee9d38bc65f25aa"
+    },
+    {
+      "path": ".awb/project.md",
+      "sha256": "b16fbfdea8cf31479dfb8b8e1feac91157e073bc2c88b020b8c9b2ed686e3e61"
+    },
+    {
+      "path": ".awb/requirements-awb.txt",
+      "sha256": "a731b26b5937fd8c81f9e00645e5bf33f5a777391d99151b693502979ef93991"
+    },
+    {
       "path": ".codex/agents/convergence-reviewer.toml",
       "sha256": "f17658e090ef2fef3e0e323db4ca1d3f9c1bda7c32ef9f82c52023e57a275e65"
     },
@@ -22,7 +38,11 @@
     },
     {
       "path": ".codex/skills/awb-orchestrator/SKILL.md",
-      "sha256": "cd2b4a784a318b341bb4e70239b45800b04021cb634e46ba1a1d06500fd0d9ff"
+      "sha256": "5444e4b9261e6fd4fc03e1d08eb9ddcd0152da7a6abce3512f7b406d11d2c6a5"
+    },
+    {
+      "path": ".codex/skills/awb-orchestrator/references/upgrade-and-rollback.md",
+      "sha256": "41aad9ba1c81db25209b5bf7e381f4c943e6d21bfdf94e5b700fab2b8f1192d1"
     },
     {
       "path": ".gitignore",
@@ -30,7 +50,7 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "aec442b048477f25c96469e7dc2d4662e65ceebe4bbb2a46e5488cbd583351f5"
+      "sha256": "1c13e3877c9c651178e950f64a109ec381b5ca0417d1ee4f22ad35c4bb2ce710"
     },
     {
       "path": "CONTRIBUTING.md",
@@ -42,11 +62,15 @@
     },
     {
       "path": "README.md",
-      "sha256": "82b31283f6f4e0530c586a3ab8f3a33e894c260d52fa78f652927c7e0fd04772"
+      "sha256": "0688c4a2ae9a9a4ca4a2019bfcc2513f815a30d01c5680fcb8d7c5c92e98faa0"
     },
     {
       "path": "docs/evidence/awb-004-release.md",
       "sha256": "c6506928cf4ea701eb31c6acf6fd9ed9aba8a87b41627db3f291cad6e0937a9f"
+    },
+    {
+      "path": "docs/evidence/awb-007-release.md",
+      "sha256": "94ce5aabe28cc583a0840eb623492c422c6e4f8d28614389db493fecae2db2e4"
     },
     {
       "path": "docs/history.md",
@@ -58,7 +82,7 @@
     },
     {
       "path": "docs/usage/quickstart.md",
-      "sha256": "dbdc5738114a98c745a93d97c653548bc43eee69c265efcf6cf0d580e5519ce2"
+      "sha256": "3b4b2a4b9e031d9d9133b4716af009abac4e81181c1f240b26197752fe41eace"
     },
     {
       "path": "docs/work-item-templates/README.md",
@@ -94,11 +118,11 @@
     },
     {
       "path": "setup.py",
-      "sha256": "36bcb7008761f3e3ef30ab02200207d3f9fde8d4b46656bf764b8c3d30431fc1"
+      "sha256": "c7d5ba673715bd55127d8ac39379ef9e3fd1b4462fb9606a3615499fa0540eb1"
     },
     {
       "path": "src/agent_workboard/__init__.py",
-      "sha256": "f3c2853f29c878ace6fddbc970b42666115d0eaa1384b2b490bc90d72b168e25"
+      "sha256": "cf2a9bf6a8c7e68b04456937a37cc707e9ab1a0d7f395001bd54e335adee0f47"
     },
     {
       "path": "src/agent_workboard/__main__.py",
@@ -106,11 +130,11 @@
     },
     {
       "path": "src/agent_workboard/_build.py",
-      "sha256": "16d1031c5ad134b9aee750f4a7ac10482b21dae5abd6268f9cbfa7f64b0e6045"
+      "sha256": "5b8eaf1e6b62eb0dcdaa290aa72949c10f44fc73a39cf06db154eac4c5d2c99d"
     },
     {
       "path": "src/agent_workboard/cli.py",
-      "sha256": "7d29b2c8f6cf88cb896fda02c55b869b3265725fd496b296c276b9d72f89061a"
+      "sha256": "52005674b1a3ca501a36ec667212c9bc63e0005376bff199ab21e74bdcf35555"
     },
     {
       "path": "src/agent_workboard/lite.py",
@@ -118,7 +142,7 @@
     },
     {
       "path": "src/agent_workboard/project.py",
-      "sha256": "8a391ca10e8f5abc4df9798490713362070e7be194c7b0bbc7e7699f034d9d41"
+      "sha256": "edb85abc73c9854790a4cb6be7d6a2b76227fd8a8c34c74ff87dfc8cdeb9c6f9"
     },
     {
       "path": "src/agent_workboard/resources/codex/agents/convergence-reviewer.toml",
@@ -142,7 +166,11 @@
     },
     {
       "path": "src/agent_workboard/resources/codex/skills/awb-orchestrator/SKILL.md",
-      "sha256": "cd2b4a784a318b341bb4e70239b45800b04021cb634e46ba1a1d06500fd0d9ff"
+      "sha256": "5444e4b9261e6fd4fc03e1d08eb9ddcd0152da7a6abce3512f7b406d11d2c6a5"
+    },
+    {
+      "path": "src/agent_workboard/resources/codex/skills/awb-orchestrator/references/upgrade-and-rollback.md",
+      "sha256": "41aad9ba1c81db25209b5bf7e381f4c943e6d21bfdf94e5b700fab2b8f1192d1"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/AGENT-GUIDE.md",
@@ -202,22 +230,22 @@
     },
     {
       "path": "tests/test_project.py",
-      "sha256": "3774f0a983e0b4a73e5534d7d1be322e43b58a67f32da7977fafe3ec6a72b20e"
+      "sha256": "11fdf449fc7fb4d4993f31a80589e47804e550adb227d8f4fc50e3f59265e16e"
     },
     {
       "path": "tests/test_release_build.py",
-      "sha256": "ea2536a5cb2657481e9ab13076552fb4379ec68e27fd667e3485612f6d303d85"
+      "sha256": "7b8c289f101029840de1877c116eb048469ff1651757cca49c5c8eb8c307e44a"
     },
     {
       "path": "tests/test_release_gate.py",
-      "sha256": "1272ef2a55587d3ddf46afbc496329ecfcdb0a29b2a56809078b0389c4f12605"
+      "sha256": "49ef29f78c186ff344eb540575fd17b1838a18ad4031c5ebf3111a531f89ab93"
     },
     {
       "path": "tools/release_gate.py",
-      "sha256": "6b34d4683a2530824a5a8ab7cbd5f52236d9b04bb8036cefaf92d97eb4adc9f8"
+      "sha256": "ee6698d7415f503e771cc54ed97ec704287da004371413be0eb82f2cd8072bbc"
     }
   ],
-  "manifestVersion": "AWB-004-public-v2",
+  "manifestVersion": "AWB-007-public-v1",
   "scope": "tracked public source files excluding .awb consumer state and this non-recursive manifest",
-  "status": "AGENT WORKBOARD 0.2.0 RELEASE TREE"
+  "status": "AGENT WORKBOARD 0.2.1 RELEASE TREE"
 }

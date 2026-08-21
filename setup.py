@@ -22,6 +22,10 @@ TEMPLATE_FILES = (
     "test-issue-trigger-rules.md",
     "wa-template.md",
 )
+CODEX_SKILL_FILES = (
+    "SKILL.md",
+    "references/upgrade-and-rollback.md",
+)
 
 
 def _source_version():
@@ -117,6 +121,11 @@ class sdist(_sdist):
         for name in TEMPLATE_FILES:
             shutil.copyfile(os.path.join(ROOT, "docs", "work-item-templates", name),
                             os.path.join(template_target, name))
+        skill_target = os.path.join(base_dir, ".codex", "skills", "awb-orchestrator")
+        for name in CODEX_SKILL_FILES:
+            target = os.path.join(skill_target, name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(os.path.join(ROOT, ".codex", "skills", "awb-orchestrator", name), target)
 
     def make_archive(self, base_name, fmt, root_dir=None, base_dir=None, owner=None, group=None):
         if fmt != "gztar" or root_dir is not None or not base_dir:
@@ -150,7 +159,8 @@ setup(
     python_requires=">=3.7",
     package_dir={"": "src"},
     packages=find_packages("src"),
-    package_data={"agent_workboard": ["resources/*/*", "resources/*/*/*", "resources/*/*/*/*"]},
+    package_data={"agent_workboard": ["resources/*/*", "resources/*/*/*", "resources/*/*/*/*",
+                                      "resources/*/*/*/*/*"]},
     entry_points={"console_scripts": ["awb=agent_workboard.cli:main"]},
     url="https://github.com/cleocn/agent-workboard",
     project_urls={"Source": "https://github.com/cleocn/agent-workboard"},

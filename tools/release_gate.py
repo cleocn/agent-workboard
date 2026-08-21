@@ -46,8 +46,16 @@ def check_successor(repository, base, candidate, v01_commit, allowlist):
         raise ValueError("v0.1.0 history is not preserved")
     if run(repository, "rev-parse", "v0.1.0^{commit}").strip() != v01_commit:
         raise ValueError("v0.1.0 tag moved")
-    if run(repository, "rev-parse", "v0.2.0^{commit}").strip() != candidate:
-        raise ValueError("v0.2.0 tag does not identify the candidate")
+    if run(repository, "rev-parse", "v0.2.0^{commit}").strip() != base:
+        raise ValueError("v0.2.0 tag moved from the verified public main")
+    if run(repository, "cat-file", "-t", "v0.2.1").strip() != "tag":
+        raise ValueError("v0.2.1 must be an annotated tag")
+    if run(repository, "rev-parse", "v0.2.1^{commit}").strip() != candidate:
+        raise ValueError("v0.2.1 tag does not identify the candidate")
+    exact_tags = sorted(line for line in run(repository, "tag", "--points-at", candidate).splitlines()
+                        if line)
+    if exact_tags != ["v0.2.1"]:
+        raise ValueError("release candidate must have the unique exact v0.2.1 tag")
     changed = sorted(line for line in run(repository, "diff", "--name-only", base, candidate).splitlines() if line)
     unexpected = sorted(set(changed) - set(allowlist))
     if unexpected:
@@ -56,6 +64,7 @@ def check_successor(repository, base, candidate, v01_commit, allowlist):
         raise ValueError("release candidate worktree is not clean")
     scanned = scan(repository)
     return {"base": base, "candidate": candidate, "v0.1.0": v01_commit,
+            "v0.2.0": base, "v0.2.1": candidate,
             "changedPaths": changed, "reachableObjectCount": len(scanned["objects"]),
             "refs": scanned["refs"]}
 

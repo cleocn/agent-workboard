@@ -23,13 +23,16 @@ class ReleaseGateTest(unittest.TestCase):
             with open(os.path.join(repository, "stable.txt"), "w", encoding="utf-8") as handle:
                 handle.write("stable self-hosting\n")
             subprocess.check_call(["git", "add", "--", "stable.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "stable"], cwd=repository, stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "commit", "-m", "v0.2.0"], cwd=repository,
+                                  stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "tag", "v0.2.0"], cwd=repository)
             base = self._git(repository, "rev-parse", "HEAD")
             with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
-                handle.write("0.2.0\n")
+                handle.write("0.2.1\n")
             subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.2.0"], cwd=repository, stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "v0.2.0"], cwd=repository)
+            subprocess.check_call(["git", "commit", "-m", "v0.2.1"], cwd=repository,
+                                  stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "tag", "-a", "v0.2.1", "-m", "v0.2.1"], cwd=repository)
             script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools", "release_gate.py")
             subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
                                    "--base", base, "--v0.1-commit", v01, "--path", "release.txt"],
@@ -37,6 +40,14 @@ class ReleaseGateTest(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
                                        "--base", base, "--v0.1-commit", v01, "--path", "stable.txt"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            subprocess.check_call(["git", "tag", "-d", "v0.2.1"], cwd=repository,
+                                  stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "tag", "v0.2.1"], cwd=repository)
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
+                                       "--base", base, "--v0.1-commit", v01, "--path", "release.txt"],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
