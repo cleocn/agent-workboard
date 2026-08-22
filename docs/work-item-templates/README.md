@@ -33,6 +33,12 @@
 - 使用 `<WI-ID>-T01...` 的连续编号任务板，含 owner、required、task status、acceptance 和 closure evidence；
 - WorkItem acceptance、closure、证据引用和初始状态历史。
 
+创建前还必须生成 `AWB-CREATION-RISK-v1`：只从实际 scope、获准动作和已观测状态
+识别 `REMOTE / DESTRUCTIVE / ANOMALOUS_STATE`，否定性的 out-of-scope/forbidden
+文字不单独触发。普通 STANDARD 新建默认 `AUTO_ON_PASS`，显式关闭自动通过为
+`MANUAL`；若命中任何风险，必须先让用户二选一，未回答不得 create。该选择不授予
+风险动作权限。公共 CLI create 必须提供 risk file；已有 WorkItem/旧 bundle 迁移为 MANUAL。
+
 顶层 lifecycle state 与 queue_state 属于 WorkItem 层；任务只使用 `NOT_STARTED / IN_PROGRESS / BLOCKED / WAITING_ACCEPTANCE / COMPLETED / CANCELLED`。同一 WorkItem 最多一个 `IN_PROGRESS`。默认进度为“已完成 required tasks / required tasks 总数”，required `CANCELLED` 不算完成且阻止关闭。
 
 旧模板中的 `T00` 是历史展示格式。新建或重新补齐到当前运行时的任务必须从 `<WI-ID>-T01` 连续编号；不得把旧 `T00` 直接持久化。模板中的 emoji 只用于展示，必须一一映射到六种 task status，不是额外状态。

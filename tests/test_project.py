@@ -14,11 +14,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from agent_workboard.lite import (LiteError, acquire_claim, acquire_repository_lock,
-                                  create_work_item, initialize_database, open_database)
+                                  create_work_item, get_work_item, human_gate_schema_state,
+                                  initialize_database, open_database)
 from agent_workboard.cli import _project_database, main as cli_main
 from agent_workboard.project import (bootstrap, codex_check, codex_install, doctor,
                                      init_project, migrate, transfer_export, transfer_import,
                                      upgrade_project)
+from agent_workboard.orchestrator import (claim as orchestrator_claim,
+                                          release as orchestrator_release,
+                                          schema_state as orchestrator_schema_state)
 from agent_workboard.usage import append_event
 import agent_workboard.project as project_module
 
@@ -46,9 +50,9 @@ class ProjectLifecycleTest(unittest.TestCase):
                          digest + "\n")
 
     def target_wheel(self):
-        identity = {"packageVersion": "0.3.0b1", "sourceCommit": "3" * 40,
-                    "sourceTree": "4" * 40, "sourceTag": "v0.3.0b1"}
-        path = os.path.join(self.temporary.name, "agent_workboard-0.3.0b1-py3-none-any.whl")
+        identity = {"packageVersion": "0.3.1b1", "sourceCommit": "3" * 40,
+                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b1"}
+        path = os.path.join(self.temporary.name, "agent_workboard-0.3.1b1-py3-none-any.whl")
         self.fake_wheel(path, identity, include_codex=True)
         return path, identity
 
@@ -66,6 +70,34 @@ class ProjectLifecycleTest(unittest.TestCase):
     def install_usage_extension(self, database):
         connection = sqlite3.connect(database)
         connection.executescript(project_module.usage_schema_sql())
+        connection.commit()
+        connection.close()
+
+    def remove_orchestrator_extension(self, database):
+        connection = sqlite3.connect(database)
+        connection.executescript(
+            "DROP TRIGGER IF EXISTS orchestrator_events_no_update;"
+            "DROP TRIGGER IF EXISTS orchestrator_events_no_delete;"
+            "DROP TABLE IF EXISTS orchestrator_events;"
+            "DROP TABLE IF EXISTS orchestrator_leases;"
+            "DROP TABLE IF EXISTS orchestrator_instances;"
+            "DELETE FROM schema_meta WHERE key='orchestrator_schema_version';"
+        )
+        connection.commit()
+        connection.close()
+
+    def remove_gate_policy_extension(self, database):
+        connection = sqlite3.connect(database)
+        connection.executescript(
+            "DELETE FROM schema_meta WHERE key='gate_policy_schema_version';"
+            "ALTER TABLE work_items DROP COLUMN human_gate_policy;"
+        )
+        connection.commit()
+        connection.close()
+
+    def install_gate_policy_extension(self, database):
+        connection = sqlite3.connect(database)
+        connection.executescript(project_module.human_gate_schema_sql())
         connection.commit()
         connection.close()
 
@@ -132,7 +164,7 @@ class ProjectLifecycleTest(unittest.TestCase):
 
     def prepare_old_project(self, with_codex=False, source_identity=None):
         init_project(self.root, with_codex=with_codex)
-        old_identity = dict(source_identity or project_module.RELEASE_0_2_1_IDENTITY)
+        old_identity = dict(source_identity or project_module.RELEASE_0_3_0B1_IDENTITY)
         source_version = old_identity["packageVersion"]
         old_wheel = os.path.join(
             self.temporary.name,
@@ -169,7 +201,9 @@ class ProjectLifecycleTest(unittest.TestCase):
         with open(os.path.join(self.root, ".awb", "requirements-awb.txt"), "w", encoding="utf-8") as handle:
             handle.write("--require-hashes\nfile://" + old_wheel +
                          "#egg=agent-workboard --hash=sha256:" + digest + "\n")
-        self.remove_usage_extension(os.path.join(self.root, ".awb", "workboard.db"))
+        database = os.path.join(self.root, ".awb", "workboard.db")
+        self.remove_orchestrator_extension(database)
+        self.remove_gate_policy_extension(database)
         return old_wheel
 
     def management(self, work_item_id):
@@ -333,6 +367,231 @@ class ProjectLifecycleTest(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_events'").fetchone())
         connection.close()
 
+    def test_gate_policy_migration_keeps_legacy_items_manual_and_doctor_fails_partial(self):
+        init_project(self.root, development=True)
+        self.bind_requirements()
+        database = os.path.join(self.root, ".awb", "dev", "workboard.db")
+        create_work_item(
+            database, "AWB-070", "AWB", "legacy item",
+            management=self.management("AWB-070"), human_review="MANUAL",
+        )
+        self.remove_gate_policy_extension(database)
+        checked = migrate(self.root, check=True)
+        self.assertEqual(["AWB-AUTO-GATE-v1"], checked["pending"])
+        self.assertEqual("ABSENT", doctor(self.root)["gatePolicySchemaState"])
+        migrated = migrate(self.root)
+        self.assertEqual("ok", migrated["status"])
+        self.assertTrue(os.path.isfile(migrated["backup"]))
+        self.assertEqual("MANUAL", get_work_item(database, "AWB-070")["humanGatePolicy"])
+        self.assertEqual("AWB-AUTO-GATE-v1", doctor(self.root)["gatePolicySchemaVersion"])
+        connection = open_database(database)
+        connection.execute(
+            "DELETE FROM schema_meta WHERE key='gate_policy_schema_version'"
+        )
+        connection.commit()
+        self.assertEqual("INVALID", human_gate_schema_state(connection))
+        connection.close()
+        with self.assertRaises(LiteError):
+            doctor(self.root)
+        with self.assertRaises(LiteError):
+            migrate(self.root)
+
+    def test_gate_policy_migration_fault_rolls_back_column_and_retains_backup(self):
+        init_project(self.root, development=True)
+        self.bind_requirements()
+        database = os.path.join(self.root, ".awb", "dev", "workboard.db")
+        self.remove_gate_policy_extension(database)
+        before = set(os.listdir(os.path.dirname(database)))
+        with mock.patch.object(
+                project_module, "human_gate_schema_sql",
+                return_value=(
+                    "ALTER TABLE work_items ADD COLUMN human_gate_policy TEXT NOT NULL "
+                    "DEFAULT 'MANUAL' CHECK (human_gate_policy IN ('AUTO_ON_PASS','MANUAL'));"
+                    "INVALID SQL;"
+                )):
+            with self.assertRaises(sqlite3.Error):
+                migrate(self.root)
+        connection = open_database(database)
+        self.assertEqual("ABSENT", human_gate_schema_state(connection))
+        connection.close()
+        after = set(os.listdir(os.path.dirname(database)))
+        self.assertTrue(any(name.endswith(".backup.db") for name in after - before))
+
+    def test_gate_policy_post_validation_fault_rolls_back(self):
+        init_project(self.root, development=True)
+        self.bind_requirements()
+        database = os.path.join(self.root, ".awb", "dev", "workboard.db")
+        self.remove_gate_policy_extension(database)
+        with mock.patch.object(
+                project_module, "human_gate_schema_state",
+                side_effect=["ABSENT", "INVALID"]):
+            with self.assertRaisesRegex(LiteError, "did not install"):
+                migrate(self.root)
+        connection = open_database(database)
+        self.assertEqual("ABSENT", human_gate_schema_state(connection))
+        connection.close()
+
+    def test_old_transfer_bundle_imports_as_manual_policy(self):
+        source = os.path.join(self.temporary.name, "legacy-source.db")
+        target = os.path.join(self.temporary.name, "new-target.db")
+        bundle = os.path.join(self.temporary.name, "legacy-bundle.json")
+        initialize_database(source)
+        initialize_database(target)
+        create_work_item(
+            source, "AWB-071", "AWB", "legacy transfer",
+            management=self.management("AWB-071"), human_review="MANUAL",
+        )
+        self.remove_gate_policy_extension(source)
+        transfer_export(source, ["AWB-071"], bundle)
+        self.assertEqual("ok", transfer_import(target, bundle)["status"])
+        self.assertEqual("MANUAL", get_work_item(target, "AWB-071")["humanGatePolicy"])
+
+    def test_orchestrator_additive_migration_backup_doctor_and_partial_fail_closed(self):
+        init_project(self.root, development=True)
+        self.bind_requirements()
+        database = os.path.join(self.root, ".awb", "dev", "workboard.db")
+        self.remove_orchestrator_extension(database)
+        checked = migrate(self.root, check=True)
+        self.assertEqual(["AWB-ORCHESTRATOR-v1"], checked["pending"])
+        self.assertEqual("ABSENT", doctor(self.root)["orchestratorSchemaState"])
+        migrated = migrate(self.root)
+        self.assertEqual("ok", migrated["status"])
+        self.assertTrue(os.path.isfile(migrated["backup"]))
+        self.assertEqual("AWB-ORCHESTRATOR-v1",
+                         doctor(self.root)["orchestratorSchemaVersion"])
+        pristine = os.path.join(self.temporary.name, "orchestrator-pristine.db")
+        initialize_database(pristine)
+        definitions = []
+        for candidate in (database, pristine):
+            connection = sqlite3.connect(candidate)
+            definitions.append(connection.execute(
+                "SELECT type,name,sql FROM sqlite_master WHERE name LIKE 'orchestrator_%' "
+                "OR name='one_active_orchestrator_per_work_item' ORDER BY type,name"
+            ).fetchall())
+            connection.close()
+        self.assertEqual(definitions[0], definitions[1])
+        backup_connection = open_database(migrated["backup"])
+        self.assertEqual("ABSENT", orchestrator_schema_state(backup_connection))
+        backup_connection.close()
+
+        create_work_item(database, "AWB-099", "AWB", "active coordinator",
+                         management=self.management("AWB-099"))
+        active = orchestrator_claim(database, "AWB-099", "migration-owner", 900,
+                                    "migration-claim")
+        with self.assertRaisesRegex(LiteError, "orchestrator lease"):
+            migrate(self.root)
+        orchestrator_release(database, "AWB-099", "migration-owner",
+                             active["lease"]["generation"], "migration-release")
+
+        for predicate in ("'RELEASED'", "' ACTIVE '", "'active '"):
+            with self.subTest(predicate=predicate):
+                connection = sqlite3.connect(database)
+                connection.executescript(
+                    "DROP INDEX one_active_orchestrator_per_work_item;"
+                    "CREATE UNIQUE INDEX one_active_orchestrator_per_work_item "
+                    "ON orchestrator_leases(work_item_id) WHERE status={0};".format(
+                        predicate
+                    )
+                )
+                connection.commit()
+                before = "\n".join(connection.iterdump())
+                connection.close()
+                with self.assertRaises(LiteError):
+                    doctor(self.root)
+                with self.assertRaises(LiteError):
+                    migrate(self.root, check=True)
+                connection = sqlite3.connect(database)
+                self.assertEqual(before, "\n".join(connection.iterdump()))
+                connection.close()
+
+    def test_orchestrator_migration_fault_rolls_back_all_new_objects(self):
+        init_project(self.root, development=True)
+        self.bind_requirements()
+        database = os.path.join(self.root, ".awb", "dev", "workboard.db")
+        self.remove_orchestrator_extension(database)
+        with mock.patch.object(
+                project_module, "orchestrator_schema_sql",
+                return_value=(
+                    "INSERT INTO schema_meta VALUES('orchestrator_schema_version',"
+                    "'AWB-ORCHESTRATOR-v1');"
+                    "CREATE TABLE orchestrator_partial(value TEXT); INVALID SQL;")):
+            with self.assertRaises(sqlite3.Error):
+                migrate(self.root)
+        connection = sqlite3.connect(database)
+        self.assertIsNone(connection.execute(
+            "SELECT value FROM schema_meta WHERE key='orchestrator_schema_version'"
+        ).fetchone())
+        self.assertIsNone(connection.execute(
+            "SELECT name FROM sqlite_master WHERE name='orchestrator_partial'"
+        ).fetchone())
+        connection.close()
+
+    def test_orchestrator_post_validation_fault_rolls_back_but_retains_backup(self):
+        init_project(self.root, development=True)
+        self.bind_requirements()
+        database = os.path.join(self.root, ".awb", "dev", "workboard.db")
+        self.remove_orchestrator_extension(database)
+        backup_parent = os.path.dirname(database)
+        before_backups = set(name for name in os.listdir(backup_parent)
+                             if name.endswith(".backup.db"))
+        with mock.patch.object(
+                project_module, "orchestrator_schema_state",
+                side_effect=["ABSENT", "INVALID"]):
+            with self.assertRaisesRegex(LiteError, "did not install"):
+                migrate(self.root)
+        after_backups = set(name for name in os.listdir(backup_parent)
+                            if name.endswith(".backup.db"))
+        self.assertEqual(1, len(after_backups - before_backups))
+        connection = sqlite3.connect(database)
+        self.assertIsNone(connection.execute(
+            "SELECT value FROM schema_meta WHERE key='orchestrator_schema_version'"
+        ).fetchone())
+        self.assertEqual([], connection.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'orchestrator_%' "
+            "OR name='one_active_orchestrator_per_work_item'"
+        ).fetchall())
+        self.assertEqual("ok", connection.execute("PRAGMA integrity_check").fetchone()[0])
+        connection.close()
+
+    def test_orchestrator_transfer_history_round_trip_active_refusal_and_conflict_zero_write(self):
+        source = os.path.join(self.temporary.name, "orchestrator-source.db")
+        target = os.path.join(self.temporary.name, "orchestrator-target.db")
+        bundle = os.path.join(self.temporary.name, "orchestrator-bundle.json")
+        initialize_database(source)
+        initialize_database(target)
+        create_work_item(source, "AWB-012", "AWB", "coordination",
+                         management=self.management("AWB-012"))
+        active = orchestrator_claim(source, "AWB-012", "local-a", 900, "claim-a")
+        with self.assertRaisesRegex(LiteError, "orchestrator lease"):
+            transfer_export(source, ["AWB-012"], bundle)
+        orchestrator_release(source, "AWB-012", "local-a",
+                             active["lease"]["generation"], "release-a")
+        transfer_export(source, ["AWB-012"], bundle)
+        self.assertEqual("ok", transfer_import(target, bundle)["status"])
+        self.assertEqual("no-op", transfer_import(target, bundle)["status"])
+        target_connection = open_database(target)
+        self.assertEqual(1, target_connection.execute(
+            "SELECT count(*) FROM orchestrator_instances").fetchone()[0])
+        self.assertEqual(1, target_connection.execute(
+            "SELECT count(*) FROM orchestrator_leases").fetchone()[0])
+        before = "\n".join(target_connection.iterdump())
+        target_connection.close()
+        with open(bundle, "r", encoding="utf-8") as handle:
+            altered = json.load(handle)
+        altered["tables"]["orchestrator_instances"][0]["last_seen_at"] = "changed"
+        body = dict(altered)
+        body.pop("sha256")
+        altered["sha256"] = hashlib.sha256(json.dumps(
+            body, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        with open(bundle, "w", encoding="utf-8") as handle:
+            json.dump(altered, handle)
+        with self.assertRaises(LiteError):
+            transfer_import(target, bundle)
+        target_connection = open_database(target)
+        self.assertEqual(before, "\n".join(target_connection.iterdump()))
+        target_connection.close()
+
     def test_transfer_round_trips_selected_usage_events_and_old_bundle_stays_valid(self):
         source = os.path.join(self.temporary.name, "usage-source.db")
         target = os.path.join(self.temporary.name, "usage-target.db")
@@ -352,17 +611,38 @@ class ProjectLifecycleTest(unittest.TestCase):
         connection = open_database(target)
         self.assertEqual(1, connection.execute("SELECT count(*) FROM usage_events").fetchone()[0])
         connection.close()
+        with open(bundle, "r", encoding="utf-8") as handle:
+            legacy = json.load(handle)
+        legacy.pop("sha256")
+        legacy.pop("orchestratorSchemaVersion", None)
+        for table in project_module.ORCHESTRATOR_TABLES:
+            legacy["tables"].pop(table, None)
+        legacy["sha256"] = hashlib.sha256(json.dumps(
+            legacy, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        legacy_path = os.path.join(self.temporary.name, "legacy-bundle.json")
+        with open(legacy_path, "w", encoding="utf-8") as handle:
+            json.dump(legacy, handle)
+        old_target = os.path.join(self.temporary.name, "old-target.db")
+        initialize_database(old_target)
+        self.remove_orchestrator_extension(old_target)
+        self.assertEqual("ok", transfer_import(old_target, legacy_path)["status"])
 
-    def test_upgrade_backs_up_migrates_and_rebinds_exact_stable_0_2_1_project(self):
+    def test_upgrade_backs_up_migrates_and_rebinds_exact_stable_0_3_0b1_project(self):
         old_wheel = self.prepare_old_project()
+        database = os.path.join(self.root, ".awb", "workboard.db")
+        self.install_gate_policy_extension(database)
+        create_work_item(database, "AWB-LEGACY", "AWB", "legacy item",
+                         management=self.management("AWB-LEGACY"))
+        self.remove_gate_policy_extension(database)
         with open(old_wheel, "rb") as handle:
             old_digest = hashlib.sha256(handle.read()).hexdigest()
         with open(os.path.join(self.root, ".awb", "requirements-awb.txt"), "w", encoding="utf-8") as handle:
-            handle.write("--require-hashes\nhttps://github.com/cleocn/agent-workboard/releases/download/v0.2.1/" +
+            handle.write("--require-hashes\nhttps://github.com/cleocn/agent-workboard/releases/download/v0.3.0b1/" +
                          os.path.basename(old_wheel) + "#egg=agent-workboard --hash=sha256:" + old_digest + "\n")
-        target_identity = {"packageVersion": "0.3.0b1", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.0b1"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.0b1-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b1", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b1"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b1-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity), \
                 mock.patch.object(project_module, "_is_editable", return_value=False):
@@ -371,13 +651,26 @@ class ProjectLifecycleTest(unittest.TestCase):
             self.assert_one_next_step(result)
             self.assertTrue(os.path.isfile(result["rollback"]["databaseBackup"]))
             self.assertEqual("AWB-USAGE-v1", doctor(self.root)["usageSchemaVersion"])
+            self.assertEqual("AWB-ORCHESTRATOR-v1", doctor(self.root)["orchestratorSchemaVersion"])
+            self.assertEqual("AWB-AUTO-GATE-v1", doctor(self.root)["gatePolicySchemaVersion"])
             self.assertEqual("ok", doctor(self.root)["status"])
+            connection = sqlite3.connect(database)
+            self.assertEqual("MANUAL", connection.execute(
+                "SELECT human_gate_policy FROM work_items WHERE work_item_id='AWB-LEGACY'"
+            ).fetchone()[0])
+            connection.close()
+            bundle = os.path.join(self.temporary.name, "upgraded-transfer.json")
+            transfer_export(database, ["AWB-LEGACY"], bundle)
+            imported = os.path.join(self.temporary.name, "upgraded-transfer-target.db")
+            initialize_database(imported)
+            self.assertEqual("ok", transfer_import(imported, bundle)["status"])
+            self.assertEqual("MANUAL", get_work_item(imported, "AWB-LEGACY")["humanGatePolicy"])
         with open(os.path.join(self.root, ".awb", "config.json"), "r", encoding="utf-8") as handle:
-            self.assertEqual("0.3.0b1", json.load(handle)["requiredPackageVersion"])
+            self.assertEqual("0.3.1b1", json.load(handle)["requiredPackageVersion"])
 
-    def test_exact_0_2_source_upgrades_and_rolls_back_package_owned_bytes(self):
+    def test_exact_0_3_0b1_source_upgrades_and_rolls_back_package_owned_bytes(self):
         old_wheel = self.prepare_old_project(
-            with_codex=True, source_identity=project_module.RELEASE_0_2_1_IDENTITY
+            with_codex=True, source_identity=project_module.RELEASE_0_3_0B1_IDENTITY
         )
         managed = [os.path.join(self.root, ".awb", name) for name in project_module.MANAGED]
         codex = list(project_module._codex_targets(self.root))
@@ -389,7 +682,7 @@ class ProjectLifecycleTest(unittest.TestCase):
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
             checked = upgrade_project(self.root, target_wheel, with_codex=True, check=True)
             self.assertEqual("READY", checked["status"])
-            self.assertEqual(project_module.RELEASE_0_2_1_IDENTITY, checked["from"])
+            self.assertEqual(project_module.RELEASE_0_3_0B1_IDENTITY, checked["from"])
             self.assertEqual(before_check, self.tree_snapshot())
             upgraded = upgrade_project(self.root, target_wheel, with_codex=True)
             self.assertEqual("OK", upgraded["status"])
@@ -412,9 +705,9 @@ class ProjectLifecycleTest(unittest.TestCase):
 
     def test_upgrade_refuses_customized_codex_without_changing_contract(self):
         self.prepare_old_project(with_codex=True)
-        target_identity = {"packageVersion": "0.3.0b1", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.0b1"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.0b1-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b1", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b1"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b1-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         config_path = os.path.join(self.root, ".awb", "config.json")
         with open(config_path, "rb") as handle:
@@ -469,7 +762,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                           "withCodex": False},
                          refused["nextStep"]["arguments"])
 
-        unsupported.update({"requiredPackageVersion": "0.3.0b1",
+        unsupported.update({"requiredPackageVersion": "0.3.1b1",
                             "requiredSourceCommit": target_identity["sourceCommit"],
                             "requiredSourceTree": target_identity["sourceTree"],
                             "requiredSourceTag": target_identity["sourceTag"]})
@@ -481,7 +774,11 @@ class ProjectLifecycleTest(unittest.TestCase):
         with open(os.path.join(self.root, ".awb", "requirements-awb.txt"), "w", encoding="utf-8") as handle:
             handle.write("--require-hashes\nfile://" + target_wheel +
                          "#egg=agent-workboard --hash=sha256:" + digest + "\n")
-        self.install_usage_extension(os.path.join(self.root, ".awb", "workboard.db"))
+        connection = sqlite3.connect(os.path.join(self.root, ".awb", "workboard.db"))
+        connection.executescript(project_module.orchestrator_schema_sql())
+        connection.executescript(project_module.human_gate_schema_sql())
+        connection.commit()
+        connection.close()
         before = self.tree_snapshot()
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
             no_op = upgrade_project(self.root, target_wheel, check=True)
@@ -489,6 +786,39 @@ class ProjectLifecycleTest(unittest.TestCase):
         self.assertEqual(before, self.tree_snapshot())
         self.assert_one_next_step(no_op)
         self.assertEqual({"action": "NONE", "arguments": {}}, no_op["nextStep"])
+
+    def test_upgrade_refuses_exact_0_2_1_cross_version_jump(self):
+        self.prepare_old_project()
+        old_identity = {
+            "packageVersion": "0.2.1",
+            "sourceCommit": "c7d210db9cb4fb59d8e263277c74d0c040b40d7c",
+            "sourceTree": "d24b1e77adff3ed01d26a6d99e7ea11d51263588",
+            "sourceTag": "v0.2.1",
+        }
+        old_wheel = os.path.join(self.temporary.name, "agent_workboard-0.2.1-py3-none-any.whl")
+        self.fake_wheel(old_wheel, old_identity)
+        config_path = os.path.join(self.root, ".awb", "config.json")
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        config.update({"requiredPackageVersion": old_identity["packageVersion"],
+                       "requiredSourceCommit": old_identity["sourceCommit"],
+                       "requiredSourceTree": old_identity["sourceTree"],
+                       "requiredSourceTag": old_identity["sourceTag"]})
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+        old_digest = hashlib.sha256(self.read_bytes(old_wheel)).hexdigest()
+        with open(os.path.join(self.root, ".awb", "requirements-awb.txt"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("--require-hashes\nfile://" + old_wheel +
+                         "#egg=agent-workboard --hash=sha256:" + old_digest + "\n")
+        target_wheel, target_identity = self.target_wheel()
+        before = self.tree_snapshot()
+        with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
+            result = upgrade_project(self.root, target_wheel, check=True)
+        self.assertEqual("REFUSED", result["status"])
+        self.assertIn("exact 0.3.0b1 to 0.3.1b1 matrix", result["reason"])
+        self.assertEqual(before, self.tree_snapshot())
 
     def test_upgrade_refuses_symbolic_backup_root_before_any_internal_or_external_write(self):
         self.prepare_old_project()
@@ -860,12 +1190,14 @@ class ProjectLifecycleTest(unittest.TestCase):
     def test_upgrade_refuses_active_claim_without_changing_contract(self):
         self.prepare_old_project()
         database = os.path.join(self.root, ".awb", "workboard.db")
+        self.install_gate_policy_extension(database)
         create_work_item(database, "AWB-777", "AWB", "active", management=self.management("AWB-777"))
         acquire_claim(database, "AWB-777", "AWB-777-T01", "planner", "PLANNER",
                       "2099-01-01T00:00:00+00:00")
-        target_identity = {"packageVersion": "0.3.0b1", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.0b1"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.0b1-py3-none-any.whl")
+        self.remove_gate_policy_extension(database)
+        target_identity = {"packageVersion": "0.3.1b1", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b1"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b1-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         config_path = os.path.join(self.root, ".awb", "config.json")
         with open(config_path, "rb") as handle:
@@ -884,12 +1216,14 @@ class ProjectLifecycleTest(unittest.TestCase):
     def test_upgrade_refuses_active_writer_and_rollback_refuses_active_use(self):
         self.prepare_old_project()
         database = os.path.join(self.root, ".awb", "workboard.db")
+        self.install_gate_policy_extension(database)
         create_work_item(database, "AWB-778", "AWB", "active writer",
                          management=self.management("AWB-778"))
         acquire_claim(database, "AWB-778", "AWB-778-T01", "planner", "PLANNER",
                       "2099-01-01T00:00:00+00:00")
         acquire_repository_lock(database, "AWB-778", "test-repository", "planner",
                                 "2099-01-01T00:00:00+00:00")
+        self.remove_gate_policy_extension(database)
         target_wheel, target_identity = self.target_wheel()
         before = self.tree_snapshot()
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
@@ -919,6 +1253,28 @@ class ProjectLifecycleTest(unittest.TestCase):
             self.assertEqual(before, self.tree_snapshot())
         finally:
             self.root = original_root
+
+    def test_upgrade_refuses_active_orchestrator_lease_with_zero_write(self):
+        self.prepare_old_project()
+        database = os.path.join(self.root, ".awb", "workboard.db")
+        self.install_gate_policy_extension(database)
+        connection = sqlite3.connect(database)
+        connection.executescript(project_module.orchestrator_schema_sql())
+        connection.commit()
+        connection.close()
+        create_work_item(database, "AWB-780", "AWB", "active orchestrator",
+                         management=self.management("AWB-780"))
+        claimed = orchestrator_claim(database, "AWB-780", "local-owner", 900,
+                                     "orchestrator-active",
+                                     now="2026-08-22T00:00:00+00:00")
+        self.assertEqual("OK", claimed["status"])
+        target_wheel, target_identity = self.target_wheel()
+        before = self.tree_snapshot()
+        with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
+            result = upgrade_project(self.root, target_wheel, check=True)
+        self.assertEqual("REFUSED", result["status"])
+        self.assertIn("active", result["reason"])
+        self.assertEqual(before, self.tree_snapshot())
 
     def test_upgrade_write_fault_restores_contract_and_created_paths(self):
         self.prepare_old_project(with_codex=True)
@@ -959,12 +1315,9 @@ class ProjectLifecycleTest(unittest.TestCase):
                 os.path.join(self.root, ".awb", name)
             ) for name in project_module.MANAGED
         }
-        broken = (
-            "INSERT INTO schema_meta VALUES('usage_schema_version','AWB-USAGE-v1'); "
-            "CREATE TABLE usage_events(value TEXT); INVALID SQL;"
-        )
+        broken = "CREATE TABLE orchestrator_instances(value TEXT); INVALID SQL;"
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity), \
-                mock.patch.object(project_module, "usage_schema_sql", return_value=broken):
+                mock.patch.object(project_module, "orchestrator_schema_sql", return_value=broken):
             result = upgrade_project(self.root, target_wheel)
         self.assertEqual("REFUSED", result["status"])
         self.assertEqual(before_database, self.database_dump(database))
@@ -972,14 +1325,47 @@ class ProjectLifecycleTest(unittest.TestCase):
             self.assertEqual(expected, self.read_bytes(path), path)
         connection = sqlite3.connect(database)
         self.assertIsNone(connection.execute(
-            "SELECT value FROM schema_meta WHERE key='usage_schema_version'"
+            "SELECT value FROM schema_meta WHERE key='orchestrator_schema_version'"
         ).fetchone())
         connection.close()
 
-    def test_upgrade_refuses_preexisting_usage_extension_with_zero_write(self):
+    def test_upgrade_post_validation_fault_restores_exact_source_database(self):
+        self.prepare_old_project()
+        target_wheel, target_identity = self.target_wheel()
+        database = os.path.join(self.root, ".awb", "workboard.db")
+        before_database = self.database_dump(database)
+        before_managed = {
+            os.path.join(self.root, ".awb", name): self.read_bytes(
+                os.path.join(self.root, ".awb", name)
+            ) for name in project_module.MANAGED
+        }
+        real_state = project_module.human_gate_schema_state
+        calls = {"count": 0}
+
+        def fail_after_install(connection):
+            calls["count"] += 1
+            state = real_state(connection)
+            return "INVALID" if calls["count"] == 2 and state == "INSTALLED" else state
+
+        with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity), \
+                mock.patch.object(project_module, "human_gate_schema_state",
+                                  side_effect=fail_after_install):
+            result = upgrade_project(self.root, target_wheel)
+        self.assertEqual("REFUSED", result["status"])
+        self.assertIn("compensated", result["reason"])
+        self.assertEqual(before_database, self.database_dump(database))
+        for path, expected in before_managed.items():
+            self.assertEqual(expected, self.read_bytes(path), path)
+        connection = sqlite3.connect(database)
+        self.assertEqual("ABSENT", real_state(connection))
+        self.assertEqual("ABSENT", orchestrator_schema_state(connection))
+        self.assertEqual("INSTALLED", project_module._usage_schema_state(connection))
+        connection.close()
+
+    def test_upgrade_refuses_missing_usage_extension_with_zero_write(self):
         self.prepare_old_project()
         database = os.path.join(self.root, ".awb", "workboard.db")
-        self.install_usage_extension(database)
+        self.remove_usage_extension(database)
         target_wheel, target_identity = self.target_wheel()
         before = self.tree_snapshot()
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
@@ -987,7 +1373,7 @@ class ProjectLifecycleTest(unittest.TestCase):
             executed = upgrade_project(self.root, target_wheel)
         for result in (checked, executed):
             self.assertEqual("REFUSED", result["status"])
-            self.assertIn("unexpected usage extension", result["reason"])
+            self.assertIn("exact usage extension", result["reason"])
         self.assertEqual(before, self.tree_snapshot())
 
     def test_rollback_refuses_post_upgrade_database_use(self):
@@ -1009,7 +1395,7 @@ class ProjectLifecycleTest(unittest.TestCase):
 
     def test_real_pip_wheel_init_and_doctor_work_from_an_unrelated_directory(self):
         repository = os.path.dirname(os.path.dirname(__file__))
-        wheel = os.path.join(repository, "dist", "agent_workboard-0.3.0b1-py3-none-any.whl")
+        wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b1-py3-none-any.whl")
         self.assertTrue(os.path.isfile(wheel), "final candidate wheel must be present for this lifecycle test")
         with tempfile.TemporaryDirectory() as temporary:
             environment = dict(os.environ)
@@ -1029,7 +1415,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                 os.unlink(direct_url)
             subprocess.check_call([awb, "init", "--project", project], cwd=unrelated, env=environment)
             subprocess.check_call([awb, "doctor", "--project", project], cwd=unrelated, env=environment)
-            artifact = os.path.join(project, ".awb", "artifacts", "agent_workboard-0.3.0b1-py3-none-any.whl")
+            artifact = os.path.join(project, ".awb", "artifacts", "agent_workboard-0.3.1b1-py3-none-any.whl")
             requirements = os.path.join(project, ".awb", "requirements-awb.txt")
             self.assertTrue(os.path.isfile(artifact))
             with open(requirements, encoding="utf-8") as handle:
@@ -1056,17 +1442,17 @@ class ProjectLifecycleTest(unittest.TestCase):
     def test_installed_wheel_rebuild_accepts_only_owned_nested_empty_cache_rows(self):
         installation = os.path.join(self.temporary.name, "installed")
         package = os.path.join(installation, "agent_workboard")
-        metadata = os.path.join(installation, "agent_workboard-0.3.0b1.dist-info")
+        metadata = os.path.join(installation, "agent_workboard-0.3.1b1.dist-info")
         os.makedirs(os.path.join(package, "usage_adapters", "nested", "__pycache__"))
         os.makedirs(metadata)
-        identity = {"packageVersion": "0.3.0b1", "sourceCommit": "3" * 40,
-                    "sourceTree": "4" * 40, "sourceTag": "v0.3.0b1"}
+        identity = {"packageVersion": "0.3.1b1", "sourceCommit": "3" * 40,
+                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b1"}
         files = {
             "agent_workboard/__init__.py": b"",
             "agent_workboard/_build.py": ("BUILD_IDENTITY = " + repr(identity) + "\n").encode("utf-8"),
-            "agent_workboard-0.3.0b1.dist-info/METADATA":
-                b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.0b1\n\n",
-            "agent_workboard-0.3.0b1.dist-info/WHEEL":
+            "agent_workboard-0.3.1b1.dist-info/METADATA":
+                b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b1\n\n",
+            "agent_workboard-0.3.1b1.dist-info/WHEEL":
                 b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         }
         for relative, raw in files.items():
@@ -1092,7 +1478,7 @@ class ProjectLifecycleTest(unittest.TestCase):
         record = os.path.join(metadata, "RECORD")
         base_rows = [hashed_row(relative) for relative in sorted(files)]
         base_rows.extend([[relative, "", ""] for relative in caches])
-        base_rows.append(["agent_workboard-0.3.0b1.dist-info/RECORD", "", ""])
+        base_rows.append(["agent_workboard-0.3.1b1.dist-info/RECORD", "", ""])
 
         def write_rows(rows):
             import csv

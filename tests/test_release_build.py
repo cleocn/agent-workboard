@@ -38,8 +38,8 @@ class ReleaseBuildTest(unittest.TestCase):
                 path = os.path.join(base, name)
                 with open(path, "rb") as handle:
                     files[os.path.relpath(path, build).replace(os.sep, "/")] = handle.read()
-        prefix = "agent_workboard-0.3.0b1.dist-info"
-        files[prefix + "/METADATA"] = b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.0b1\n\n"
+        prefix = "agent_workboard-0.3.1b1.dist-info"
+        files[prefix + "/METADATA"] = b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b1\n\n"
         files[prefix + "/WHEEL"] = b"Wheel-Version: 1.0\nGenerator: awb-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
         files[prefix + "/entry_points.txt"] = b"[console_scripts]\nawb = agent_workboard.cli:main\n"
         records = []
@@ -65,10 +65,12 @@ class ReleaseBuildTest(unittest.TestCase):
         self.assertIn("exact `rollbackManifest`", text)
         self.assertIn("awb upgrade --check --project", text)
         self.assertIn("awb upgrade --project <project> --rollback", text)
-        for identity in ("`0.2.1/v0.2.1`", "`0.3.0b1/v0.3.0b1`"):
+        for identity in ("`0.3.0b1/v0.3.0b1`", "`0.3.1b1/v0.3.1b1`"):
             self.assertIn(identity, text)
         self.assertIn("database pre/post SHA-256", text)
         self.assertIn("usageSchemaVersion=AWB-USAGE-v1", text)
+        self.assertIn("orchestratorSchemaVersion=AWB-ORCHESTRATOR-v1", text)
+        self.assertIn("gatePolicySchemaVersion=AWB-AUTO-GATE-v1", text)
         for section in RUNBOOK_SECTIONS:
             self.assertIn("## " + section, text)
 
@@ -88,7 +90,7 @@ class ReleaseBuildTest(unittest.TestCase):
                             "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"})
         subprocess.check_call(["git", "commit", "-m", "release test"], cwd=repository,
                               env=environment, stdout=subprocess.DEVNULL)
-        subprocess.check_call(["git", "tag", "-a", "v0.3.0b1", "-m", "preview"], cwd=repository)
+        subprocess.check_call(["git", "tag", "-a", "v0.3.1b1", "-m", "preview"], cwd=repository)
         return repository
 
     def _identity(self, path):
@@ -99,7 +101,7 @@ class ReleaseBuildTest(unittest.TestCase):
         repository = os.path.dirname(os.path.dirname(__file__))
         with open(os.path.join(repository, "manifest.json"), "r", encoding="utf-8") as handle:
             manifest = json.load(handle)
-        self.assertEqual("AWB-011-public-v1", manifest["manifestVersion"])
+        self.assertEqual("AWB-015-public-v1", manifest["manifestVersion"])
         expected_paths = set(subprocess.check_output(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
             cwd=repository,
@@ -114,10 +116,38 @@ class ReleaseBuildTest(unittest.TestCase):
                                  "mvp_lite_v1_1")
         with open(os.path.join(spec_root, "manifest.json"), "r", encoding="utf-8") as handle:
             spec = json.load(handle)
-        self.assertEqual("MVP-LITE-v1 + AWB-USAGE-v1", spec["databaseSchemaVersion"])
+        self.assertEqual("MVP-LITE-v1 + AWB-USAGE-v1 + AWB-ORCHESTRATOR-v1 + AWB-AUTO-GATE-v1",
+                         spec["databaseSchemaVersion"])
+        self.assertEqual(51, spec["composition"]["acceptanceCaseCount"])
         for entry in spec["artifacts"]:
             with open(os.path.join(spec_root, entry["path"]), "rb") as handle:
                 self.assertEqual(entry["sha256"], hashlib.sha256(handle.read()).hexdigest())
+
+        with open(os.path.join(spec_root, "workflow.yaml"), "r", encoding="utf-8") as handle:
+            workflow = handle.read()
+        plan = workflow.split("  agent_approve_plan:\n", 1)[1].split(
+            "  agent_reject_plan:\n", 1)[0]
+        self.assertIn(
+            "to: {AUTO_ON_PASS: PLAN_REVIEW_APPROVED, MANUAL: PLAN_REVIEW_PENDING}", plan)
+        for prerequisite in (
+                "mode_STANDARD", "queue_CLAIMED", "active_independent_reviewer_claim",
+                "management_envelope_present", "latest_independent_plan_review_PASS",
+                "open_plan_findings_zero", "held_reason_absent", "blocked_reason_absent"):
+            self.assertIn(prerequisite, plan)
+        self.assertIn("stage: PLAN", plan)
+        final = workflow.split("  agent_approve_final:\n", 1)[1].split(
+            "  agent_reject_final:\n", 1)[0]
+        self.assertIn(
+            "to: {AUTO_ON_PASS: FINAL_ACCEPTANCE_APPROVED, MANUAL: IMPLEMENTATION_COMPLETED}",
+            final)
+        for prerequisite in (
+                "mode_STANDARD", "queue_CLAIMED", "active_independent_reviewer_claim",
+                "management_envelope_present", "latest_independent_final_review_PASS",
+                "open_implementation_findings_zero", "held_reason_absent",
+                "blocked_reason_absent", "required_tasks_completed",
+                "implementation_quality_baseline_PASS"):
+            self.assertIn(prerequisite, final)
+        self.assertIn("stage: FINAL", final)
 
     def test_tagged_build_and_no_git_sdist_preserve_identity_and_templates(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -127,8 +157,8 @@ class ReleaseBuildTest(unittest.TestCase):
             subprocess.check_call([sys.executable, "setup.py", "build_py"], cwd=repository, env=environment,
                                   stdout=subprocess.DEVNULL)
             direct_identity = self._identity(os.path.join(repository, "build", "lib", "agent_workboard", "_build.py"))
-            self.assertEqual("0.3.0b1", direct_identity["packageVersion"])
-            self.assertEqual("v0.3.0b1", direct_identity["sourceTag"])
+            self.assertEqual("0.3.1b1", direct_identity["packageVersion"])
+            self.assertEqual("v0.3.1b1", direct_identity["sourceTag"])
             for name in TEMPLATES:
                 with open(os.path.join(repository, "docs", "work-item-templates", name), "rb") as source:
                     expected = source.read()
@@ -153,10 +183,15 @@ class ReleaseBuildTest(unittest.TestCase):
             with open(root_skill, "r", encoding="utf-8") as handle:
                 route = handle.read()
             for token in ("references/upgrade-and-rollback.md", "PREFLIGHT_FIRST", "REFUSED",
-                          "BLOCKED", "nextStep"):
+                          "BLOCKED", "nextStep", "--orchestrator-generation",
+                          "does not\nspawn", "AWB-CREATION-RISK-v1", "AUTO_ON_PASS",
+                          "AUTO_GATE_APPROVED", "300-second", "caffeinate -di",
+                          "last active WorkItem", "POWER_INHIBIT_UNAVAILABLE",
+                          "POWER_INHIBIT_CLEANUP_FAILED", "`pkill`", "`pmset`",
+                          "not a product\nrunner"):
                 self.assertIn(token, route)
 
-            wheel = os.path.join(repository, "dist", "agent_workboard-0.3.0b1-py3-none-any.whl")
+            wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b1-py3-none-any.whl")
             os.makedirs(os.path.dirname(wheel), exist_ok=True)
             self._wheel_from_build(repository, wheel)
             with zipfile.ZipFile(wheel) as archive:
@@ -169,10 +204,10 @@ class ReleaseBuildTest(unittest.TestCase):
             for sequence in ("one", "two"):
                 checkout = os.path.join(temporary, sequence)
                 subprocess.check_call(["git", "clone", "--quiet", repository, checkout])
-                subprocess.check_call(["git", "checkout", "--quiet", "v0.3.0b1"], cwd=checkout)
+                subprocess.check_call(["git", "checkout", "--quiet", "v0.3.1b1"], cwd=checkout)
                 subprocess.check_call([sys.executable, "setup.py", "sdist"], cwd=checkout, env=environment,
                                       stdout=subprocess.DEVNULL)
-                archive = os.path.join(checkout, "dist", "agent-workboard-0.3.0b1.tar.gz")
+                archive = os.path.join(checkout, "dist", "agent-workboard-0.3.1b1.tar.gz")
                 with open(archive, "rb") as handle:
                     hashes.append(hashlib.sha256(handle.read()).hexdigest())
                 archives.append(archive)
@@ -181,7 +216,7 @@ class ReleaseBuildTest(unittest.TestCase):
             extracted = os.path.join(temporary, "extracted")
             with tarfile.open(archives[0], "r:gz") as archive:
                 archive.extractall(extracted)
-            source_tree = os.path.join(extracted, "agent-workboard-0.3.0b1")
+            source_tree = os.path.join(extracted, "agent-workboard-0.3.1b1")
             self.assertFalse(os.path.exists(os.path.join(source_tree, ".git")))
             with open(os.path.join(source_tree, ".awb-release-identity.json"), "r", encoding="utf-8") as handle:
                 envelope = json.load(handle)
@@ -198,7 +233,7 @@ class ReleaseBuildTest(unittest.TestCase):
                                    "skills", "awb-orchestrator", "references",
                                    "upgrade-and-rollback.md"), "rb") as handle:
                 self.assertEqual(root_runbook, handle.read())
-            no_git_wheel = os.path.join(source_tree, "dist", "agent_workboard-0.3.0b1-py3-none-any.whl")
+            no_git_wheel = os.path.join(source_tree, "dist", "agent_workboard-0.3.1b1-py3-none-any.whl")
             self._wheel_from_build(source_tree, no_git_wheel)
             with zipfile.ZipFile(no_git_wheel) as archive:
                 self.assertEqual(root_runbook, archive.read(

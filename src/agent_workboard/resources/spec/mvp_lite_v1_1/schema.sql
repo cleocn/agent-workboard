@@ -8,7 +8,9 @@ CREATE TABLE schema_meta (
 INSERT INTO schema_meta(key, value) VALUES
   ('schema_version', 'MVP-LITE-v1'),
   ('plan_revision', 'PLAN-MVP-LITE-v1'),
-  ('usage_schema_version', 'AWB-USAGE-v1');
+  ('usage_schema_version', 'AWB-USAGE-v1'),
+  ('orchestrator_schema_version', 'AWB-ORCHESTRATOR-v1'),
+  ('gate_policy_schema_version', 'AWB-AUTO-GATE-v1');
 
 CREATE TABLE work_items (
   work_item_id TEXT PRIMARY KEY,
@@ -23,6 +25,8 @@ CREATE TABLE work_items (
     'CLAIMABLE','CLAIMED','WAITING_HUMAN','HELD','BLOCKED'
   )),
   priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0','P1','P2','P3')),
+  human_gate_policy TEXT NOT NULL DEFAULT 'MANUAL'
+    CHECK (human_gate_policy IN ('AUTO_ON_PASS','MANUAL')),
   current_role TEXT CHECK (current_role IN ('PLANNER','IMPLEMENTER','REVIEWER','ORCHESTRATOR')),
   held_reason TEXT,
   blocked_reason TEXT,
@@ -116,6 +120,57 @@ CREATE TABLE events (
 CREATE INDEX tasks_by_work_item ON tasks(work_item_id, seq);
 CREATE INDEX work_items_inbox ON work_items(priority, updated_at, work_item_id);
 CREATE INDEX events_timeline ON events(work_item_id, event_id);
+
+-- Local coordination extension.  These leases are independent of Agent task
+-- claims and never grant repository writer or HUMAN gate authority.
+CREATE TABLE orchestrator_instances (
+  orchestrator_id TEXT PRIMARY KEY,
+  registered_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE orchestrator_leases (
+  lease_id TEXT PRIMARY KEY,
+  work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id),
+  orchestrator_id TEXT NOT NULL REFERENCES orchestrator_instances(orchestrator_id),
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  status TEXT NOT NULL CHECK (status IN ('ACTIVE','RELEASED','EXPIRED')),
+  acquired_at TEXT NOT NULL,
+  renewed_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  released_at TEXT
+);
+
+CREATE UNIQUE INDEX one_active_orchestrator_per_work_item
+  ON orchestrator_leases(work_item_id) WHERE status = 'ACTIVE';
+CREATE INDEX orchestrator_leases_by_instance
+  ON orchestrator_leases(orchestrator_id, status, work_item_id);
+
+CREATE TABLE orchestrator_events (
+  orchestrator_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE,
+  operation TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  orchestrator_id TEXT REFERENCES orchestrator_instances(orchestrator_id),
+  work_item_id TEXT REFERENCES work_items(work_item_id),
+  lease_id TEXT REFERENCES orchestrator_leases(lease_id),
+  generation INTEGER,
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX orchestrator_events_timeline
+  ON orchestrator_events(work_item_id, orchestrator_event_id);
+
+CREATE TRIGGER orchestrator_events_no_update
+BEFORE UPDATE ON orchestrator_events BEGIN
+  SELECT RAISE(ABORT, 'orchestrator_events are immutable');
+END;
+
+CREATE TRIGGER orchestrator_events_no_delete
+BEFORE DELETE ON orchestrator_events BEGIN
+  SELECT RAISE(ABORT, 'orchestrator_events are immutable');
+END;
 
 -- Observation-only extension.  Workflow events remain unchanged because usage
 -- and quota records may intentionally have no WorkItem attribution.

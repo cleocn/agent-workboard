@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1b1 Preview
+
+- Add provider-neutral, one-shot local Orchestrator registration, WorkItem lease,
+  claim-next, renewal, release, recovery, and generation-fenced dispatch commands.
+- Make new STANDARD WorkItems default to `AUTO_ON_PASS`, retain independent
+  3+1+1 review, and require an explicit policy choice when creation risk is remote,
+  destructive, or anomalous; risky actions remain separately authorized.
+- Add main-Agent best-effort usage display and process-scoped macOS
+  `caffeinate -di` guidance without introducing a runner, daemon, or timing SLA.
+- Support only exact 0.3.0b1→0.3.1b1 backup-first upgrades that transactionally
+  install Orchestrator and auto-gate schemas, with database-bound rollback.
+- Keep PyPI publication, remote control, host process management, stable/GA claims,
+  and official weekly-quota accounting out of scope.
+
 ## 0.3.0b1 Preview
 
 - Add opt-in, local-only, observation-only usage accounting for explicitly bound

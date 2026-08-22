@@ -1,19 +1,19 @@
 # Agent Workboard
 
 Agent Workboard is a local-first SQLite workboard for a small, auditable
-planner → reviewer → human gate → implementer → reviewer workflow. It has no
+planner → reviewer → policy gate → implementer → reviewer workflow. It has no
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install the 0.3.0b1 Preview
+## Install the 0.3.1b1 Preview
 
 This release is an opt-in, local-only, observation-only Preview. Download the
-wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.0b1` prerelease, verify both
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b1` prerelease, verify both
 artifacts, then initialize a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.0b1-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b1-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -36,27 +36,28 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an exact 0.2.1 project
+## Upgrade an exact 0.3.0b1 project
 
-Retain the exact old 0.2.1 wheel and install the verified 0.3.0b1 wheel. If the
-project uses an official GitHub URL lock, place its verified 0.2.1 wheel beside
+Retain the exact old 0.3.0b1 wheel and install the verified 0.3.1b1 wheel. If the
+project uses an official GitHub URL lock, place its verified 0.3.0b1 wheel beside
 the Preview wheel; a local file lock continues to use its recorded path. Always
 run the read-only preflight first, then execute only its one structured
 `nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.0b1-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.0b1-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b1-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b1-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
 
-Upgrade accepts only the exact released 0.2.1→0.3.0b1 identity pair. It refuses
-an invalid database, active claim or writer, identity drift, a pre-existing
-usage extension and customized package-owned Codex files. Execution first makes
-an online backup, then installs the additive `AWB-USAGE-v1` schema in one
-transaction. The bound rollback manifest includes the database; any post-upgrade
-workflow or usage write makes rollback fail closed rather than discard data.
+Upgrade accepts only the exact released 0.3.0b1→0.3.1b1 identity pair. It refuses
+an invalid database, active claim/writer/Orchestrator lease, identity drift,
+missing or partial source extensions, and customized package-owned Codex files.
+Execution first makes an online backup, preserves `AWB-USAGE-v1`, then installs
+`AWB-ORCHESTRATOR-v1` and `AWB-AUTO-GATE-v1` in one transaction. Existing
+WorkItems remain `MANUAL`. The bound rollback manifest includes the database;
+any post-upgrade workflow or usage write makes rollback fail closed rather than discard data.
 Use `awb upgrade --check --rollback <manifest>` before the exact rollback
 command. Do not restore files or database tables by hand.
 
@@ -64,6 +65,20 @@ The shipped Orchestrator Skill routes Agents to
 `references/upgrade-and-rollback.md` (`AWB-UPGRADE-RUNBOOK-v1`) before upgrade,
 rollback or recovery work. It preserves zero-write preflight, structured
 one-next-step results and exact rollback material.
+
+## WorkItem gate policy
+
+After the additive `AWB-AUTO-GATE-v1` migration, a new STANDARD WorkItem
+defaults to `AUTO_ON_PASS`; an explicit opt-out persists `MANUAL`. Before create,
+the Orchestrator Skill classifies actual remote, destructive, and anomalous-state
+risk. Any signal requires a user choice between the two policies, and no answer
+means no WorkItem is created. The choice is audited but never authorizes the
+risky action.
+
+Independent Reviewer and strict 3+1+1 review remain mandatory. Only the latest
+PASS with zero open Findings and valid state/quality evidence can produce a
+`SYSTEM/AUTO_GATE_APPROVED` event. Failures and drift fall back to human
+handling; no HUMAN record is fabricated.
 
 ## Usage observation Preview
 
@@ -78,6 +93,17 @@ analysis units, not the ChatGPT/Codex weekly quota bill. Quota window snapshots
 remain separate and are never allocated directly to a role or WorkItem. The
 AWB-010 long-running observation has not completed, so this Preview does not
 claim a stable baseline, quota prediction, GA readiness or automated control.
+
+## Local multi-Orchestrator coordination
+
+The source tree includes provider-neutral `awb orchestrator` primitives for
+multiple local runtimes to own different WorkItems. Each WorkItem has at most
+one active Orchestrator lease; repository writes still use the existing single
+writer lock. Existing databases must run `awb migrate --check` and then the
+backup-first `awb migrate` before using this extension. See
+`docs/orchestration/quickstart.md` for the explicit-claim, dispatch-fence,
+renew, release and recovery contract. This is a coordination API only: AWB does
+not spawn, supervise, kill or steer host Agent processes.
 
 ## Security and scope
 

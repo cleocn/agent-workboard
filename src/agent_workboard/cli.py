@@ -7,6 +7,7 @@ import sys
 
 from . import __version__
 from . import lite
+from . import orchestrator
 from . import usage
 from .project import (backup, bootstrap, codex_check, codex_install, doctor,
                       init_project, migrate, transfer_export, transfer_import,
@@ -83,6 +84,37 @@ def _usage_command(args):
                                   "HUMAN" if args.human else "AGENT", payload))
     else:
         _print(usage.self_check(database))
+
+
+def _orchestrator_command(args):
+    name = args.orchestrator_command
+    try:
+        database = _project_database(args.project)
+        if name == "register":
+            result = orchestrator.register(database, args.orchestrator, args.request_id)
+        elif name == "claim":
+            result = orchestrator.claim(database, args.work_item, args.orchestrator,
+                                        args.ttl, args.request_id)
+        elif name == "claim-next":
+            result = orchestrator.claim_next(database, args.orchestrator, args.ttl,
+                                             args.request_id)
+        elif name == "renew":
+            result = orchestrator.renew(database, args.work_item, args.orchestrator,
+                                        args.generation, args.ttl, args.request_id)
+        elif name == "release":
+            result = orchestrator.release(database, args.work_item, args.orchestrator,
+                                          args.generation, args.request_id)
+        elif name == "recover":
+            result = orchestrator.recover(database, args.work_item, args.orchestrator,
+                                          args.ttl, args.request_id)
+        elif name == "list":
+            result = orchestrator.list_leases(database, args.orchestrator, args.status)
+        else:
+            result = orchestrator.show(database, args.work_item)
+    except lite.LiteError:
+        result = orchestrator.error_result(name)
+    _print(result)
+    return 2 if result["status"] in ("REFUSED", "CONFLICT") else 0
 
 
 def main(argv=None):
@@ -180,6 +212,45 @@ def main(argv=None):
         cohort_command.add_argument("--human", action="store_true")
     usage_check = usage_sub.add_parser("self-check")
     usage_check.add_argument("--project", default=".")
+    coordinator = sub.add_parser("orchestrator")
+    coordinator_sub = coordinator.add_subparsers(dest="orchestrator_command", required=True)
+    register = coordinator_sub.add_parser("register")
+    register.add_argument("--project", default=".")
+    register.add_argument("--orchestrator", required=True)
+    register.add_argument("--request-id", required=True)
+    coordinator_claim = coordinator_sub.add_parser("claim")
+    coordinator_claim.add_argument("work_item", metavar="work-item")
+    coordinator_claim.add_argument("--project", default=".")
+    coordinator_claim.add_argument("--orchestrator", required=True)
+    coordinator_claim.add_argument("--ttl", type=int, default=orchestrator.DEFAULT_TTL)
+    coordinator_claim.add_argument("--request-id", required=True)
+    claim_next = coordinator_sub.add_parser("claim-next")
+    claim_next.add_argument("--project", default=".")
+    claim_next.add_argument("--orchestrator", required=True)
+    claim_next.add_argument("--ttl", type=int, default=orchestrator.DEFAULT_TTL)
+    claim_next.add_argument("--request-id", required=True)
+    for coordinator_name in ("renew", "release"):
+        command = coordinator_sub.add_parser(coordinator_name)
+        command.add_argument("work_item", metavar="work-item")
+        command.add_argument("--project", default=".")
+        command.add_argument("--orchestrator", required=True)
+        command.add_argument("--generation", type=int, required=True)
+        command.add_argument("--request-id", required=True)
+        if coordinator_name == "renew":
+            command.add_argument("--ttl", type=int, default=orchestrator.DEFAULT_TTL)
+    recover = coordinator_sub.add_parser("recover")
+    recover.add_argument("work_item", metavar="work-item")
+    recover.add_argument("--project", default=".")
+    recover.add_argument("--orchestrator", required=True)
+    recover.add_argument("--ttl", type=int, default=orchestrator.DEFAULT_TTL)
+    recover.add_argument("--request-id", required=True)
+    coordinator_list = coordinator_sub.add_parser("list")
+    coordinator_list.add_argument("--project", default=".")
+    coordinator_list.add_argument("--orchestrator")
+    coordinator_list.add_argument("--status", choices=("ACTIVE", "RELEASED", "EXPIRED"))
+    coordinator_show = coordinator_sub.add_parser("show")
+    coordinator_show.add_argument("work_item", metavar="work-item")
+    coordinator_show.add_argument("--project", default=".")
     lite_parser = sub.add_parser("lite", help="compatibility access to MVP-LITE commands")
     lite_parser.add_argument("--project", default=".")
     lite_parser.add_argument("--database")
@@ -219,6 +290,8 @@ def main(argv=None):
                 _print(transfer_import(args.database, args.bundle, args.check))
         elif args.command == "usage":
             _usage_command(args)
+        elif args.command == "orchestrator":
+            return _orchestrator_command(args)
         elif args.command == "serve":
             database = _lite_args(args)
             return lite.main(database + ["serve", "--host", args.host, "--port", str(args.port)])

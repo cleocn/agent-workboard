@@ -84,7 +84,7 @@ class LiteWorkboardTest(unittest.TestCase):
     def create(self, work_item_id="TI-001", mode="STANDARD", priority="P2"):
         return create_work_item(
             self.database, work_item_id, work_item_id.split("-")[0], "测试任务", mode,
-            priority, management=self.management(work_item_id, mode)
+            priority, management=self.management(work_item_id, mode), human_review="MANUAL"
         )
 
     def claim(self, work_item_id, seq, agent, role):
@@ -630,6 +630,185 @@ class LiteWorkboardTest(unittest.TestCase):
         approved = record_human_gate(self.database, "TI-001", "PLAN", "human", "APPROVED", "ok")
         self.assertEqual("PLAN_REVIEW_APPROVED", approved["state"])
 
+    def test_standard_create_defaults_auto_and_plan_pass_is_system_approved(self):
+        created = create_work_item(
+            self.database, "TI-010", "TI", "auto item",
+            management=self.management("TI-010"),
+        )
+        self.assertEqual(("AUTO_ON_PASS", "DEFAULT"), (
+            created["humanGatePolicy"], created["humanGatePolicySource"]
+        ))
+        self.claim("TI-010", 1, "planner-auto", "PLANNER")
+        self.complete("TI-010", 1, "planner-auto")
+        transition(self.database, "TI-010", "submit_plan", "planner-auto")
+        self.claim("TI-010", 3, "reviewer-auto", "REVIEWER")
+        reviewed = record_agent_review(
+            self.database, "TI-010", "PLAN", "reviewer-auto", "APPROVED",
+            self.structured_review("PLAN", "PASS"), request_id="auto-plan-review",
+        )
+        self.assertEqual(("PLAN_REVIEW_APPROVED", "CLAIMABLE", "IMPLEMENTER"), (
+            reviewed["state"], reviewed["queue_state"], reviewed["current_role"]
+        ))
+        connection = open_database(self.database)
+        self.assertEqual(0, connection.execute(
+            "SELECT count(*) FROM human_gates WHERE work_item_id='TI-010'"
+        ).fetchone()[0])
+        event = connection.execute(
+            "SELECT actor_kind,actor_id,payload_json FROM events "
+            "WHERE work_item_id='TI-010' AND event_type='AUTO_GATE_APPROVED'"
+        ).fetchone()
+        connection.close()
+        self.assertEqual(("SYSTEM", "auto-gate"), (event[0], event[1]))
+        payload = json.loads(event[2])
+        self.assertEqual(("PLAN", "AUTO_ON_PASS", "auto-plan-review"), (
+            payload["stage"], payload["policy"], payload["reviewRequestId"]
+        ))
+
+    def test_risk_requires_explicit_choice_and_audits_without_authorizing_action(self):
+        for index, kind in enumerate(("REMOTE", "DESTRUCTIVE", "ANOMALOUS_STATE")):
+            risk = {"protocolVersion": "AWB-CREATION-RISK-v1", "signals": [{
+                "kind": kind, "source": "authorization.allowed",
+                "evidence": "actual classified operation",
+            }]}
+            work_item_id = "TI-01{0}".format(index + 1)
+            with self.assertRaisesRegex(LiteError, "explicit human review choice"):
+                create_work_item(
+                    self.database, work_item_id, "TI", "risk item",
+                    management=self.management(work_item_id), creation_risk=risk,
+                )
+        connection = open_database(self.database)
+        self.assertEqual(0, connection.execute(
+            "SELECT count(*) FROM work_items WHERE work_item_id IN ('TI-011','TI-012','TI-013')"
+        ).fetchone()[0])
+        connection.close()
+        risk = {"protocolVersion": "AWB-CREATION-RISK-v1", "signals": [{
+            "kind": "REMOTE", "source": "authorization.allowed",
+            "evidence": "create a remote repository",
+        }]}
+        created = create_work_item(
+            self.database, "TI-011", "TI", "remote item",
+            management=self.management("TI-011"), creation_risk=risk,
+            human_review="AUTO_ON_PASS", decision_actor="user-a",
+        )
+        self.assertEqual("AUTO_ON_PASS", created["humanGatePolicy"])
+        creation = timeline(self.database, "TI-011")[0]
+        payload = json.loads(creation["payload_json"])
+        self.assertEqual(("AUTO_ON_PASS", "user-a", False), (
+            payload["riskPromptDecision"], payload["decisionActor"],
+            payload["riskActionAuthorized"],
+        ))
+
+    def test_creation_risk_rejects_duplicates_unknown_kinds_and_credentials(self):
+        signal = {"kind": "DESTRUCTIVE", "source": "scope",
+                  "evidence": "delete generated state"}
+        invalid = [
+            {"protocolVersion": "AWB-CREATION-RISK-v1", "signals": [signal, signal]},
+            {"protocolVersion": "AWB-CREATION-RISK-v1", "signals": [
+                {"kind": "OTHER", "source": "scope", "evidence": "unknown"}
+            ]},
+            {"protocolVersion": "AWB-CREATION-RISK-v1", "signals": [
+                {"kind": "REMOTE", "source": "scope", "evidence": "api_key=abcd"}
+            ]},
+        ]
+        for index, risk in enumerate(invalid):
+            with self.assertRaises(LiteError):
+                create_work_item(
+                    self.database, "TI-02{0}".format(index), "TI", "invalid risk",
+                    management=self.management("TI-02{0}".format(index)),
+                    creation_risk=risk, human_review="MANUAL", decision_actor="user-a",
+                )
+
+    def test_auto_final_requires_quality_and_review_replay_is_zero_write(self):
+        create_work_item(
+            self.database, "TI-030", "TI", "auto final",
+            management=self.management("TI-030"),
+        )
+        self.claim("TI-030", 1, "planner-auto", "PLANNER")
+        self.complete("TI-030", 1, "planner-auto")
+        transition(self.database, "TI-030", "submit_plan", "planner-auto")
+        self.claim("TI-030", 3, "plan-reviewer", "REVIEWER")
+        record_agent_review(
+            self.database, "TI-030", "PLAN", "plan-reviewer", "APPROVED",
+            self.structured_review("PLAN", "PASS"), request_id="plan-replay",
+        )
+        first_count = len(timeline(self.database, "TI-030"))
+        replayed = record_agent_review(
+            self.database, "TI-030", "PLAN", "plan-reviewer", "APPROVED",
+            self.structured_review("PLAN", "PASS"), request_id="plan-replay",
+        )
+        self.assertEqual(first_count, len(timeline(self.database, "TI-030")))
+        self.assertEqual("PLAN_REVIEW_APPROVED", replayed["state"])
+        with self.assertRaisesRegex(LiteError, "different content"):
+            record_agent_review(
+                self.database, "TI-030", "PLAN", "plan-reviewer", "REJECTED",
+                self.structured_review("PLAN", "REVISE"), request_id="plan-replay",
+            )
+        self.claim("TI-030", 2, "implementer-auto", "IMPLEMENTER")
+        transition(self.database, "TI-030", "start_implementation", "implementer-auto")
+        self.complete("TI-030", 2, "implementer-auto")
+        transition(
+            self.database, "TI-030", "submit_implementation", "implementer-auto",
+            local_tests_passed=True, quality_baseline=self.quality(),
+        )
+        self.claim("TI-030", 3, "final-reviewer", "REVIEWER")
+        done = record_agent_review(
+            self.database, "TI-030", "FINAL", "final-reviewer", "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
+        )
+        self.assertEqual(("FINAL_ACCEPTANCE_APPROVED", "HELD", "TERMINAL_STATE"), (
+            done["state"], done["queue_state"], done["held_reason"]
+        ))
+        self.assertEqual(2, sum(
+            row["event_type"] == "AUTO_GATE_APPROVED"
+            for row in timeline(self.database, "TI-030")
+        ))
+
+    def test_auto_final_quality_drift_fails_closed_without_auto_event(self):
+        create_work_item(
+            self.database, "TI-031", "TI", "auto fail closed",
+            management=self.management("TI-031"),
+        )
+        self.claim("TI-031", 1, "planner-auto", "PLANNER")
+        self.complete("TI-031", 1, "planner-auto")
+        transition(self.database, "TI-031", "submit_plan", "planner-auto")
+        self.claim("TI-031", 3, "plan-reviewer", "REVIEWER")
+        record_agent_review(
+            self.database, "TI-031", "PLAN", "plan-reviewer", "APPROVED",
+            self.structured_review("PLAN", "PASS"),
+        )
+        self.claim("TI-031", 2, "implementer-auto", "IMPLEMENTER")
+        transition(self.database, "TI-031", "start_implementation", "implementer-auto")
+        self.complete("TI-031", 2, "implementer-auto")
+        transition(
+            self.database, "TI-031", "submit_implementation", "implementer-auto",
+            local_tests_passed=True, quality_baseline=self.quality(),
+        )
+        connection = open_database(self.database)
+        row = connection.execute(
+            "SELECT event_id,payload_json FROM events WHERE work_item_id='TI-031' "
+            "AND event_type='SUBMIT_IMPLEMENTATION'"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload["qualityBaseline"]["tests"][0]["result"] = "FAIL"
+        connection.execute(
+            "UPDATE events SET payload_json=? WHERE event_id=?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), row["event_id"]),
+        )
+        connection.commit()
+        connection.close()
+        self.claim("TI-031", 3, "final-reviewer", "REVIEWER")
+        reviewed = record_agent_review(
+            self.database, "TI-031", "FINAL", "final-reviewer", "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
+        )
+        self.assertEqual(("IMPLEMENTATION_COMPLETED", "WAITING_HUMAN"), (
+            reviewed["state"], reviewed["queue_state"]
+        ))
+        events = timeline(self.database, "TI-031")
+        self.assertEqual(1, sum(row["event_type"] == "AUTO_GATE_APPROVED" for row in events))
+        final_review = [row for row in events if row["event_type"] == "AGENT_FINAL_REVIEW"][0]
+        self.assertEqual("FAIL_CLOSED", json.loads(final_review["payload_json"])["autoGate"]["status"])
+
     def test_human_plan_rejection_returns_draft(self):
         self.create()
         self.claim("TI-001", 1, "planner", "PLANNER")
@@ -952,9 +1131,13 @@ class LiteWorkboardTest(unittest.TestCase):
 
     def test_cli_write_commands_complete_standard_workflow(self):
         management_file = self.json_file("fe-management.json", self.management("FE-99", item_type="FE"))
+        risk_file = self.json_file("fe-risk.json", {
+            "protocolVersion": "AWB-CREATION-RISK-v1", "signals": []
+        })
         quality_file = self.json_file("fe-quality.json", self.quality())
         self.cli("create", "FE-99", "--type", "FE", "--title", "CLI trial",
-                 "--management-file", management_file)
+                 "--management-file", management_file, "--risk-file", risk_file,
+                 "--human-review", "manual")
         self.cli("claim", "FE-99", "FE-99-T01", "--agent", "planner", "--role", "PLANNER")
         self.cli("lock", "FE-99", "--repository", "repo", "--agent", "planner")
         self.cli("unlock", "FE-99", "--repository", "repo", "--agent", "planner")
@@ -978,8 +1161,11 @@ class LiteWorkboardTest(unittest.TestCase):
 
     def test_cli_block_release_unblock_and_reclaim(self):
         management_file = self.json_file("ti-management.json", self.management("TI-88"))
+        risk_file = self.json_file("ti-risk.json", {
+            "protocolVersion": "AWB-CREATION-RISK-v1", "signals": []
+        })
         self.cli("create", "TI-88", "--type", "TI", "--title", "blocked trial",
-                 "--management-file", management_file)
+                 "--management-file", management_file, "--risk-file", risk_file)
         self.cli("claim", "TI-88", "TI-88-T01", "--agent", "planner", "--role", "PLANNER")
         self.cli("task", "TI-88", "TI-88-T01", "--agent", "planner", "--status", "IN_PROGRESS")
         self.cli("task", "TI-88", "TI-88-T01", "--agent", "planner", "--status", "BLOCKED", "--evidence", "waiting")

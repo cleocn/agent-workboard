@@ -6,11 +6,13 @@ two review stages, human gates, hold/block and an event timeline.
 
 import argparse
 import datetime
+import hashlib
 import html
 import ipaddress
 import json
 import os
 import pkgutil
+import re
 import sqlite3
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,6 +23,10 @@ from urllib.parse import unquote, urlsplit
 SCHEMA_VERSION = "MVP-LITE-v1"
 MANAGEMENT_CONTRACT_VERSION = "AWB-WORKITEM-MGMT-v1"
 TEMPLATE_CONTRACT_VERSION = "AWB-MANAGEMENT-v1"
+AUTO_GATE_SCHEMA_VERSION = "AWB-AUTO-GATE-v1"
+CREATION_RISK_PROTOCOL = "AWB-CREATION-RISK-v1"
+HUMAN_GATE_POLICIES = ("AUTO_ON_PASS", "MANUAL")
+CREATION_RISK_KINDS = ("REMOTE", "DESTRUCTIVE", "ANOMALOUS_STATE")
 BUSY_TIMEOUT_MS = 5000
 DEFAULT_SCHEMA = None
 # Compatibility-only default.  Installed projects should use `awb ... --project`
@@ -42,6 +48,138 @@ def _id(prefix):
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha(value):
+    if not isinstance(value, bytes):
+        value = value.encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
+def _normalize_schema_sql(value):
+    """Canonicalize SQL without changing quoted text."""
+    value = value or ""
+    normalized = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character.isspace():
+            index += 1
+            continue
+        if value.startswith("--", index):
+            newline = value.find("\n", index + 2)
+            index = len(value) if newline < 0 else newline + 1
+            continue
+        if value.startswith("/*", index):
+            closing = value.find("*/", index + 2)
+            index = len(value) if closing < 0 else closing + 2
+            continue
+        if character in ("'", '"', "`"):
+            quote = character
+            normalized.append(character)
+            index += 1
+            while index < len(value):
+                character = value[index]
+                normalized.append(character)
+                index += 1
+                if character == quote:
+                    if index < len(value) and value[index] == quote:
+                        normalized.append(value[index])
+                        index += 1
+                    else:
+                        break
+            continue
+        if character == "[":
+            normalized.append(character)
+            index += 1
+            while index < len(value):
+                character = value[index]
+                normalized.append(character)
+                index += 1
+                if character == "]":
+                    if index < len(value) and value[index] == "]":
+                        normalized.append(value[index])
+                        index += 1
+                    else:
+                        break
+            continue
+        normalized.append(character.lower())
+        index += 1
+    return "".join(normalized)
+
+
+def human_gate_schema_sql():
+    return """
+ALTER TABLE work_items ADD COLUMN human_gate_policy TEXT NOT NULL DEFAULT 'MANUAL'
+  CHECK (human_gate_policy IN ('AUTO_ON_PASS','MANUAL'));
+INSERT INTO schema_meta(key,value) VALUES
+  ('gate_policy_schema_version','AWB-AUTO-GATE-v1');
+""".strip()
+
+
+def human_gate_schema_state(connection):
+    marker = connection.execute(
+        "SELECT value FROM schema_meta WHERE key='gate_policy_schema_version'"
+    ).fetchone()
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(work_items)")]
+    present = "human_gate_policy" in columns
+    if marker is None and not present:
+        return "ABSENT"
+    table = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'"
+    ).fetchone()
+    normalized = _normalize_schema_sql(table[0] if table else "")
+    expected = "human_gate_policytextnotnulldefault'MANUAL'check(human_gate_policyin('AUTO_ON_PASS','MANUAL'))"
+    invalid_values = (connection.execute(
+        "SELECT count(*) FROM work_items WHERE human_gate_policy NOT IN ('AUTO_ON_PASS','MANUAL')"
+    ).fetchone()[0] if present else 1)
+    if (marker and marker[0] == AUTO_GATE_SCHEMA_VERSION and present and
+            expected in normalized and not invalid_values):
+        return "INSTALLED"
+    return "INVALID"
+
+
+_SENSITIVE_RISK = re.compile(
+    r"(?i)(bearer\s+[a-z0-9._~+/=-]+|password\s*[:=]|secret\s*[:=]|"
+    r"api[_-]?key\s*[:=]|access[_-]?token\s*[:=]|credential\s*[:=])"
+)
+
+
+def normalize_creation_risk(value):
+    """Validate the Agent's pre-create classification before any DB transaction."""
+    if value is None:
+        value = {"protocolVersion": CREATION_RISK_PROTOCOL, "signals": []}
+    if not isinstance(value, dict) or set(value) != {"protocolVersion", "signals"}:
+        raise LiteError("creation risk must contain only protocolVersion and signals")
+    if value.get("protocolVersion") != CREATION_RISK_PROTOCOL:
+        raise LiteError("creation risk protocolVersion is invalid")
+    signals = value.get("signals")
+    if not isinstance(signals, list):
+        raise LiteError("creation risk signals must be a list")
+    normalized = []
+    seen = set()
+    for signal in signals:
+        if not isinstance(signal, dict) or set(signal) != {"kind", "source", "evidence"}:
+            raise LiteError("creation risk signal fields are invalid")
+        kind = signal.get("kind")
+        source = signal.get("source")
+        evidence = signal.get("evidence")
+        if kind not in CREATION_RISK_KINDS:
+            raise LiteError("creation risk kind is invalid")
+        if (not isinstance(source, str) or not source.strip() or len(source.strip()) > 120 or
+                not isinstance(evidence, str) or not evidence.strip() or
+                len(evidence.strip()) > 240):
+            raise LiteError("creation risk source and evidence must be short non-empty strings")
+        source, evidence = source.strip(), evidence.strip()
+        if _SENSITIVE_RISK.search(source) or _SENSITIVE_RISK.search(evidence):
+            raise LiteError("creation risk must not contain credentials or secrets")
+        key = (kind, source, evidence)
+        if key in seen:
+            raise LiteError("creation risk signals must not be duplicated")
+        seen.add(key)
+        normalized.append({"kind": kind, "source": source, "evidence": evidence})
+    normalized.sort(key=lambda entry: (entry["kind"], entry["source"], entry["evidence"]))
+    return {"protocolVersion": CREATION_RISK_PROTOCOL, "signals": normalized}
 
 
 def open_database(path):
@@ -301,18 +439,42 @@ def _current_and_next(item, tasks, active_claim, review_state=None):
 
 
 def create_work_item(database, work_item_id, item_type, title, mode="STANDARD", priority="P2",
-                     management=None, request_id=None, actor_id="orchestrator"):
+                     management=None, request_id=None, actor_id="orchestrator",
+                     human_review=None, creation_risk=None, decision_actor=None):
     if not work_item_id.startswith(item_type + "-"):
         raise LiteError("WorkItem id and type must match")
     if item_type not in ("TI", "FE", "R", "WA", "AWB"):
         raise LiteError("unsupported WorkItem type")
     if mode not in ("STANDARD", "READ_ONLY_DIAGNOSIS"):
         raise LiteError("unsupported mode")
+    risk = normalize_creation_risk(creation_risk)
+    if human_review is not None and human_review not in HUMAN_GATE_POLICIES:
+        raise LiteError("human review policy is invalid")
+    if mode == "READ_ONLY_DIAGNOSIS" and human_review == "AUTO_ON_PASS":
+        raise LiteError("AUTO_ON_PASS is only valid for STANDARD WorkItems")
+    if risk["signals"] and human_review is None:
+        raise LiteError("risk signals require an explicit human review choice before create")
+    if risk["signals"] and (not isinstance(decision_actor, str) or not decision_actor.strip()):
+        raise LiteError("risk choice requires a decision actor")
+    policy = (human_review or "AUTO_ON_PASS") if mode == "STANDARD" else "MANUAL"
+    policy_source = "EXPLICIT" if human_review is not None else "DEFAULT"
     request_id = request_id or _id("create")
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        basic_payload = {"type": item_type, "title": title, "mode": mode, "priority": priority}
+        if human_gate_schema_state(connection) != "INSTALLED":
+            raise LiteError("human gate policy schema is not installed; run awb migrate")
+        basic_payload = {
+            "type": item_type, "title": title, "mode": mode, "priority": priority,
+            "humanGatePolicy": policy, "policySource": policy_source,
+            "creationRisk": risk,
+        }
+        if risk["signals"]:
+            basic_payload.update({
+                "riskPromptDecision": policy,
+                "decisionActor": decision_actor.strip(),
+                "riskActionAuthorized": False,
+            })
         replay = connection.execute(
             "SELECT event_type,payload_json FROM events WHERE request_id=?", (request_id,)
         ).fetchone()
@@ -346,9 +508,9 @@ def create_work_item(database, work_item_id, item_type, title, mode="STANDARD", 
         create_payload = dict(basic_payload)
         create_payload["management"] = normalized
         connection.execute(
-            "INSERT INTO work_items(work_item_id,work_item_type,title,mode,priority,current_role,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,'PLANNER',?,?)",
-            (work_item_id, item_type, title, mode, priority, now, now),
+            "INSERT INTO work_items(work_item_id,work_item_type,title,mode,priority,current_role,"
+            "created_at,updated_at,human_gate_policy) VALUES(?,?,?,?,?,'PLANNER',?,?,?)",
+            (work_item_id, item_type, title, mode, priority, now, now, policy),
         )
         for task in normalized["tasks"]:
             connection.execute(
@@ -372,6 +534,17 @@ def get_work_item(database, work_item_id):
     connection = open_database(database)
     try:
         item = dict(_item(connection, work_item_id))
+        policy = item.get("human_gate_policy", "MANUAL")
+        item["humanGatePolicy"] = policy
+        creation = connection.execute(
+            "SELECT payload_json FROM events WHERE work_item_id=? AND event_type='WORK_ITEM_CREATED' "
+            "ORDER BY event_id LIMIT 1", (work_item_id,),
+        ).fetchone()
+        try:
+            creation_payload = json.loads(creation[0]) if creation else {}
+        except (TypeError, ValueError):
+            creation_payload = {}
+        item["humanGatePolicySource"] = creation_payload.get("policySource", "MIGRATED")
         item["tasks"] = [dict(row) for row in connection.execute(
             "SELECT * FROM tasks WHERE work_item_id=? ORDER BY seq", (work_item_id,)
         )]
@@ -445,6 +618,7 @@ def list_work_items(database):
             "updated_at, work_item_id"
         )]
         for row in rows:
+            row["humanGatePolicy"] = row.get("human_gate_policy", "MANUAL")
             tasks = [dict(task) for task in connection.execute(
                 "SELECT * FROM tasks WHERE work_item_id=? ORDER BY seq", (row["work_item_id"],)
             )]
@@ -598,9 +772,53 @@ def _expire_claims(connection, work_item_id, now):
     )
 
 
+def _validate_orchestrator_fence(connection, work_item_id, orchestrator_id,
+                                 orchestrator_generation, now):
+    """Authorize a new Agent dispatch without coupling in-flight Agent work.
+
+    Databases without the extension and WorkItems with zero lease history retain
+    the legacy no-fence path.  After the first lease, omission is intentionally
+    not a bypass: the exact current ACTIVE and unexpired fence is mandatory.
+    """
+    supplied = (orchestrator_id is not None, orchestrator_generation is not None)
+    if supplied[0] != supplied[1]:
+        raise LiteError("orchestrator-id and orchestrator-generation must be supplied together")
+    try:
+        from .orchestrator import schema_state
+        state = schema_state(connection)
+    except sqlite3.Error:
+        state = "ABSENT"
+    if state == "INVALID":
+        raise LiteError("orchestrator schema is invalid")
+    if state == "ABSENT":
+        if any(supplied):
+            raise LiteError("orchestrator fence requires installed schema")
+        return
+    history = connection.execute(
+        "SELECT count(*) FROM orchestrator_leases WHERE work_item_id=?",
+        (work_item_id,),
+    ).fetchone()[0]
+    if history == 0:
+        if any(supplied):
+            raise LiteError("orchestrator fence has no lease history")
+        return
+    if not all(supplied):
+        raise LiteError("current orchestrator fence is required")
+    if type(orchestrator_generation) is not int or orchestrator_generation < 1:
+        raise LiteError("orchestrator-generation must be positive")
+    active = connection.execute(
+        "SELECT 1 FROM orchestrator_leases WHERE work_item_id=? AND orchestrator_id=? "
+        "AND generation=? AND status='ACTIVE' AND expires_at>?",
+        (work_item_id, orchestrator_id, orchestrator_generation, now),
+    ).fetchone()
+    if active is None:
+        raise LiteError("stale or inactive orchestrator fence")
+
+
 def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
                   request_id=None, session_id=None, usage_provider=None, model=None,
-                  sessions_root=None):
+                  sessions_root=None, orchestrator_id=None,
+                  orchestrator_generation=None):
     usage_values = (session_id, usage_provider, model)
     if any(value is not None for value in usage_values) and not all(usage_values):
         raise LiteError("session-id, usage-provider, and model must be supplied together")
@@ -618,6 +836,9 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
         now = _now()
+        _validate_orchestrator_fence(
+            connection, work_item_id, orchestrator_id, orchestrator_generation, now
+        )
         _expire_claims(connection, work_item_id, now)
         active = connection.execute(
             "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE'", (work_item_id,)
@@ -1201,6 +1422,111 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
     }
 
 
+def _review_request_fingerprint(work_item_id, stage, reviewer_agent_id, decision, summary):
+    return _sha(_json({
+        "workItemId": work_item_id, "stage": stage, "reviewer": reviewer_agent_id,
+        "decision": decision, "summary": summary,
+    }))
+
+
+def _quality_baseline_is_auto_safe(baseline, management):
+    if not isinstance(baseline, dict):
+        return False
+    list_fields = (
+        "passedAcceptance", "tests", "modifiedScope", "regressions",
+        "acceptanceRegressions", "closureEvidence",
+    )
+    if any(not isinstance(baseline.get(field), list) for field in list_fields):
+        return False
+    acceptance = {
+        entry.get("id") for entry in baseline["passedAcceptance"]
+        if isinstance(entry, dict) and entry.get("id") and entry.get("evidence")
+    }
+    closure = {
+        entry.get("id") for entry in baseline["closureEvidence"]
+        if isinstance(entry, dict) and entry.get("id") and entry.get("evidence")
+    }
+    required_acceptance = {entry["id"] for entry in management.get("acceptance", [])}
+    required_closure = {entry["id"] for entry in management.get("closure", [])}
+    return bool(
+        baseline["passedAcceptance"] and baseline["tests"] and
+        baseline["modifiedScope"] and baseline["closureEvidence"] and
+        required_acceptance.issubset(acceptance) and required_closure.issubset(closure) and
+        baseline.get("testsWeakened") is False and not baseline.get("planDeviation") and
+        not baseline["regressions"] and not baseline["acceptanceRegressions"] and
+        all(isinstance(test, dict) and test.get("command") and test.get("result") == "PASS"
+            for test in baseline["tests"])
+    )
+
+
+def _approved_gate_preconditions(connection, item, stage):
+    expected = "PLAN_REVIEW_PENDING" if stage == "PLAN" else "IMPLEMENTATION_COMPLETED"
+    if item["mode"] != "STANDARD" or item["state"] != expected:
+        raise LiteError("gate stage is invalid")
+    review = connection.execute(
+        "SELECT * FROM reviews WHERE work_item_id=? AND stage=? "
+        "ORDER BY created_at DESC,rowid DESC LIMIT 1", (item["work_item_id"], stage),
+    ).fetchone()
+    if review is None or _decoded_review(review)["result"] != "PASS":
+        raise LiteError("approval requires approved Agent review")
+    projection = _review_projection(connection, item["work_item_id"])
+    projected_stage = "PLAN" if stage == "PLAN" else "IMPLEMENTATION"
+    if projection[projected_stage]["openFindings"]:
+        raise LiteError("approval requires no open {0} Findings".format(projected_stage.lower()))
+    if stage == "FINAL":
+        pending = connection.execute(
+            "SELECT count(*) FROM tasks WHERE work_item_id=? AND required=1 AND status<>'COMPLETED'",
+            (item["work_item_id"],),
+        ).fetchone()[0]
+        if pending:
+            raise LiteError("final approval requires all required tasks completed")
+        baseline = _latest_submission_baseline(connection, item["work_item_id"])
+        management = _management_from_events(connection, item["work_item_id"])
+        if not _quality_baseline_is_auto_safe(baseline, management or {}):
+            raise LiteError("final approval requires passing implementation quality evidence")
+    return review
+
+
+def _approve_gate(connection, item, stage, now):
+    _approved_gate_preconditions(connection, item, stage)
+    if stage == "PLAN":
+        state, queue, role, held, closed = (
+            "PLAN_REVIEW_APPROVED", "CLAIMABLE", "IMPLEMENTER", None, None
+        )
+    else:
+        state, queue, role, held, closed = (
+            "FINAL_ACCEPTANCE_APPROVED", "HELD", None, "TERMINAL_STATE", now
+        )
+    connection.execute(
+        "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,"
+        "blocked_reason=NULL,closed_at=?,row_version=row_version+1,updated_at=? "
+        "WHERE work_item_id=?",
+        (state, queue, role, held, closed, now, item["work_item_id"]),
+    )
+
+
+def _auto_gate_context(connection, work_item_id):
+    row = connection.execute(
+        "SELECT payload_json FROM events WHERE work_item_id=? AND event_type='WORK_ITEM_CREATED' "
+        "ORDER BY event_id LIMIT 1", (work_item_id,),
+    ).fetchone()
+    try:
+        payload = json.loads(row[0]) if row else {}
+    except (TypeError, ValueError):
+        payload = {}
+    risk = payload.get("creationRisk", {})
+    signals = risk.get("signals", []) if isinstance(risk, dict) else []
+    return {
+        "policySource": payload.get("policySource", "MIGRATED"),
+        "creationRiskKinds": sorted(set(
+            signal.get("kind") for signal in signals if isinstance(signal, dict) and
+            signal.get("kind") in CREATION_RISK_KINDS
+        )),
+        "riskPromptDecision": payload.get("riskPromptDecision"),
+        "riskActionAuthorized": False,
+    }
+
+
 def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decision, summary,
                         request_id=None):
     _usage_sync_boundary(database, work_item_id)
@@ -1208,6 +1534,25 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        fingerprint = _review_request_fingerprint(
+            work_item_id, stage, reviewer_agent_id, decision, summary
+        )
+        replay = connection.execute(
+            "SELECT event_type,actor_kind,actor_id,payload_json FROM events WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        if replay:
+            try:
+                replay_payload = json.loads(replay["payload_json"])
+            except (TypeError, ValueError):
+                replay_payload = {}
+            expected_event = "AGENT_{0}_REVIEW".format(stage)
+            if (replay["event_type"] != expected_event or replay["actor_kind"] != "AGENT" or
+                    replay["actor_id"] != reviewer_agent_id or
+                    replay_payload.get("requestFingerprint") != fingerprint):
+                raise LiteError("request_id was already used with different content")
+            connection.rollback()
+            return get_work_item(database, work_item_id)
         item = _item(connection, work_item_id)
         _active_claim(connection, work_item_id, "REVIEWER", reviewer_agent_id)
         expected = "PLAN_REVIEW_PENDING" if stage == "PLAN" else "IMPLEMENTATION_COMPLETED"
@@ -1225,13 +1570,15 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
         review = _normalize_review(connection, work_item_id, stage, decision, summary)
         stored_decision = "APPROVED" if review["result"] == "PASS" else "REJECTED"
         now = _now()
+        review_id = _id("review")
         connection.execute(
             "INSERT INTO reviews VALUES(?,?,?,?,?,?,?)",
-            (_id("review"), work_item_id, stage, reviewer_agent_id, stored_decision, _json(review), now),
+            (review_id, work_item_id, stage, reviewer_agent_id, stored_decision, _json(review), now),
         )
         _release_active(connection, work_item_id, now)
         result = review["result"]
         round_number = review["round"]
+        policy = item["human_gate_policy"] if "human_gate_policy" in item.keys() else "MANUAL"
         if result == "PASS" and item["mode"] == "STANDARD":
             state, queue, role = item["state"], "WAITING_HUMAN", None
         elif result == "PASS":
@@ -1262,13 +1609,48 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
                 (reviewer_status, _json([{"reviewRound": round_number, "result": result}]), now,
                  work_item_id),
             )
-        connection.execute(
-            "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,blocked_reason=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (state, queue, role, "TARGET_REACHED" if queue == "HELD" else None,
-             "REVIEW_BLOCKED" if queue == "BLOCKED" else None, now, work_item_id),
-        )
+        auto_approved = False
+        auto_gate_failure = None
+        if (result == "PASS" and item["mode"] == "STANDARD" and
+                policy == "AUTO_ON_PASS" and item["queue_state"] == "CLAIMED" and
+                item["held_reason"] is None and item["blocked_reason"] is None):
+            try:
+                _approve_gate(connection, item, stage, now)
+                auto_approved = True
+            except LiteError as exc:
+                # The independent PASS remains recorded, but runtime drift or
+                # incomplete quality evidence deliberately falls back to HUMAN.
+                auto_gate_failure = str(exc)
+        if not auto_approved:
+            connection.execute(
+                "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,"
+                "blocked_reason=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
+                (state, queue, role, "TARGET_REACHED" if queue == "HELD" else None,
+                 "REVIEW_BLOCKED" if queue == "BLOCKED" else None, now, work_item_id),
+            )
+        review_payload = {"decision": stored_decision, "review": review,
+                          "requestFingerprint": fingerprint}
+        if auto_gate_failure:
+            review_payload["autoGate"] = {
+                "status": "FAIL_CLOSED", "reason": auto_gate_failure,
+            }
         _event(connection, work_item_id, request_id, "AGENT_{0}_REVIEW".format(stage), "AGENT",
-               reviewer_agent_id, {"decision": stored_decision, "review": review})
+               reviewer_agent_id, review_payload)
+        if auto_approved:
+            review_event = connection.execute(
+                "SELECT event_id FROM events WHERE request_id=?", (request_id,)
+            ).fetchone()[0]
+            payload = {
+                "policy": policy, "stage": stage, "reviewId": review_id,
+                "reviewRound": round_number, "reviewRequestId": request_id,
+                "reviewEventId": review_event,
+                "idempotencyRequestId": request_id,
+            }
+            payload.update(_auto_gate_context(connection, work_item_id))
+            _event(
+                connection, work_item_id, "auto-gate-" + _sha(request_id + ":" + stage),
+                "AUTO_GATE_APPROVED", "SYSTEM", "auto-gate", payload,
+            )
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -1293,29 +1675,17 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
             raise LiteError("human gate stage or decision is invalid")
         if _management_from_events(connection, work_item_id) is None:
             raise LiteError("management envelope is required before human gate")
-        review = connection.execute(
-            "SELECT * FROM reviews WHERE work_item_id=? AND stage=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (work_item_id, stage),
-        ).fetchone()
-        if decision == "APPROVED" and (review is None or _decoded_review(review)["result"] != "PASS"):
-            raise LiteError("human approval requires approved Agent review")
-        if decision == "APPROVED" and stage == "FINAL":
-            pending = connection.execute(
-                "SELECT count(*) FROM tasks WHERE work_item_id=? AND required=1 AND status<>'COMPLETED'",
-                (work_item_id,),
-            ).fetchone()[0]
-            if pending:
-                raise LiteError("final approval requires all required tasks completed")
-            if _review_projection(connection, work_item_id)["IMPLEMENTATION"]["openFindings"]:
-                raise LiteError("final approval requires no open implementation Findings")
-            if _latest_submission_baseline(connection, work_item_id) is None:
-                raise LiteError("final approval requires implementation quality evidence")
+        if decision == "APPROVED":
+            _approved_gate_preconditions(connection, item, stage)
         now = _now()
         connection.execute(
             "INSERT INTO human_gates VALUES(?,?,?,?,?,?,?)",
             (_id("gate"), work_item_id, stage, human_id, decision, reason, now),
         )
-        if stage == "PLAN":
+        if decision == "APPROVED":
+            _approve_gate(connection, item, stage, now)
+            state = None
+        elif stage == "PLAN":
             state = "PLAN_REVIEW_APPROVED" if decision == "APPROVED" else "DRAFT"
             queue, role, held, closed = "CLAIMABLE", "IMPLEMENTER" if decision == "APPROVED" else "PLANNER", None, None
             if decision == "REJECTED":
@@ -1323,22 +1693,18 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
                     "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? AND owner_role='PLANNER'",
                     (now, work_item_id),
                 )
-        elif decision == "APPROVED":
-            state, queue, role, held, closed = "FINAL_ACCEPTANCE_APPROVED", "HELD", None, "TERMINAL_STATE", now
-            connection.execute(
-                "UPDATE tasks SET status='COMPLETED',updated_at=? WHERE work_item_id=? AND owner_role='REVIEWER'",
-                (now, work_item_id),
-            )
         else:
             state, queue, role, held, closed = "IMPLEMENTING", "CLAIMABLE", "IMPLEMENTER", None, None
             connection.execute(
                 "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? AND owner_role='IMPLEMENTER'",
                 (now, work_item_id),
             )
-        connection.execute(
-            "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,closed_at=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (state, queue, role, held, closed, now, work_item_id),
-        )
+        if state is not None:
+            connection.execute(
+                "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,closed_at=?,"
+                "row_version=row_version+1,updated_at=? WHERE work_item_id=?",
+                (state, queue, role, held, closed, now, work_item_id),
+            )
         _event(connection, work_item_id, request_id, "HUMAN_{0}_GATE".format(stage), "HUMAN",
                human_id, {"decision": decision, "reason": reason})
         connection.commit()
@@ -1644,6 +2010,9 @@ def main(argv=None):
     create.add_argument("--mode", choices=("STANDARD", "READ_ONLY_DIAGNOSIS"), default="STANDARD")
     create.add_argument("--priority", choices=("P0", "P1", "P2", "P3"), default="P2")
     create.add_argument("--management-file", required=True)
+    create.add_argument("--risk-file", required=True)
+    create.add_argument("--human-review", choices=("auto-on-pass", "manual"))
+    create.add_argument("--decision-actor")
     sub.add_parser("list")
     show = sub.add_parser("show")
     show.add_argument("work_item_id")
@@ -1658,6 +2027,8 @@ def main(argv=None):
     claim.add_argument("--session-id")
     claim.add_argument("--usage-provider")
     claim.add_argument("--model")
+    claim.add_argument("--orchestrator-id")
+    claim.add_argument("--orchestrator-generation", type=int)
     release = sub.add_parser("release")
     release.add_argument("work_item_id")
     release.add_argument("--agent", required=True)
@@ -1732,6 +2103,11 @@ def main(argv=None):
             _print(create_work_item(
                 args.database, args.work_item_id, args.type, args.title, args.mode, args.priority,
                 management=_load_json_file(args.management_file, "management file"),
+                creation_risk=_load_json_file(args.risk_file, "risk file"),
+                human_review=({"auto-on-pass": "AUTO_ON_PASS", "manual": "MANUAL"}.get(
+                    args.human_review
+                )),
+                decision_actor=args.decision_actor,
             ))
         elif args.command == "list":
             _print(list_work_items(args.database))
@@ -1745,7 +2121,9 @@ def main(argv=None):
             expires = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=args.ttl)).replace(microsecond=0).isoformat()
             _print(acquire_claim(args.database, args.work_item_id, args.task_id, args.agent,
                                  args.role, expires, session_id=args.session_id,
-                                 usage_provider=args.usage_provider, model=args.model))
+                                 usage_provider=args.usage_provider, model=args.model,
+                                 orchestrator_id=args.orchestrator_id,
+                                 orchestrator_generation=args.orchestrator_generation))
         elif args.command == "release":
             release_claim(args.database, args.work_item_id, args.agent)
             _print(get_work_item(args.database, args.work_item_id))

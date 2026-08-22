@@ -21,7 +21,12 @@ from urllib.parse import quote, unquote, urlparse
 
 from . import __version__
 from ._build import BUILD_IDENTITY
-from .lite import LiteError, SCHEMA_VERSION, initialize_database, open_database
+from .lite import (AUTO_GATE_SCHEMA_VERSION, LiteError, SCHEMA_VERSION,
+                   human_gate_schema_sql, human_gate_schema_state,
+                   initialize_database, open_database)
+from .orchestrator import (ORCHESTRATOR_SCHEMA_VERSION, active_count,
+                           schema_sql as orchestrator_schema_sql,
+                           schema_state as orchestrator_schema_state)
 from .usage import USAGE_SCHEMA_VERSION, schema_installed, usage_schema_sql
 
 
@@ -30,15 +35,17 @@ MANAGED = ("config.json", "project.md", ".gitignore", "requirements-awb.txt")
 TABLES = ("work_items", "tasks", "claims", "repository_locks", "reviews",
           "human_gates", "events")
 USAGE_TABLES = ("usage_events",)
+ORCHESTRATOR_TABLES = ("orchestrator_instances", "orchestrator_leases",
+                       "orchestrator_events")
 UPGRADE_PROTOCOL = "AWB-UPGRADE-v1"
 ROLLBACK_PROTOCOL = "AWB-ROLLBACK-v1"
-RELEASE_0_2_1_IDENTITY = {
-    "packageVersion": "0.2.1",
-    "sourceCommit": "c7d210db9cb4fb59d8e263277c74d0c040b40d7c",
-    "sourceTree": "d24b1e77adff3ed01d26a6d99e7ea11d51263588",
-    "sourceTag": "v0.2.1",
+RELEASE_0_3_0B1_IDENTITY = {
+    "packageVersion": "0.3.0b1",
+    "sourceCommit": "e7616c97c8572ba2556e9d636365595424f6eccf",
+    "sourceTree": "bef05f7c608aafef8ca49bfcaf0b782cab4fb718",
+    "sourceTag": "v0.3.0b1",
 }
-SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_2_1_IDENTITY,)
+SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_0B1_IDENTITY,)
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
 
 
@@ -344,7 +351,7 @@ def _validate_project_contract(root):
             raise LiteError("requirements-awb.txt wheel hash does not match")
     elif (parsed.scheme != "https" or parsed.netloc != "github.com" or
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
-                  for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1"))):
+                  for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -560,13 +567,29 @@ def doctor(path):
             "SELECT count(*) FROM sqlite_master WHERE type='trigger' "
             "AND name IN ('usage_events_no_update','usage_events_no_delete')").fetchone()[0]
                           if usage_version else 0)
+        orchestrator_state = orchestrator_schema_state(connection)
+        orchestrator_version = (ORCHESTRATOR_SCHEMA_VERSION
+                                if orchestrator_state == "INSTALLED" else None)
+        active_orchestrators = active_count(connection)
+        gate_policy_state = human_gate_schema_state(connection)
     finally:
         connection.close()
-    if integrity != "ok" or foreign_keys or (usage_version and usage_triggers != 2):
+    if (integrity != "ok" or foreign_keys or (usage_version and usage_triggers != 2) or
+            orchestrator_state == "INVALID" or gate_policy_state == "INVALID"):
         raise LiteError("database integrity or foreign key check failed")
     return {"status": "ok", "database": database, "schemaVersion": SCHEMA_VERSION,
             "usageSchemaVersion": usage_version, "buildIdentity": BUILD_IDENTITY,
-            "activeClaims": active_claims, "activeWriters": writers}
+            "orchestratorSchemaVersion": orchestrator_version,
+            "orchestratorSchemaState": orchestrator_state,
+            "gatePolicySchemaVersion": (AUTO_GATE_SCHEMA_VERSION
+                                        if gate_policy_state == "INSTALLED" else None),
+            "gatePolicySchemaState": gate_policy_state,
+            "activeClaims": active_claims, "activeWriters": writers,
+            "activeOrchestratorLeases": active_orchestrators,
+            "nextStep": ({"action": "MIGRATE", "arguments": {}}
+                         if (orchestrator_state == "ABSENT" or
+                             gate_policy_state == "ABSENT") else
+                         {"action": "NONE", "arguments": {}})}
 
 
 def backup(path):
@@ -785,18 +808,28 @@ def _database_preflight(database):
             claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
             writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
             usage_state = _usage_schema_state(connection)
+            coordinator_state = orchestrator_schema_state(connection)
+            coordinators = active_count(connection)
+            gate_policy_state = human_gate_schema_state(connection)
         except sqlite3.Error as exc:
             raise LiteError("upgrade cannot read database: {0}".format(exc))
         finally:
             connection.close()
     if not version or version[0] != SCHEMA_VERSION or integrity != "ok" or foreign_keys:
         raise LiteError("upgrade refuses an invalid database")
-    if claims or writers:
-        raise LiteError("upgrade refuses active claim or repository writer")
+    if claims or writers or coordinators:
+        raise LiteError("upgrade refuses active claim or repository writer or orchestrator lease")
     if usage_state == "INVALID":
         raise LiteError("upgrade refuses an invalid or unexpected usage extension")
+    if coordinator_state == "INVALID":
+        raise LiteError("upgrade refuses an invalid or unexpected orchestrator extension")
+    if gate_policy_state == "INVALID":
+        raise LiteError("upgrade refuses an invalid or unexpected auto-gate extension")
     return {"activeClaims": claims, "activeWriters": writers, "integrity": integrity,
-            "usageSchemaState": usage_state}
+            "activeOrchestratorLeases": coordinators,
+            "usageSchemaState": usage_state,
+            "orchestratorSchemaState": coordinator_state,
+            "gatePolicySchemaState": gate_policy_state}
 
 
 def _wheel_resource_optional(wheel, resource):
@@ -838,17 +871,19 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.0b1" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.0b1"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.0b1 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b1" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b1"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b1 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
         evidence.append(dict({"id": "DATABASE", "status": "PASS"}, **database_status))
 
         if current_identity == target_identity:
-            if database_status["usageSchemaState"] != "INSTALLED":
-                raise LiteError("same-identity 0.3.0b1 project is missing the usage schema")
+            if (database_status["usageSchemaState"] != "INSTALLED" or
+                    database_status["orchestratorSchemaState"] != "INSTALLED" or
+                    database_status["gatePolicySchemaState"] != "INSTALLED"):
+                raise LiteError("same-identity 0.3.1b1 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -859,9 +894,13 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
             return {"result": result, "root": root, "config": config, "database": database}
 
         if current_identity not in SUPPORTED_UPGRADE_SOURCES:
-            raise LiteError("upgrade source identity is outside the exact 0.2.1 to 0.3.0b1 matrix")
-        if database_status["usageSchemaState"] != "ABSENT":
-            raise LiteError("upgrade refuses a 0.2.1 database with an unexpected usage extension")
+            raise LiteError("upgrade source identity is outside the exact 0.3.0b1 to 0.3.1b1 matrix")
+        if database_status["usageSchemaState"] != "INSTALLED":
+            raise LiteError("upgrade refuses a 0.3.0b1 database without the exact usage extension")
+        if database_status["orchestratorSchemaState"] != "ABSENT":
+            raise LiteError("upgrade refuses a 0.3.0b1 database with an unexpected orchestrator extension")
+        if database_status["gatePolicySchemaState"] != "ABSENT":
+            raise LiteError("upgrade refuses a 0.3.0b1 database with an unexpected auto-gate extension")
         old_wheel, old_digest = _locked_wheel(root, os.path.dirname(target_wheel))
         old_identity = _wheel_identity(old_wheel)
         if old_identity != current_identity:
@@ -1015,11 +1054,17 @@ def _write_upgrade(plan):
             _atomic_bytes(target, replacement)
         connection = open_database(plan["database"])
         try:
-            connection.executescript("BEGIN IMMEDIATE;\n" + usage_schema_sql() + "\nCOMMIT;")
+            connection.executescript(
+                "BEGIN IMMEDIATE;\n" + orchestrator_schema_sql() + "\n" +
+                human_gate_schema_sql()
+            )
             if (_usage_schema_state(connection) != "INSTALLED" or
+                    orchestrator_schema_state(connection) != "INSTALLED" or
+                    human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("usage migration validation failed")
+                raise LiteError("0.3.1b1 extension migration validation failed")
+            connection.commit()
         except Exception:
             connection.rollback()
             raise
@@ -1113,7 +1158,7 @@ def _manifest_target(base, relative, label, allow_missing=False):
 
 
 def _expected_rollback_material(root, database, manifest, backup_root):
-    """Reconstruct the only mutations the bounded 0.3.0b1 upgrade can make."""
+    """Reconstruct the only mutations the bounded 0.3.1b1 upgrade can make."""
     if not isinstance(manifest.get("withCodex"), bool):
         raise LiteError("rollback manifest Codex selection is invalid")
     managed_backups = {}
@@ -1184,8 +1229,14 @@ def _expected_rollback_material(root, database, manifest, backup_root):
     database_relative = os.path.relpath(database, root).replace(os.sep, "/")
     database_backup = _manifest_target(backup_root, database_relative,
                                        "database rollback backup")
-    if (_database_preflight(database_backup)["usageSchemaState"] != "ABSENT" or
-            _database_preflight(database)["usageSchemaState"] != "INSTALLED"):
+    before_database = _database_preflight(database_backup)
+    after_database = _database_preflight(database)
+    if (before_database["usageSchemaState"] != "INSTALLED" or
+            before_database["orchestratorSchemaState"] != "ABSENT" or
+            before_database["gatePolicySchemaState"] != "ABSENT" or
+            after_database["usageSchemaState"] != "INSTALLED" or
+            after_database["orchestratorSchemaState"] != "INSTALLED" or
+            after_database["gatePolicySchemaState"] != "INSTALLED"):
         raise LiteError("rollback database schema state is outside the exact migration pair")
     expected_actions.append({
         "action": "RESTORE",
@@ -1473,7 +1524,7 @@ def _write_rollback(plan):
 
 
 def upgrade_project(path, wheel_path=None, with_codex=False, check=False, rollback_manifest=None):
-    """Check, execute, or exactly roll back a bounded upgrade to 0.3.0b1."""
+    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b1."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",
@@ -1509,25 +1560,52 @@ def migrate(path, check=False):
     try:
         claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
         writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
-        installed = schema_installed(connection)
+        usage_state = _usage_schema_state(connection)
+        coordinator_state = orchestrator_schema_state(connection)
+        coordinators = active_count(connection)
+        gate_policy_state = human_gate_schema_state(connection)
     finally:
         connection.close()
-    pending = [] if installed else [USAGE_SCHEMA_VERSION]
+    if (usage_state == "INVALID" or coordinator_state == "INVALID" or
+            gate_policy_state == "INVALID"):
+        raise LiteError("migrate refuses a partial or unknown extension")
+    pending = []
+    if usage_state == "ABSENT":
+        pending.append(USAGE_SCHEMA_VERSION)
+    if coordinator_state == "ABSENT":
+        pending.append(ORCHESTRATOR_SCHEMA_VERSION)
+    if gate_policy_state == "ABSENT":
+        pending.append(AUTO_GATE_SCHEMA_VERSION)
     result = {"current": SCHEMA_VERSION, "target": USAGE_SCHEMA_VERSION,
-              "pending": pending, "activeClaims": claims, "activeWriters": writers}
+              "targetExtensions": [USAGE_SCHEMA_VERSION, ORCHESTRATOR_SCHEMA_VERSION,
+                                   AUTO_GATE_SCHEMA_VERSION],
+              "pending": pending, "activeClaims": claims, "activeWriters": writers,
+              "activeOrchestratorLeases": coordinators}
     if check:
         return result
-    if claims or writers:
-        raise LiteError("migrate refuses active claim or repository writer")
-    if installed:
+    if claims or writers or coordinators:
+        raise LiteError("migrate refuses active claim, repository writer, or orchestrator lease")
+    if not pending:
         result["status"] = "no-op"
         return result
     result["backup"] = backup(root)["backup"]
     connection = open_database(database)
     try:
-        connection.executescript("BEGIN IMMEDIATE;\n" + usage_schema_sql() + "\nCOMMIT;")
-        if not schema_installed(connection):
-            raise LiteError("usage migration did not install its schema marker")
+        statements = []
+        if usage_state == "ABSENT":
+            statements.append(usage_schema_sql())
+        if coordinator_state == "ABSENT":
+            statements.append(orchestrator_schema_sql())
+        if gate_policy_state == "ABSENT":
+            statements.append(human_gate_schema_sql())
+        connection.executescript("BEGIN IMMEDIATE;\n" + "\n".join(statements))
+        if (_usage_schema_state(connection) != "INSTALLED" or
+                orchestrator_schema_state(connection) != "INSTALLED" or
+                human_gate_schema_state(connection) != "INSTALLED" or
+                connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
+                connection.execute("PRAGMA foreign_key_check").fetchall()):
+            raise LiteError("migration did not install all schema markers")
+        connection.commit()
     except Exception:
         connection.rollback()
         raise
@@ -1581,7 +1659,10 @@ def codex_check(path):
         skill = handle.read()
     if ("AGENTS.md" not in skill or ".awb/project.md" not in skill or
             "convergence-reviewer" not in skill or "human" not in skill.lower() or
-            "references/upgrade-and-rollback.md" not in skill or "PREFLIGHT_FIRST" not in skill):
+            "references/upgrade-and-rollback.md" not in skill or "PREFLIGHT_FIRST" not in skill or
+            "AWB-CREATION-RISK-v1" not in skill or "AUTO_ON_PASS" not in skill or
+            "AUTO_GATE_APPROVED" not in skill or "300-second" not in skill or
+            "caffeinate -di" not in skill or "last active WorkItem" not in skill):
         raise LiteError("Codex Skill contract is incomplete")
     with open(os.path.join(root, ".codex", "skills", "awb-orchestrator", "references",
                            "upgrade-and-rollback.md"), "r", encoding="utf-8") as handle:
@@ -1606,8 +1687,18 @@ def transfer_export(database, work_item_ids, destination):
             ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
         writers = source.execute("SELECT count(*) FROM repository_locks WHERE work_item_id IN ({0}) AND status='ACTIVE'".format(
             ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
-        if active or writers:
-            raise LiteError("transfer export refuses active claim or writer")
+        coordinator_state = orchestrator_schema_state(source)
+        if coordinator_state == "INVALID":
+            raise LiteError("transfer export refuses invalid orchestrator extension")
+        gate_policy_state = human_gate_schema_state(source)
+        if gate_policy_state == "INVALID":
+            raise LiteError("transfer export refuses invalid gate policy extension")
+        coordinators = (source.execute(
+            "SELECT count(*) FROM orchestrator_leases WHERE work_item_id IN ({0}) AND status='ACTIVE'".format(
+                ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
+                        if coordinator_state == "INSTALLED" else 0)
+        if active or writers or coordinators:
+            raise LiteError("transfer export refuses active claim, writer, or orchestrator lease")
         bundle = {"schemaVersion": SCHEMA_VERSION, "bundleId": "bundle-" + uuid.uuid4().hex,
                   "sourceDatabaseId": _sha(os.path.realpath(database)),
                   "workItemIds": sorted(work_item_ids), "tables": {}}
@@ -1621,6 +1712,33 @@ def transfer_export(database, work_item_ids, destination):
                 bundle["tables"][table] = [dict(row) for row in source.execute(
                     "SELECT * FROM {0} WHERE work_item_id IN ({1}) ORDER BY rowid".format(
                         table, ",".join("?" for _ in work_item_ids)), work_item_ids)]
+        if coordinator_state == "INSTALLED":
+            bundle["orchestratorSchemaVersion"] = ORCHESTRATOR_SCHEMA_VERSION
+            leases = [dict(row) for row in source.execute(
+                "SELECT * FROM orchestrator_leases WHERE work_item_id IN ({0}) ORDER BY rowid".format(
+                    ",".join("?" for _ in work_item_ids)), work_item_ids)]
+            instance_ids = sorted(set(row["orchestrator_id"] for row in leases))
+            instances = []
+            if instance_ids:
+                instances = [dict(row) for row in source.execute(
+                    "SELECT * FROM orchestrator_instances WHERE orchestrator_id IN ({0}) ORDER BY orchestrator_id".format(
+                        ",".join("?" for _ in instance_ids)), instance_ids)]
+            events = [dict(row) for row in source.execute(
+                "SELECT * FROM orchestrator_events WHERE work_item_id IN ({0}) ORDER BY rowid".format(
+                    ",".join("?" for _ in work_item_ids)), work_item_ids)]
+            if instance_ids:
+                events.extend(dict(row) for row in source.execute(
+                    "SELECT * FROM orchestrator_events WHERE work_item_id IS NULL "
+                    "AND orchestrator_id IN ({0}) ORDER BY rowid".format(
+                        ",".join("?" for _ in instance_ids)), instance_ids))
+            unique_events = {row["orchestrator_event_id"]: row for row in events}
+            bundle["tables"]["orchestrator_instances"] = instances
+            bundle["tables"]["orchestrator_leases"] = leases
+            bundle["tables"]["orchestrator_events"] = [
+                unique_events[key] for key in sorted(unique_events)
+            ]
+        if gate_policy_state == "INSTALLED":
+            bundle["gatePolicySchemaVersion"] = AUTO_GATE_SCHEMA_VERSION
         bundle["eventWatermark"] = max([row["event_id"] for row in bundle["tables"]["events"]] or [0])
         encoded = _json(bundle)
         bundle["sha256"] = _sha(encoded)
@@ -1652,11 +1770,24 @@ def transfer_import(database, bundle_path, check=False):
         usage_tables = USAGE_TABLES if bundle.get("usageSchemaVersion") else ()
         if usage_tables and not schema_installed(target):
             raise LiteError("transfer bundle contains usage events; run awb migrate first")
-        for table in TABLES + usage_tables:
+        coordinator_tables = ORCHESTRATOR_TABLES if bundle.get("orchestratorSchemaVersion") else ()
+        if coordinator_tables and orchestrator_schema_state(target) != "INSTALLED":
+            raise LiteError("transfer bundle contains orchestrator history; run awb migrate first")
+        if (bundle.get("gatePolicySchemaVersion") and
+                human_gate_schema_state(target) != "INSTALLED"):
+            raise LiteError("transfer bundle contains gate policy; run awb migrate first")
+        target_has_gate_policy = human_gate_schema_state(target) == "INSTALLED"
+        for table in TABLES + usage_tables + coordinator_tables:
             for row in bundle["tables"].get(table, []):
+                if table == "work_items" and target_has_gate_policy and "human_gate_policy" not in row:
+                    row = dict(row)
+                    row["human_gate_policy"] = "MANUAL"
                 key = {"work_items": "work_item_id", "tasks": "task_id", "claims": "claim_id",
                        "repository_locks": "lock_id", "reviews": "review_id", "human_gates": "gate_id",
-                       "events": "event_id", "usage_events": "usage_event_id"}[table]
+                       "events": "event_id", "usage_events": "usage_event_id",
+                       "orchestrator_instances": "orchestrator_id",
+                       "orchestrator_leases": "lease_id",
+                       "orchestrator_events": "orchestrator_event_id"}[table]
                 existing = target.execute("SELECT * FROM {0} WHERE {1}=?".format(table, key), (row[key],)).fetchone()
                 if existing is not None and _row_hash(dict(existing)) != _row_hash(row):
                     raise LiteError("transfer conflict in {0}:{1}".format(table, row[key]))

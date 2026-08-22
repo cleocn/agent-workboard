@@ -22,8 +22,32 @@ priorities: [P0, P1, P2, P3]
 taskStates: [NOT_STARTED, IN_PROGRESS, BLOCKED, WAITING_ACCEPTANCE, COMPLETED, CANCELLED]
 
 humanGatePolicy:
-  STANDARD: {plan: required, final: required}
-  READ_ONLY_DIAGNOSIS: {plan: optional, final: not_applicable}
+  schemaVersion: AWB-AUTO-GATE-v1
+  STANDARD:
+    default: AUTO_ON_PASS
+    explicitOptOut: MANUAL
+    stages: [PLAN, FINAL]
+    autoRequires:
+      PLAN: [mode_STANDARD, state_PLAN_REVIEW_PENDING, queue_CLAIMED,
+             active_independent_reviewer_claim, management_envelope_present,
+             latest_independent_plan_review_PASS, open_plan_findings_zero,
+             held_reason_absent, blocked_reason_absent]
+      FINAL: [mode_STANDARD, state_IMPLEMENTATION_COMPLETED, queue_CLAIMED,
+              active_independent_reviewer_claim, management_envelope_present,
+              latest_independent_final_review_PASS, open_implementation_findings_zero,
+              held_reason_absent, blocked_reason_absent, required_tasks_completed,
+              implementation_quality_baseline_PASS]
+    autoEvent: {type: AUTO_GATE_APPROVED, actorKind: SYSTEM, actorId: auto-gate}
+    neverGrants: [remote_write, publish, deploy, delete, destructive_action]
+  READ_ONLY_DIAGNOSIS: {policy: MANUAL, plan: optional, final: not_applicable}
+
+creationRiskPolicy:
+  protocol: AWB-CREATION-RISK-v1
+  kinds: [REMOTE, DESTRUCTIVE, ANOMALOUS_STATE]
+  riskRequiresExplicitChoice: [AUTO_ON_PASS, MANUAL]
+  unanswered: zero_create_zero_side_effect
+  negativeDeclarationsDoNotTrigger: [outOfScope, authorization.forbidden]
+  ambiguousActualState: ANOMALOUS_STATE
 
 transitions:
   submit_plan:
@@ -33,9 +57,14 @@ transitions:
     requires: [active_work_item_claim, planning_tasks_completed]
   agent_approve_plan:
     from: PLAN_REVIEW_PENDING
-    to: PLAN_REVIEW_PENDING
+    to: {AUTO_ON_PASS: PLAN_REVIEW_APPROVED, MANUAL: PLAN_REVIEW_PENDING}
     actor: REVIEWER
-    queueAfter: WAITING_HUMAN
+    requires:
+      AUTO_ON_PASS: [mode_STANDARD, queue_CLAIMED, active_independent_reviewer_claim,
+                     management_envelope_present, latest_independent_plan_review_PASS,
+                     open_plan_findings_zero, held_reason_absent, blocked_reason_absent]
+    autoEvent: {type: AUTO_GATE_APPROVED, actorKind: SYSTEM, actorId: auto-gate, stage: PLAN}
+    queueAfter: {AUTO_ON_PASS: CLAIMABLE, MANUAL: WAITING_HUMAN}
   agent_reject_plan:
     from: PLAN_REVIEW_PENDING
     to: DRAFT
@@ -62,9 +91,16 @@ transitions:
     requires: [implementation_tasks_completed, local_tests_passed]
   agent_approve_final:
     from: IMPLEMENTATION_COMPLETED
-    to: IMPLEMENTATION_COMPLETED
+    to: {AUTO_ON_PASS: FINAL_ACCEPTANCE_APPROVED, MANUAL: IMPLEMENTATION_COMPLETED}
     actor: REVIEWER
-    queueAfter: WAITING_HUMAN
+    requires:
+      AUTO_ON_PASS: [mode_STANDARD, queue_CLAIMED, active_independent_reviewer_claim,
+                     management_envelope_present, latest_independent_final_review_PASS,
+                     open_implementation_findings_zero, held_reason_absent,
+                     blocked_reason_absent, required_tasks_completed,
+                     implementation_quality_baseline_PASS]
+    autoEvent: {type: AUTO_GATE_APPROVED, actorKind: SYSTEM, actorId: auto-gate, stage: FINAL}
+    queueAfter: {AUTO_ON_PASS: HELD, MANUAL: WAITING_HUMAN}
   agent_reject_final:
     from: IMPLEMENTATION_COMPLETED
     to: IMPLEMENTING
@@ -87,6 +123,19 @@ claimPolicy:
   leaseSeconds: 900
   expiredClaimMayBeReacquired: true
   generationMustIncrease: true
+
+orchestratorCoordinationPolicy:
+  protocol: AWB-ORCHESTRATOR-v1
+  oneActiveLeasePerWorkItem: true
+  differentWorkItemsMayHaveDifferentOwners: true
+  explicitClaimAndClaimNextShareEligibility: true
+  claimNextOrder: [priority_P0_to_P3, updated_at, work_item_id]
+  mutationsRequireRequestId: true
+  exactReplayIsZeroWrite: true
+  generationFenceRequiredAfterFirstLeaseHistory: true
+  legacyNoFenceOnlyWhen: [extension_absent, work_item_zero_lease_history]
+  recoverNeverChangesAgentClaim: true
+  hostProcessManagement: false
 
 repositoryWritePolicy:
   oneActiveWriterPerRepository: true
@@ -142,7 +191,6 @@ phase2Only:
   - pause_resume_and_steer
 
 notPlannedUnlessEvidenceRequiresIt:
-  - runner_authority_and_operation_leases
   - process_quiescence_proofs
   - cryptographic_git_snapshot_binding
   - adversarial_database_tamper_resistance

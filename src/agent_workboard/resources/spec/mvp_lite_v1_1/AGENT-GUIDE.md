@@ -8,7 +8,7 @@
 
 ## 角色操作
 
-- `ORCHESTRATOR`：创建 WorkItem、选择下一角色、维护优先级和搁置；不代替人工批准。
+- `ORCHESTRATOR`：创建 WorkItem、选择下一角色、维护优先级和搁置；只能按持久化策略消费 SYSTEM 自动门，不能冒充 HUMAN。
 - `PLANNER`：读取范围、形成复现/根因/方案或实施计划，完成后执行 `submit_plan`。
 - `IMPLEMENTER`：只在“规划复审通过”后实施；完成全部实施任务和本地测试后执行 `submit_implementation`。
 - `REVIEWER`：独立复审整份规划或整批实施结果；不对每个子任务逐一复审，不修改被审内容。
@@ -20,12 +20,29 @@
 3. 写仓库前取得仓库单写锁；只读操作不取得写锁。
 4. 执行任务并记录简短证据引用。不得写入密码、Token 或隐藏思维链。
 5. 持有 WorkItem claim 完成当前任务；先释放仓库 writer lock，再提交规划或实施结果。提交 transition 成功时原子释放 claim，提前 release claim 的提交必须被拒绝。
-6. 达到用户指定停止点、人工门禁、`HELD` 或 `BLOCKED` 时停止。
+6. 达到用户指定停止点、人工门禁、`HELD` 或 `BLOCKED` 时停止；状态变化后同步并显示脱敏 usage。
+
+## 创建风险与 gate 策略
+
+每次 create 前，主 Agent 必须把实际 scope、获准动作和已观测状态分类为
+`AWB-CREATION-RISK-v1`。实际远程写入为 `REMOTE`，删除/覆盖/reset/难恢复变更为
+`DESTRUCTIVE`，身份或 schema 漂移、冲突 lease/writer、失败预检或无法解释状态为
+`ANOMALOUS_STATE`。`outOfScope` 和 `authorization.forbidden` 中的否定声明不单独触发。
+
+普通新建 STANDARD WorkItem 默认 `AUTO_ON_PASS`；创建者明确关闭自动通过时使用
+`MANUAL`。风险信号非空时，未取得用户对 `AUTO_ON_PASS / MANUAL` 的明确选择不得
+调用 create。选择、决策人和脱敏原因进入创建审计；选择 AUTO 只改变 workflow gate，
+绝不授权远程、发布、部署、删除或破坏性动作。旧 WorkItem 和省略新字段的旧 transfer
+bundle 迁移为 `MANUAL`。
 
 ## 复审与退回
 
-- 规划 Agent 复审通过后，STANDARD 等待人工规划批准；驳回返回 `DRAFT`。
-- 最终 Agent 复审通过后，STANDARD 等待人工最终验收；驳回返回 `IMPLEMENTING`。
+- 规划 Agent 复审 PASS/open0 后，STANDARD 的 `AUTO_ON_PASS` 在同一事务写
+  `SYSTEM/AUTO_GATE_APPROVED` 并进入 `PLAN_REVIEW_APPROVED`；`MANUAL` 等待人工规划批准。
+- 最终 Agent 复审 PASS/open0 且全部 required task、测试与质量基线通过后，
+  `AUTO_ON_PASS` 自动进入终态；`MANUAL` 等待人工最终验收。驳回返回 `IMPLEMENTING`。
+- REVISE、BLOCKED、WAITING_HUMAN、PLAN_DEVIATION、开放 Finding、测试失败或状态漂移
+  一律 fail closed；自动事件不写 `human_gates`，也不产生 HUMAN actor。
 - `READ_ONLY_DIAGNOSIS` 只创建规划和规划复审任务，可按指令停在规划提交或 Agent 规划复审，不进入实施。
 - 实施采用批量复审：全部实施任务和本地测试完成后只进行一次最终 Agent 复审。
 
@@ -39,6 +56,36 @@ PLAN 与 IMPLEMENTATION 独立使用严格串行 `3+1+1`。第 1～3 轮使用�
 - 外部依赖未满足时使用 `BLOCKED` 并写明原因。
 - 一个 WorkItem 同时最多一个活动 claim；同一仓库同时最多一个活动写锁。
 - 租约过期后可由编排器回收并以更大的 generation 重新认领。
+
+## 多 Orchestrator 协调
+
+安装 `AWB-ORCHESTRATOR-v1` 后，多个本地 Orchestrator 可以各自通过顶层
+`awb orchestrator claim <WorkItem>` 或 `claim-next` 持有不同 WorkItem。每个 WorkItem
+只能有一个活动 Orchestrator lease；该 lease 与 Agent claim 分表，不授予 repository
+writer 或 HUMAN gate 权限。`claim-next` 在一个 `BEGIN IMMEDIATE` 事务内按 P0→P3、
+`updated_at`、WorkItem ID 选择和插入。
+
+宿主保存返回的 generation、在到期前 `renew`，并在新 Agent claim 时成组传入
+`--orchestrator-id` 和 `--orchestrator-generation`。extension 缺失或目标 WorkItem
+零 lease 历史时保留旧无 fence 路径；一旦出现第一条历史，省略、缺半、owner 不同、
+旧 generation、过期或已 release 全部必须在 workflow 零副作用下拒绝。已经合法取得的
+Agent claim 不受 lease 后续过期、释放或接管影响。
+
+`recover` 只接管已过期的最新 lease 并递增 generation，不释放或冒充在途 Agent。
+HUMAN gate、hold/block 和同 repositoryKey 单 writer 规则保持不变。AWB 只提供一次性
+本地 JSON 命令，不创建、监督、终止或迁移宿主进程和 Agent session。
+
+## 主 Agent 活动期保障
+
+成功状态变更后，主 Agent 执行 `usage sync` 与按 role 的 `usage show`，只展示聚合
+token、estimated credits、quota、coverage 和 gap reason。活动等待时以 300 秒为目标
+best effort 刷新；错过不补跑，会话暂停/关闭后不工作，也不承诺 daemon 或定时 SLA。
+
+macOS 上主 Agent 可用一个前台工具会话持有 `caffeinate -di`，并以工具 session/cell
+句柄作为唯一所有权。多个活动 WorkItem 共享一个 inhibitor；只有最后一个活动项停止后
+才终止并确认该精确会话。禁止 PID 文件、进程名扫描、`pkill`、猜测 PID 和 `pmset`。
+启动/清理失败必须告警并停止新建 inhibitor，但不阻断 AWB workflow。非 macOS 明确降级。
+这是 Agent 工具会话/Skill 行为，不是 AWB runner 或宿主进程管理 API。
 
 ## 提交契约
 

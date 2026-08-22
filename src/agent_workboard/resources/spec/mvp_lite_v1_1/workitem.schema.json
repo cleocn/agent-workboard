@@ -4,13 +4,15 @@
   "title": "Agent Workboard WorkItem with AWB-WORKITEM-MGMT-v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["workItemId", "type", "title", "mode", "priority", "management"],
+  "required": ["workItemId", "type", "title", "mode", "priority", "humanGatePolicy", "management"],
   "properties": {
     "workItemId": {"type": "string", "pattern": "^(TI|FE|R|WA|AWB)-[A-Za-z0-9-]+$", "maxLength": 80},
     "type": {"enum": ["TI", "FE", "R", "WA", "AWB"]},
     "title": {"type": "string", "minLength": 1, "maxLength": 200},
     "mode": {"enum": ["STANDARD", "READ_ONLY_DIAGNOSIS"]},
     "priority": {"enum": ["P0", "P1", "P2", "P3"]},
+    "humanGatePolicy": {"enum": ["AUTO_ON_PASS", "MANUAL"]},
+    "creationRisk": {"$ref": "#/$defs/creationRisk"},
     "management": {"$ref": "#/$defs/management"},
     "target": {"enum": ["PLAN_REVIEW_PENDING", "PLAN_REVIEW_APPROVED", "IMPLEMENTATION_COMPLETED", "FINAL_ACCEPTANCE_APPROVED"]},
     "modelOverrides": {
@@ -23,6 +25,24 @@
     }
   },
   "$defs": {
+    "creationRisk": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocolVersion", "signals"],
+      "properties": {
+        "protocolVersion": {"const": "AWB-CREATION-RISK-v1"},
+        "signals": {
+          "type": "array", "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["kind", "source", "evidence"],
+            "properties": {
+              "kind": {"enum": ["REMOTE", "DESTRUCTIVE", "ANOMALOUS_STATE"]},
+              "source": {"type": "string", "minLength": 1, "maxLength": 120},
+              "evidence": {"type": "string", "minLength": 1, "maxLength": 240}
+            }
+          }
+        }
+      }
+    },
     "nonEmptyStrings": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
     "criterion": {
       "type": "object", "additionalProperties": false, "required": ["id", "criterion"],

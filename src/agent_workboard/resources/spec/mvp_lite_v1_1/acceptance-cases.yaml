@@ -1,5 +1,5 @@
-version: AWB-005-v1
-owner: AWB-005
+version: AWB-014-v1
+owner: AWB-014
 managementContract: AWB-WORKITEM-MGMT-v1
 templateContract: AWB-MANAGEMENT-v1
 cases:
@@ -34,3 +34,23 @@ cases:
   - {id: AWB-005-AC-029, priority: P0, title: FE 默认任务进度且显式冻结权重严格校验}
   - {id: AWB-005-AC-030, priority: P0, title: TI WA R 业务语义和授权不越权}
   - {id: AWB-005-AC-031, priority: P0, title: 模板 schema runtime workflow guide Agent 和测试版本同步}
+  - {id: AWB-012-AC-001, priority: P0, title: 每 WorkItem 单活动 Orchestrator lease 且不同 WorkItem 可由不同 owner 持有}
+  - {id: AWB-012-AC-002, priority: P0, title: 指定 claim 与 claim-next 共享 eligibility 并稳定排序}
+  - {id: AWB-012-AC-003, priority: P0, title: register renew release expiry recover 事务化且 generation 单调}
+  - {id: AWB-012-AC-004, priority: P0, title: 首条 lease 历史后新 Agent dispatch 强制 exact active unexpired fence}
+  - {id: AWB-012-AC-005, priority: P0, title: omitted partial wrong stale expired released fence 拒绝且 workflow 零副作用}
+  - {id: AWB-012-AC-006, priority: P0, title: recover 保留在途 Agent 且同仓库 writer 继续串行}
+  - {id: AWB-012-AC-007, priority: P0, title: public CLI 八命令提供稳定 JSON reason nextStep exit code}
+  - {id: AWB-012-AC-008, priority: P0, title: additive migration backup doctor transfer old bundle 和 fault rollback}
+  - {id: AWB-012-AC-009, priority: P0, title: 并发 busy request replay privacy Python3.7 和旧 API 不回归}
+  - {id: AWB-012-AC-010, priority: P0, title: provider-neutral local-only 且不管理宿主进程}
+  - {id: AWB-014-AC-001, priority: P0, title: 普通 STANDARD 新建默认 AUTO_ON_PASS 且显式 opt-out 为 MANUAL}
+  - {id: AWB-014-AC-002, priority: P0, title: REMOTE DESTRUCTIVE ANOMALOUS_STATE 风险未选择时零创建零副作用}
+  - {id: AWB-014-AC-003, priority: P0, title: 风险原因选择和 decision actor 审计且 AUTO 不授予风险动作}
+  - {id: AWB-014-AC-004, priority: P0, title: 旧数据库和旧 transfer bundle 安全迁移为 MANUAL}
+  - {id: AWB-014-AC-005, priority: P0, title: PLAN FINAL 仅独立 PASS open0 和完整前置条件自动推进}
+  - {id: AWB-014-AC-006, priority: P0, title: SYSTEM AUTO_GATE_APPROVED 幂等关联 review 且不写 human gate}
+  - {id: AWB-014-AC-007, priority: P0, title: REVISE BLOCKED 偏差测试失败状态漂移和开放 Finding 均 fail closed}
+  - {id: AWB-014-AC-008, priority: P0, title: 自动 gate 与远程发布部署删除破坏性授权严格隔离}
+  - {id: AWB-014-AC-009, priority: P0, title: 状态变化 usage 与活动等待 300 秒 best effort 且隐私不回归}
+  - {id: AWB-014-AC-010, priority: P0, title: Agent工具会话 caffeinate 精确所有权聚合清理故障告警且无 runner}
