@@ -922,7 +922,7 @@ class LiteWorkboardTest(unittest.TestCase):
         expected = {
             "README.md", "test-issue-template.md", "test-issue-trigger-rules.md",
             "fe-template.md", "remediation-plan-template.md", "wa-template.md",
-            "awb-template.md",
+            "awb-template.md", "usage-observation-template.md",
         }
         self.assertEqual(expected, set(os.listdir(template_root)))
         for name in expected:

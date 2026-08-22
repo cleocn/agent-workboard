@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0b1 Preview
+
+- Add opt-in, local-only, observation-only usage accounting for explicitly bound
+  AWB sessions, with role/agent/model/stage/time projections and redacted export.
+- Preserve privacy with an allowlist-only `codex-local` adapter that fails closed
+  on observed-schema drift and never uploads session content or source.
+- Report raw token counters and versioned estimated credits separately from quota
+  window snapshots; estimated credits are not the ChatGPT/Codex weekly bill.
+- Support only exact 0.2.1→0.3.0b1 upgrades with backup-first transactional usage
+  migration, database-bound rollback and zero-write refusal on drift or use.
+- Keep AWB-010 long-term observation, automated routing, budget caps, hard stops,
+  telemetry, real consumer migration and PyPI publication out of scope.
+
 ## 0.2.1
 
 - Ship `AWB-UPGRADE-RUNBOOK-v1` with the Orchestrator Skill and release wheel.

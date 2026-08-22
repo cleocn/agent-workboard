@@ -7,6 +7,7 @@ import sys
 
 from . import __version__
 from . import lite
+from . import usage
 from .project import (backup, bootstrap, codex_check, codex_install, doctor,
                       init_project, migrate, transfer_export, transfer_import,
                       upgrade_project)
@@ -42,6 +43,46 @@ def _lite_args(args):
             if os.path.realpath(database) != os.path.realpath(configured):
                 raise lite.LiteError("--database must match the configured project database")
     return ["--database", database] + getattr(args, "remainder", [])
+
+
+def _usage_command(args):
+    database = _project_database(args.project)
+    if args.usage_command == "sync":
+        result = usage.sync(database, args.work_item, args.all_bound, args.dry_run)
+        _print(result) if args.format == "json" else print(usage.render_sync_table(result))
+    elif args.usage_command == "show":
+        simulated = None
+        if args.simulate_rate_card:
+            with open(args.simulate_rate_card, "rb") as handle:
+                simulated = handle.read()
+        result = usage.project(database, args.group_by, args.from_time, args.to_time,
+                               args.work_item_id, simulated)
+        _print(result) if args.format == "json" else print(usage.render_table(result))
+    elif args.usage_command == "export":
+        _print(usage.export_report(database, args.output, args.format, args.group_by,
+                                   args.from_time, args.to_time, args.work_item))
+    elif args.usage_command == "correct":
+        with open(args.correction_file, "r", encoding="utf-8") as handle:
+            replacement = json.load(handle)
+        _print(usage.correct(database, args.event, args.human, args.reason, replacement))
+    elif args.usage_command == "span":
+        if args.span_command == "begin":
+            _print(usage.begin_span(database, args.work_item, args.task, args.agent,
+                                    args.session_id, args.model))
+        else:
+            _print(usage.end_span(database, args.span, args.agent))
+    elif args.usage_command == "cohort":
+        payload = {}
+        if args.payload_file:
+            with open(args.payload_file, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        event_type = {"start": "COHORT_STARTED", "snapshot": "COHORT_SNAPSHOT",
+                      "semantics-changed": "COHORT_SEMANTICS_CHANGED",
+                      "conclude": "COHORT_CONCLUDED"}[args.cohort_command]
+        _print(usage.cohort_event(database, event_type, args.cohort, args.actor,
+                                  "HUMAN" if args.human else "AGENT", payload))
+    else:
+        _print(usage.self_check(database))
 
 
 def main(argv=None):
@@ -84,6 +125,61 @@ def main(argv=None):
     imported.add_argument("--database", required=True)
     imported.add_argument("--bundle", required=True)
     imported.add_argument("--check", action="store_true")
+    usage_parser = sub.add_parser("usage")
+    usage_sub = usage_parser.add_subparsers(dest="usage_command", required=True)
+    usage_sync = usage_sub.add_parser("sync")
+    usage_sync.add_argument("--project", default=".")
+    usage_sync_scope = usage_sync.add_mutually_exclusive_group(required=True)
+    usage_sync_scope.add_argument("--work-item")
+    usage_sync_scope.add_argument("--all-bound", action="store_true")
+    usage_sync.add_argument("--dry-run", action="store_true")
+    usage_sync.add_argument("--format", choices=("json", "table"), default="json")
+    usage_show = usage_sub.add_parser("show")
+    usage_show.add_argument("work_item_id", nargs="?")
+    usage_show.add_argument("--project", default=".")
+    usage_show.add_argument("--from", dest="from_time")
+    usage_show.add_argument("--to", dest="to_time")
+    usage_show.add_argument("--group-by", choices=("work_item", "role", "agent", "model", "stage", "date"), default="role")
+    usage_show.add_argument("--format", choices=("json", "table"), default="table")
+    usage_show.add_argument("--simulate-rate-card")
+    usage_export = usage_sub.add_parser("export")
+    usage_export.add_argument("--project", default=".")
+    usage_export.add_argument("--work-item")
+    usage_export.add_argument("--from", dest="from_time")
+    usage_export.add_argument("--to", dest="to_time")
+    usage_export.add_argument("--group-by", choices=("work_item", "role", "agent", "model", "stage", "date"), default="role")
+    usage_export.add_argument("--format", choices=("json", "csv"), required=True)
+    usage_export.add_argument("--output", required=True)
+    usage_correct = usage_sub.add_parser("correct")
+    usage_correct.add_argument("--project", default=".")
+    usage_correct.add_argument("--event", type=int, required=True)
+    usage_correct.add_argument("--human", required=True)
+    usage_correct.add_argument("--reason", required=True)
+    usage_correct.add_argument("--correction-file", required=True)
+    usage_span = usage_sub.add_parser("span")
+    span_sub = usage_span.add_subparsers(dest="span_command", required=True)
+    span_begin = span_sub.add_parser("begin")
+    span_begin.add_argument("--project", default=".")
+    span_begin.add_argument("--work-item", required=True)
+    span_begin.add_argument("--task")
+    span_begin.add_argument("--agent", required=True)
+    span_begin.add_argument("--session-id", required=True)
+    span_begin.add_argument("--model", required=True)
+    span_end = span_sub.add_parser("end")
+    span_end.add_argument("--project", default=".")
+    span_end.add_argument("--span", required=True)
+    span_end.add_argument("--agent", required=True)
+    usage_cohort = usage_sub.add_parser("cohort")
+    cohort_sub = usage_cohort.add_subparsers(dest="cohort_command", required=True)
+    for cohort_name in ("start", "snapshot", "semantics-changed", "conclude"):
+        cohort_command = cohort_sub.add_parser(cohort_name)
+        cohort_command.add_argument("--project", default=".")
+        cohort_command.add_argument("--cohort", required=True)
+        cohort_command.add_argument("--actor", required=True)
+        cohort_command.add_argument("--payload-file")
+        cohort_command.add_argument("--human", action="store_true")
+    usage_check = usage_sub.add_parser("self-check")
+    usage_check.add_argument("--project", default=".")
     lite_parser = sub.add_parser("lite", help="compatibility access to MVP-LITE commands")
     lite_parser.add_argument("--project", default=".")
     lite_parser.add_argument("--database")
@@ -121,12 +217,14 @@ def main(argv=None):
                 _print(transfer_export(args.database, args.work_item, args.output))
             else:
                 _print(transfer_import(args.database, args.bundle, args.check))
+        elif args.command == "usage":
+            _usage_command(args)
         elif args.command == "serve":
             database = _lite_args(args)
             return lite.main(database + ["serve", "--host", args.host, "--port", str(args.port)])
         else:
             return lite.main(_lite_args(args))
         return 0
-    except lite.LiteError as exc:
+    except (lite.LiteError, usage.UsageError, IOError, ValueError) as exc:
         print("error: {0}".format(exc), file=sys.stderr)
         return 2

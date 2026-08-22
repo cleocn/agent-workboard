@@ -20,6 +20,7 @@ TEMPLATE_FILES = (
     "remediation-plan-template.md",
     "test-issue-template.md",
     "test-issue-trigger-rules.md",
+    "usage-observation-template.md",
     "wa-template.md",
 )
 CODEX_SKILL_FILES = (

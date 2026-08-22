@@ -7,7 +7,8 @@ CREATE TABLE schema_meta (
 
 INSERT INTO schema_meta(key, value) VALUES
   ('schema_version', 'MVP-LITE-v1'),
-  ('plan_revision', 'PLAN-MVP-LITE-v1');
+  ('plan_revision', 'PLAN-MVP-LITE-v1'),
+  ('usage_schema_version', 'AWB-USAGE-v1');
 
 CREATE TABLE work_items (
   work_item_id TEXT PRIMARY KEY,
@@ -115,3 +116,43 @@ CREATE TABLE events (
 CREATE INDEX tasks_by_work_item ON tasks(work_item_id, seq);
 CREATE INDEX work_items_inbox ON work_items(priority, updated_at, work_item_id);
 CREATE INDEX events_timeline ON events(work_item_id, event_id);
+
+-- Observation-only extension.  Workflow events remain unchanged because usage
+-- and quota records may intentionally have no WorkItem attribution.
+CREATE TABLE usage_events (
+  usage_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'USAGE_BINDING_RECORDED','USAGE_SPAN_BEGAN','USAGE_SPAN_ENDED',
+    'AGENT_USAGE_RECORDED','COUNTER_SEGMENT_STARTED','QUOTA_SNAPSHOT_RECORDED',
+    'USAGE_SYNC_REJECTED','USAGE_CORRECTED','COHORT_STARTED','COHORT_SNAPSHOT',
+    'COHORT_SEMANTICS_CHANGED','COHORT_CONCLUDED'
+  )),
+  work_item_id TEXT REFERENCES work_items(work_item_id),
+  task_id TEXT REFERENCES tasks(task_id),
+  claim_id TEXT REFERENCES claims(claim_id),
+  provider TEXT,
+  source_session_id TEXT,
+  source_snapshot_key TEXT,
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('AGENT','HUMAN','SYSTEM')),
+  actor_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX usage_events_work_item ON usage_events(work_item_id, usage_event_id);
+CREATE INDEX usage_events_stream ON usage_events(provider, source_session_id, usage_event_id);
+CREATE UNIQUE INDEX usage_source_snapshot_once
+  ON usage_events(provider, source_session_id, source_snapshot_key)
+  WHERE source_snapshot_key IS NOT NULL;
+
+CREATE TRIGGER usage_events_no_update
+BEFORE UPDATE ON usage_events BEGIN
+  SELECT RAISE(ABORT, 'usage_events are immutable');
+END;
+
+CREATE TRIGGER usage_events_no_delete
+BEFORE DELETE ON usage_events BEGIN
+  SELECT RAISE(ABORT, 'usage_events are immutable');
+END;

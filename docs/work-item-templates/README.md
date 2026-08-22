@@ -21,6 +21,8 @@
 
 一个类型只有上述唯一入口；不得复制旧工作区路径、编号规则或状态机作为并行规范。
 
+`usage-observation-template.md` 是 AWB-009 最终验收后才可使用的长期观察附加启动包；它不替代 `awb-template.md`，也不构成第六种顶层类型或并行运行时权威。
+
 ## 统一 management 输入
 
 所有新 WorkItem 首次创建前，模板输入必须足以生成版本化 management envelope：
@@ -53,7 +55,7 @@ Markdown 模板可以保留示例、问题域表格和规划提示，但不得�
 
 ## 同批同步门禁
 
-本目录七个正式文件是一个受版本约束的模板集合：本 README、五种类型模板和 TI trigger rules。任何模板字段、状态语义、进度算法、任务编号、授权或关闭规则变更，必须在同一批变更中同步并验证：
+本目录八个正式文件是一个受版本约束的模板集合：本 README、五种类型模板、TI trigger rules 和 usage observation 附加启动包。任何模板字段、状态语义、进度算法、任务编号、授权或关闭规则变更，必须在同一批变更中同步并验证：
 
 1. `workitem.schema.json` management 契约；
 2. `lite.py` create/show/timeline/task/transition/review/gate 的运行时读取、投影与校验；

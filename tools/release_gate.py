@@ -32,39 +32,43 @@ def scan(repository):
     return {"refs": refs, "objects": sorted(objects, key=lambda item: (item["type"], item["object"]))}
 
 
-def check_successor(repository, base, candidate, v01_commit, allowlist):
+def check_successor(repository, base, candidate, preserved, allowlist,
+                    expected_branch="release/awb-011-v0.3.0b1"):
     repository = os.path.realpath(repository)
     base = run(repository, "rev-parse", base + "^{commit}").strip()
     candidate = run(repository, "rev-parse", candidate + "^{commit}").strip()
-    v01_commit = run(repository, "rev-parse", v01_commit + "^{commit}").strip()
     if subprocess.call(["git", "merge-base", "--is-ancestor", base, candidate], cwd=repository):
         raise ValueError("candidate is not a descendant of the verified public main")
     parents = run(repository, "rev-list", "--parents", "-n", "1", candidate).split()
     if len(parents) != 2 or parents[1] != base:
         raise ValueError("release candidate must be the direct normal successor of public main")
-    if subprocess.call(["git", "merge-base", "--is-ancestor", v01_commit, candidate], cwd=repository):
-        raise ValueError("v0.1.0 history is not preserved")
-    if run(repository, "rev-parse", "v0.1.0^{commit}").strip() != v01_commit:
-        raise ValueError("v0.1.0 tag moved")
-    if run(repository, "rev-parse", "v0.2.0^{commit}").strip() != base:
-        raise ValueError("v0.2.0 tag moved from the verified public main")
-    if run(repository, "cat-file", "-t", "v0.2.1").strip() != "tag":
-        raise ValueError("v0.2.1 must be an annotated tag")
-    if run(repository, "rev-parse", "v0.2.1^{commit}").strip() != candidate:
-        raise ValueError("v0.2.1 tag does not identify the candidate")
+    if run(repository, "branch", "--show-current").strip() != expected_branch:
+        raise ValueError("release candidate is not on the approved release branch")
+    for tag, expected in sorted(preserved.items()):
+        expected = run(repository, "rev-parse", expected + "^{commit}").strip()
+        if run(repository, "cat-file", "-t", tag).strip() != "tag":
+            raise ValueError(tag + " must remain an annotated tag")
+        if run(repository, "rev-parse", tag + "^{commit}").strip() != expected:
+            raise ValueError(tag + " moved")
+        if subprocess.call(["git", "merge-base", "--is-ancestor", expected, candidate], cwd=repository):
+            raise ValueError(tag + " history is not preserved")
+    if run(repository, "cat-file", "-t", "v0.3.0b1").strip() != "tag":
+        raise ValueError("v0.3.0b1 must be an annotated tag")
+    if run(repository, "rev-parse", "v0.3.0b1^{commit}").strip() != candidate:
+        raise ValueError("v0.3.0b1 tag does not identify the candidate")
     exact_tags = sorted(line for line in run(repository, "tag", "--points-at", candidate).splitlines()
                         if line)
-    if exact_tags != ["v0.2.1"]:
-        raise ValueError("release candidate must have the unique exact v0.2.1 tag")
+    if exact_tags != ["v0.3.0b1"]:
+        raise ValueError("release candidate must have the unique exact v0.3.0b1 tag")
     changed = sorted(line for line in run(repository, "diff", "--name-only", base, candidate).splitlines() if line)
-    unexpected = sorted(set(changed) - set(allowlist))
-    if unexpected:
-        raise ValueError("candidate changes files outside the release allowlist: " + ", ".join(unexpected))
+    if (set(changed) != set(allowlist) or len(changed) != len(set(allowlist)) or
+            len(allowlist) != len(set(allowlist))):
+        raise ValueError("candidate changed paths differ from the exact release allowlist")
     if run(repository, "status", "--porcelain").strip():
         raise ValueError("release candidate worktree is not clean")
     scanned = scan(repository)
-    return {"base": base, "candidate": candidate, "v0.1.0": v01_commit,
-            "v0.2.0": base, "v0.2.1": candidate,
+    return {"base": base, "candidate": candidate, "preservedTags": preserved,
+            "v0.3.0b1": candidate,
             "changedPaths": changed, "reachableObjectCount": len(scanned["objects"]),
             "refs": scanned["refs"]}
 
@@ -77,12 +81,18 @@ def main(argv=None):
     check.add_argument("--base", required=True)
     check.add_argument("--candidate", default="HEAD")
     check.add_argument("--v0.1-commit", dest="v01_commit", required=True)
+    check.add_argument("--v0.2-commit", dest="v02_commit", required=True)
+    check.add_argument("--v0.2.1-commit", dest="v021_commit", required=True)
+    check.add_argument("--branch", default="release/awb-011-v0.3.0b1")
     check.add_argument("--path", action="append", required=True)
     scan_parser = sub.add_parser("scan")
     scan_parser.add_argument("--repository", required=True)
     args = parser.parse_args(argv)
     if args.command == "check-successor":
-        result = check_successor(args.repository, args.base, args.candidate, args.v01_commit, args.path)
+        preserved = {"v0.1.0": args.v01_commit, "v0.2.0": args.v02_commit,
+                     "v0.2.1": args.v021_commit}
+        result = check_successor(args.repository, args.base, args.candidate, preserved,
+                                 args.path, expected_branch=args.branch)
     else:
         result = scan(args.repository)
     print(json.dumps(result, sort_keys=True))

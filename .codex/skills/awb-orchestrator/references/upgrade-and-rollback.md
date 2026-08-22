@@ -6,15 +6,17 @@ Protocol: `AWB-UPGRADE-RUNBOOK-v1`
 
 Use this runbook only for an existing stable managed project with
 `.awb/config.json` and an exact source/target pair listed by the installed AWB
-release. The current matrix supports the exact released `0.1.0/v0.1.0` and
-`0.2.0/v0.2.0` identities to the exact running `0.2.1/v0.2.1` wheel, and an
-exact same-identity no-op.
+release. The current Preview matrix supports only the exact released
+`0.2.1/v0.2.1` identity to the exact running `0.3.0b1/v0.3.0b1` wheel, and an
+exact same-identity no-op after the usage schema is installed and valid.
 
 ## DOES_NOT_APPLY
 
-Do not use it for a new project, a development database, `awb migrate`, package
-download or publication, a remote consumer migration, or any unlisted future
-version.  Never infer compatibility from a semantic-version wildcard.
+Do not use it for a new project, a development database, standalone `awb
+migrate`, package download or publication, a remote consumer migration, a
+direct `0.1.0`/`0.2.0` jump, or any unlisted future version. Never infer
+compatibility from a semantic-version wildcard; older projects must first reach
+exact 0.2.1 with the released 0.2.1 procedure.
 
 ## AUTHORITY
 
@@ -60,27 +62,34 @@ single `nextStep`, then run preflight again.
 ## MANDATORY_STOP
 
 Stop for an unsupported identity/pair, source or target drift, active claim or
-repository writer, customized/unowned/symlink Codex content, wrong project,
-path traversal, duplicate target, manifest replay, or any live/backup/staging
-hash drift.  Do not delete, copy, or edit files by hand to bypass the refusal.
+repository writer, a pre-existing/partial usage extension on the 0.2.1 source,
+a missing/invalid usage extension on a same-identity 0.3.0b1 project,
+customized/unowned/symlink Codex content, wrong project, path traversal,
+duplicate target, manifest replay, or any live/backup/staging hash drift. Do not
+delete, copy, or edit files by hand to bypass the refusal.
 
 ## EVIDENCE
 
 Retain the complete preflight, upgrade, and rollback JSON plus exit codes; old
-and new wheel paths and SHA-256 values; backup and manifest paths; and the later
-doctor/Codex results.  Never record credentials or sensitive raw data.
+and new wheel paths and SHA-256 values; database pre/post SHA-256 values; backup
+and manifest paths; and the later doctor/Codex results. Never record credentials
+or sensitive raw data.
 
 ## POST_UPGRADE
 
-After `OK`, run `awb doctor --project <project>`.  If `--with-codex` was used,
-also run `awb codex check --project <project>`.  Record both results in the
-WorkItem before treating upgrade as accepted.
+After `OK`, run `awb doctor --project <project>` and require
+`usageSchemaVersion=AWB-USAGE-v1`. If `--with-codex` was used, also run `awb
+codex check --project <project>`. Record both results in the WorkItem before
+treating upgrade as accepted. The upgrade itself performs the backup-first
+additive database migration; do not run a separate unbound migration step.
 
 ## ROLLBACK
 
 Rollback only when the user explicitly requests it, or required post-upgrade
-validation failed and local write authority was granted.  First run rollback
-preflight against the exact manifest.  If it is `READY`, run:
+validation failed and local write authority was granted. First run rollback
+preflight against the exact manifest. The database is a bound restore action:
+any workflow or usage write after upgrade changes its post-upgrade hash and must
+make rollback refuse rather than discard data. If it is `READY`, run:
 
 ```text
 awb upgrade --project <project> --rollback <exact-manifest>

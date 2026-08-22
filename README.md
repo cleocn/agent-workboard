@@ -5,14 +5,15 @@ planner → reviewer → human gate → implementer → reviewer workflow. It ha
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install a verified release
+## Install the 0.3.0b1 Preview
 
-Download the `agent_workboard-0.2.1-py3-none-any.whl` asset and verify its
-SHA-256 against `SHA256SUMS` from the GitHub release. Install it with pip, then
-initialize a project:
+This release is an opt-in, local-only, observation-only Preview. Download the
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.0b1` prerelease, verify both
+artifacts, then initialize a project:
 
 ```bash
-python -m pip install agent_workboard-0.2.1-py3-none-any.whl
+shasum -a 256 -c SHA256SUMS
+python -m pip install agent_workboard-0.3.0b1-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -35,31 +36,48 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an existing 0.1.0 or 0.2.0 project
+## Upgrade an exact 0.2.1 project
 
-Retain the exact old wheel and install the verified 0.2.1 wheel. If the project
-uses an official GitHub URL lock, place its verified 0.1.0 or 0.2.0 wheel beside
-the 0.2.1 wheel; a local file lock continues to use its recorded path. Always
-run the read-only preflight first, then execute only its structured `nextStep`:
+Retain the exact old 0.2.1 wheel and install the verified 0.3.0b1 wheel. If the
+project uses an official GitHub URL lock, place its verified 0.2.1 wheel beside
+the Preview wheel; a local file lock continues to use its recorded path. Always
+run the read-only preflight first, then execute only its one structured
+`nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.2.1-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.2.1-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.0b1-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.0b1-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
 
-Upgrade accepts only the exact released 0.1.0→0.2.1 and 0.2.0→0.2.1 identities.
-It refuses an invalid database, active claim or writer, identity drift and
-customized package-owned Codex files. It writes a bound rollback manifest under
-`.awb/backups/`; use `awb upgrade --check --rollback <manifest>` before executing
-the exact rollback command. Do not restore files by hand. The retained database
-backup is evidence only because 0.2.1 does not change the schema.
+Upgrade accepts only the exact released 0.2.1→0.3.0b1 identity pair. It refuses
+an invalid database, active claim or writer, identity drift, a pre-existing
+usage extension and customized package-owned Codex files. Execution first makes
+an online backup, then installs the additive `AWB-USAGE-v1` schema in one
+transaction. The bound rollback manifest includes the database; any post-upgrade
+workflow or usage write makes rollback fail closed rather than discard data.
+Use `awb upgrade --check --rollback <manifest>` before the exact rollback
+command. Do not restore files or database tables by hand.
 
 The shipped Orchestrator Skill routes Agents to
 `references/upgrade-and-rollback.md` (`AWB-UPGRADE-RUNBOOK-v1`) before upgrade,
-rollback or recovery work. The 0.2.1 release adds that bounded Agent runbook,
-zero-write preflight, structured results and exact rollback material.
+rollback or recovery work. It preserves zero-write preflight, structured
+one-next-step results and exact rollback material.
+
+## Usage observation Preview
+
+Usage collection is off until sessions are explicitly bound and `awb usage
+sync` is invoked. The `codex-local` adapter observes a local, non-public schema
+and fails closed on drift. It reads only allowlisted session metadata and usage
+counters; it does not upload prompts, responses, tool output, source, sessions
+or databases. See `docs/usage/quickstart.md` for the opt-in workflow.
+
+Raw tokens are the primary evidence. `estimatedCredits` are versioned local
+analysis units, not the ChatGPT/Codex weekly quota bill. Quota window snapshots
+remain separate and are never allocated directly to a role or WorkItem. The
+AWB-010 long-running observation has not completed, so this Preview does not
+claim a stable baseline, quota prediction, GA readiness or automated control.
 
 ## Security and scope
 

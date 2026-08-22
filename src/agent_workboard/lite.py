@@ -599,7 +599,19 @@ def _expire_claims(connection, work_item_id, now):
 
 
 def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
-                  request_id=None):
+                  request_id=None, session_id=None, usage_provider=None, model=None,
+                  sessions_root=None):
+    usage_values = (session_id, usage_provider, model)
+    if any(value is not None for value in usage_values) and not all(usage_values):
+        raise LiteError("session-id, usage-provider, and model must be supplied together")
+    baseline = identity = None
+    if all(usage_values):
+        try:
+            from .usage import prepare_interval_boundary
+            baseline, identity, adapter = prepare_interval_boundary(
+                database, usage_provider, session_id, sessions_root)
+        except Exception as exc:
+            raise LiteError("usage binding baseline failed: {0}".format(exc))
     request_id = request_id or _id("claim")
     connection = open_database(database)
     try:
@@ -635,6 +647,17 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         )
         _event(connection, work_item_id, request_id, "CLAIM_ACQUIRED", "AGENT", agent_id,
                {"claimId": claim_id, "taskId": task_id, "role": role, "generation": generation})
+        if all(usage_values):
+            try:
+                from .usage import record_binding
+                claim = connection.execute("SELECT * FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
+                record_binding(connection, claim, usage_provider, session_id, model,
+                               baseline=baseline,
+                               adapter_version=adapter.adapter_version,
+                               parser_version=adapter.parser_version,
+                               role_observed=identity.get("agent_role") if identity else None)
+            except Exception as exc:
+                raise LiteError("usage binding failed: {0}".format(exc))
         connection.commit()
         return {"claimId": claim_id, "generation": generation}
     except Exception:
@@ -644,7 +667,16 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         connection.close()
 
 
+def _usage_sync_boundary(database, work_item_id):
+    try:
+        from .usage import best_effort_sync
+        return best_effort_sync(database, work_item_id)
+    except Exception:
+        return {"status": "coverage-gap", "reasonCode": "SYNC_IMPORT_FAILED"}
+
+
 def release_claim(database, work_item_id, agent_id, request_id=None):
+    _usage_sync_boundary(database, work_item_id)
     request_id = request_id or _id("release")
     connection = open_database(database)
     try:
@@ -750,6 +782,7 @@ def release_repository_lock(database, work_item_id, repository_key, agent_id,
 
 def set_task_status(database, work_item_id, task_id, agent_id, status, evidence=None,
                     request_id=None):
+    _usage_sync_boundary(database, work_item_id)
     if status not in ("IN_PROGRESS", "BLOCKED", "WAITING_ACCEPTANCE", "COMPLETED", "CANCELLED"):
         raise LiteError("unsupported task status")
     request_id = request_id or _id("task")
@@ -930,6 +963,7 @@ def _validate_revision_submission(connection, work_item_id, stage, submission):
 
 def transition(database, work_item_id, action, agent_id, request_id=None,
                local_tests_passed=False, submission=None, quality_baseline=None):
+    _usage_sync_boundary(database, work_item_id)
     request_id = request_id or _id(action)
     connection = open_database(database)
     try:
@@ -1169,6 +1203,7 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
 
 def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decision, summary,
                         request_id=None):
+    _usage_sync_boundary(database, work_item_id)
     request_id = request_id or _id("review")
     connection = open_database(database)
     try:
@@ -1245,6 +1280,7 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
 
 def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
                       request_id=None):
+    _usage_sync_boundary(database, work_item_id)
     request_id = request_id or _id("human")
     connection = open_database(database)
     try:
@@ -1619,6 +1655,9 @@ def main(argv=None):
     claim.add_argument("--agent", required=True)
     claim.add_argument("--role", required=True, choices=("PLANNER", "IMPLEMENTER", "REVIEWER", "ORCHESTRATOR"))
     claim.add_argument("--ttl", type=int, default=900)
+    claim.add_argument("--session-id")
+    claim.add_argument("--usage-provider")
+    claim.add_argument("--model")
     release = sub.add_parser("release")
     release.add_argument("work_item_id")
     release.add_argument("--agent", required=True)
@@ -1704,7 +1743,9 @@ def main(argv=None):
             if args.ttl < 1:
                 raise LiteError("ttl must be positive")
             expires = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=args.ttl)).replace(microsecond=0).isoformat()
-            _print(acquire_claim(args.database, args.work_item_id, args.task_id, args.agent, args.role, expires))
+            _print(acquire_claim(args.database, args.work_item_id, args.task_id, args.agent,
+                                 args.role, expires, session_id=args.session_id,
+                                 usage_provider=args.usage_provider, model=args.model))
         elif args.command == "release":
             release_claim(args.database, args.work_item_id, args.agent)
             _print(get_work_item(args.database, args.work_item_id))
