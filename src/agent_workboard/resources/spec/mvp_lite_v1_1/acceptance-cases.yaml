@@ -1,5 +1,5 @@
-version: AWB-014-v1
-owner: AWB-014
+version: AWB-017-v1
+owner: AWB-017
 managementContract: AWB-WORKITEM-MGMT-v1
 templateContract: AWB-MANAGEMENT-v1
 cases:
@@ -54,3 +54,4 @@ cases:
   - {id: AWB-014-AC-008, priority: P0, title: 自动 gate 与远程发布部署删除破坏性授权严格隔离}
   - {id: AWB-014-AC-009, priority: P0, title: 状态变化 usage 与活动等待 300 秒 best effort 且隐私不回归}
   - {id: AWB-014-AC-010, priority: P0, title: Agent工具会话 caffeinate 精确所有权聚合清理故障告警且无 runner}
+  - {id: AWB-017-AC-001, priority: P0, title: HUMAN-only 精确恢复孤立 Reviewer task，审计幂等拒绝零写且恢复后 FINAL 可重新领取}

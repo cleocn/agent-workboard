@@ -2,20 +2,20 @@
   "manifestVersion": "MVP-LITE-v1.1",
   "status": "ACTIVE / AUTHORITATIVE",
   "databaseSchemaVersion": "MVP-LITE-v1 + AWB-USAGE-v1 + AWB-ORCHESTRATOR-v1 + AWB-AUTO-GATE-v1",
-  "planRevision": "AWB-009 accepted / AWB-011 usage Preview / AWB-012 local coordination / AWB-014 auto gates / AWB-015 0.3.1b1 release",
+  "planRevision": "AWB-009 accepted / AWB-011 usage Preview / AWB-012 local coordination / AWB-014 auto gates / AWB-015 0.3.1b1 release / AWB-017 review task recovery candidate",
   "composition": {
     "databaseSchema": "schema.sql",
     "workItemSchema": "workitem.schema.json",
     "workflow": "workflow.yaml",
     "agentGuide": "AGENT-GUIDE.md",
     "acceptanceSuite": "acceptance-cases.yaml",
-    "acceptanceCaseCount": 51
+    "acceptanceCaseCount": 52
   },
   "artifacts": [
     {"path": "schema.sql", "sha256": "766fa8d2773e57847244fb269925a34d0f1623bedc63b657f400159c5f00a050"},
     {"path": "workitem.schema.json", "sha256": "f548e873b7bfc36303a77bfbbc44f6acc71f67aa2e50409ab6288f9c00a341a4"},
-    {"path": "workflow.yaml", "sha256": "d99cdfa1f1214b742c23e19c1e16dfd93f103d8e6931410019bf1c8052760fc4"},
-    {"path": "AGENT-GUIDE.md", "sha256": "981e60509f4aabd61ea3eec491b061e97c082a3baa4f25bcbb40aecd2e227c3f"},
-    {"path": "acceptance-cases.yaml", "sha256": "f55a9d4106043e5d6ad15a2495274a714a515478c44f2fa64bbf244dced993a6"}
+    {"path": "workflow.yaml", "sha256": "0887dd077f166ededc07f55b1127e6bde10c9f9b2d9382a9edbb96b71f97c97a"},
+    {"path": "AGENT-GUIDE.md", "sha256": "e7980cf015148d2aabacac622f2a7e5ea385fd816a966c0732c05ae39c9a79b6"},
+    {"path": "acceptance-cases.yaml", "sha256": "1a95f2bb8559670c37b7c6a88dde3af948cae70ec3557670fb5a136e1ffc70fd"}
   ]
 }

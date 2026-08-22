@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1b2 Preview
+
+- Add a HUMAN-only, fail-closed `recover-review-task` command for one precisely
+  bound orphaned PLAN Reviewer task; it never unblocks or resumes work itself.
+- Support only exact 0.3.1b1→0.3.1b2 backup-first upgrades with no schema DDL,
+  database-bound rollback, and same-identity no-op validation.
+- Preserve independent 3+1+1 review, AUTO_ON_PASS authorization boundaries,
+  existing usage/Orchestrator/auto-gate semantics, and local-only operation.
+- Do not include the pending Codex usage parser candidate; AWB-010 remains
+  unstarted and estimated credits remain separate from official weekly quota.
+
 ## 0.3.1b1 Preview
 
 - Add provider-neutral, one-shot local Orchestrator registration, WorkItem lease,

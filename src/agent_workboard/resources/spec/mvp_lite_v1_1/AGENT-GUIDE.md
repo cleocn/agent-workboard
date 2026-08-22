@@ -50,6 +50,29 @@ bundle 迁移为 `MANUAL`。
 
 PLAN 与 IMPLEMENTATION 独立使用严格串行 `3+1+1`。第 1～3 轮使用普通 Reviewer；第 3 轮仍 REVISE 时冻结 artifact，不返回作者，直接调用唯一一次第 4 轮高级 convergence reviewer。其结果只允许 PASS、CONVERGENCE_REVISE、WAITING_HUMAN 或真实 BLOCKED；只有 CONVERGENCE_REVISE 允许一次最小返工。第 5 轮由普通 Reviewer 仅核验高级关闭条件和直接回归，仍 REVISE 就进入 WAITING_HUMAN，禁止第 6 轮。Reviewer、claim generation、重复提交、人工退回或 PLAN_DEVIATION 都不重置累计轮次。
 
+## 孤立 Reviewer 任务恢复
+
+PLAN Reviewer 只领取 Reviewer task 并提交 review，禁止为 PLAN review 手工把复用的
+Reviewer task 改为 `IN_PROGRESS`；该 task 留给 FINAL review 完成。若旧运行序列已在 PLAN
+PASS 后遗留一个无 claim 的 Reviewer `IN_PROGRESS` task，只有 HUMAN 可调用：
+
+```text
+awb lite --project <project> recover-review-task <WorkItem> <Task> \
+  --human <human-id> --reason <reason> --request-id <unique-id>
+```
+
+`AWB-REVIEW-TASK-RECOVERY-v1` 不是通用 reset。它只接受唯一 Reviewer task、唯一
+`IN_PROGRESS`、无活动 claim/writer、已释放且身份匹配的 Reviewer claim、structured PLAN
+PASS/open0、对应 PLAN review event、已通过 gate、后续 `START_IMPLEMENTATION`、无 FINAL
+review，以及精确 `IMPLEMENTING` 或 `PLAN_DEVIATION` 投影。成功只把该 task 恢复为
+`NOT_STARTED`、递增 WorkItem row version 并追加 `HUMAN_REVIEW_TASK_RECOVERED`；不会
+unblock、approve、submit、claim、release、发布、升级或执行远程/破坏性动作。
+
+相同 request id 和内容重放返回 `NO_OP`；冲突重放、第二次恢复、active/歧义/漂移都
+`REFUSED` 且零写入。`PLAN_DEVIATION` 形态恢复后仍须 HUMAN 显式 `unblock`，Planner
+重新提交冻结计划；后续 PLAN Reviewer 不启动复用 task。T02 完成并提交实施后，FINAL
+Reviewer 才重新领取该 task，并由 FINAL review 完成它。
+
 ## 搁置、阻塞和认领
 
 - 每个非终态都允许进入 `HELD`；搁置项不得被自动认领。

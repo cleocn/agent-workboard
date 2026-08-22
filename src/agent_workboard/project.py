@@ -39,13 +39,13 @@ ORCHESTRATOR_TABLES = ("orchestrator_instances", "orchestrator_leases",
                        "orchestrator_events")
 UPGRADE_PROTOCOL = "AWB-UPGRADE-v1"
 ROLLBACK_PROTOCOL = "AWB-ROLLBACK-v1"
-RELEASE_0_3_0B1_IDENTITY = {
-    "packageVersion": "0.3.0b1",
-    "sourceCommit": "e7616c97c8572ba2556e9d636365595424f6eccf",
-    "sourceTree": "bef05f7c608aafef8ca49bfcaf0b782cab4fb718",
-    "sourceTag": "v0.3.0b1",
+RELEASE_0_3_1B1_IDENTITY = {
+    "packageVersion": "0.3.1b1",
+    "sourceCommit": "5c783f07f001462b8b05a956d5a6885a12b5f4ac",
+    "sourceTree": "bceaecdb58d864cd1509a04b55f014f9bd9d532e",
+    "sourceTag": "v0.3.1b1",
 }
-SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_0B1_IDENTITY,)
+SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_1B1_IDENTITY,)
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
 
 
@@ -351,7 +351,8 @@ def _validate_project_contract(root):
             raise LiteError("requirements-awb.txt wheel hash does not match")
     elif (parsed.scheme != "https" or parsed.netloc != "github.com" or
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
-                  for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1"))):
+                  for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1",
+                              "v0.3.1b2"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -871,9 +872,9 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.1b1" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b1"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.1b1 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b2" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b2"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b2 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
@@ -883,7 +884,7 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
             if (database_status["usageSchemaState"] != "INSTALLED" or
                     database_status["orchestratorSchemaState"] != "INSTALLED" or
                     database_status["gatePolicySchemaState"] != "INSTALLED"):
-                raise LiteError("same-identity 0.3.1b1 project is missing a required schema extension")
+                raise LiteError("same-identity 0.3.1b2 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -894,13 +895,13 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
             return {"result": result, "root": root, "config": config, "database": database}
 
         if current_identity not in SUPPORTED_UPGRADE_SOURCES:
-            raise LiteError("upgrade source identity is outside the exact 0.3.0b1 to 0.3.1b1 matrix")
+            raise LiteError("upgrade source identity is outside the exact 0.3.1b1 to 0.3.1b2 matrix")
         if database_status["usageSchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a 0.3.0b1 database without the exact usage extension")
-        if database_status["orchestratorSchemaState"] != "ABSENT":
-            raise LiteError("upgrade refuses a 0.3.0b1 database with an unexpected orchestrator extension")
-        if database_status["gatePolicySchemaState"] != "ABSENT":
-            raise LiteError("upgrade refuses a 0.3.0b1 database with an unexpected auto-gate extension")
+            raise LiteError("upgrade refuses a 0.3.1b1 database without the exact usage extension")
+        if database_status["orchestratorSchemaState"] != "INSTALLED":
+            raise LiteError("upgrade refuses a 0.3.1b1 database without the exact orchestrator extension")
+        if database_status["gatePolicySchemaState"] != "INSTALLED":
+            raise LiteError("upgrade refuses a 0.3.1b1 database without the exact auto-gate extension")
         old_wheel, old_digest = _locked_wheel(root, os.path.dirname(target_wheel))
         old_identity = _wheel_identity(old_wheel)
         if old_identity != current_identity:
@@ -1054,16 +1055,13 @@ def _write_upgrade(plan):
             _atomic_bytes(target, replacement)
         connection = open_database(plan["database"])
         try:
-            connection.executescript(
-                "BEGIN IMMEDIATE;\n" + orchestrator_schema_sql() + "\n" +
-                human_gate_schema_sql()
-            )
+            connection.execute("BEGIN IMMEDIATE")
             if (_usage_schema_state(connection) != "INSTALLED" or
                     orchestrator_schema_state(connection) != "INSTALLED" or
                     human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("0.3.1b1 extension migration validation failed")
+                raise LiteError("0.3.1b2 no-DDL extension validation failed")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1158,7 +1156,7 @@ def _manifest_target(base, relative, label, allow_missing=False):
 
 
 def _expected_rollback_material(root, database, manifest, backup_root):
-    """Reconstruct the only mutations the bounded 0.3.1b1 upgrade can make."""
+    """Reconstruct the only mutations the bounded 0.3.1b2 upgrade can make."""
     if not isinstance(manifest.get("withCodex"), bool):
         raise LiteError("rollback manifest Codex selection is invalid")
     managed_backups = {}
@@ -1232,12 +1230,12 @@ def _expected_rollback_material(root, database, manifest, backup_root):
     before_database = _database_preflight(database_backup)
     after_database = _database_preflight(database)
     if (before_database["usageSchemaState"] != "INSTALLED" or
-            before_database["orchestratorSchemaState"] != "ABSENT" or
-            before_database["gatePolicySchemaState"] != "ABSENT" or
+            before_database["orchestratorSchemaState"] != "INSTALLED" or
+            before_database["gatePolicySchemaState"] != "INSTALLED" or
             after_database["usageSchemaState"] != "INSTALLED" or
             after_database["orchestratorSchemaState"] != "INSTALLED" or
             after_database["gatePolicySchemaState"] != "INSTALLED"):
-        raise LiteError("rollback database schema state is outside the exact migration pair")
+        raise LiteError("rollback database schema state is outside the exact no-DDL pair")
     expected_actions.append({
         "action": "RESTORE",
         "path": database_relative,
@@ -1524,7 +1522,7 @@ def _write_rollback(plan):
 
 
 def upgrade_project(path, wheel_path=None, with_codex=False, check=False, rollback_manifest=None):
-    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b1."""
+    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b2."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",

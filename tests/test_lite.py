@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -26,6 +27,7 @@ from agent_workboard.lite import (
     open_database,
     record_agent_review,
     record_human_gate,
+    recover_review_task,
     report_plan_deviation,
     release_claim,
     release_repository_lock,
@@ -35,6 +37,7 @@ from agent_workboard.lite import (
     transition,
     unblock_task,
 )
+from agent_workboard.project import transfer_export, transfer_import
 
 
 class LiteWorkboardTest(unittest.TestCase):
@@ -160,6 +163,56 @@ class LiteWorkboardTest(unittest.TestCase):
         self.claim(work_item_id, 3, "reviewer-a", "REVIEWER")
         record_agent_review(self.database, work_item_id, "PLAN", "reviewer-a", "APPROVED", "可实施")
         record_human_gate(self.database, work_item_id, "PLAN", "human-a", "APPROVED", "批准")
+
+    def create_orphaned_review_task(self, work_item_id="AWB-REC", deviation=False,
+                                    leave_claim=False):
+        create_work_item(
+            self.database, work_item_id, "AWB", "orphan recovery",
+            management=self.management(work_item_id, item_type="AWB"),
+            human_review="AUTO_ON_PASS",
+        )
+        planner = work_item_id + "-planner"
+        reviewer = work_item_id + "-plan-reviewer"
+        implementer = work_item_id + "-implementer"
+        self.claim(work_item_id, 1, planner, "PLANNER")
+        self.complete(work_item_id, 1, planner)
+        transition(self.database, work_item_id, "submit_plan", planner)
+        self.claim(work_item_id, 3, reviewer, "REVIEWER")
+        set_task_status(
+            self.database, work_item_id, work_item_id + "-T03", reviewer,
+            "IN_PROGRESS", [{"phase": "PLAN"}],
+        )
+        record_agent_review(
+            self.database, work_item_id, "PLAN", reviewer, "APPROVED",
+            self.structured_review("PLAN", "PASS"),
+        )
+        self.claim(work_item_id, 2, implementer, "IMPLEMENTER")
+        transition(self.database, work_item_id, "start_implementation", implementer)
+        if deviation:
+            report_plan_deviation(
+                self.database, work_item_id, work_item_id + "-T02", implementer,
+                {"reason": "approved plan cannot proceed", "impact": "planning must resume"},
+            )
+        elif not leave_claim:
+            release_claim(self.database, work_item_id, implementer)
+        return {"planner": planner, "reviewer": reviewer, "implementer": implementer}
+
+    def database_snapshot(self, database=None):
+        connection = open_database(database or self.database)
+        try:
+            tables = (
+                "work_items", "tasks", "claims", "repository_locks", "reviews",
+                "human_gates", "events", "orchestrator_instances",
+                "orchestrator_leases", "orchestrator_events", "usage_events",
+            )
+            return {
+                table: [dict(row) for row in connection.execute(
+                    "SELECT * FROM {0} ORDER BY rowid".format(table)
+                )]
+                for table in tables
+            }
+        finally:
+            connection.close()
 
     def to_plan_convergence_round(self, work_item_id):
         self.create(work_item_id)
@@ -1121,6 +1174,271 @@ class LiteWorkboardTest(unittest.TestCase):
         for path in consumers:
             with open(path, encoding="utf-8") as handle:
                 self.assertIn("AWB-WORKITEM-MGMT-v1", handle.read())
+
+    def test_human_recovery_is_exact_audited_and_final_review_can_reclaim_task(self):
+        work_item_id = "AWB-REC"
+        self.create_orphaned_review_task(work_item_id)
+        before = get_work_item(self.database, work_item_id)
+        result = recover_review_task(
+            self.database, work_item_id, work_item_id + "-T03", "human-a",
+            "released PLAN reviewer left reusable task active", "recover-001",
+        )
+        self.assertEqual(("OK", "RECOVERED"), (result["status"], result["reasonCode"]))
+        self.assertEqual("AWB-REVIEW-TASK-RECOVERY-v1", result["protocolVersion"])
+        binding = result["binding"]
+        self.assertEqual("AWB-REC-plan-reviewer", binding["reviewerAgentId"])
+        self.assertEqual(2, binding["claimGeneration"])
+        after = get_work_item(self.database, work_item_id)
+        self.assertEqual("NOT_STARTED", after["tasks"][2]["status"])
+        self.assertEqual(before["tasks"][2]["evidence_json"], after["tasks"][2]["evidence_json"])
+        for field in ("state", "queue_state", "current_role", "blocked_reason", "held_reason"):
+            self.assertEqual(before[field], after[field])
+        self.assertEqual(before["row_version"] + 1, after["row_version"])
+        event = timeline(self.database, work_item_id)[-1]
+        self.assertEqual(("HUMAN_REVIEW_TASK_RECOVERED", "HUMAN", "human-a"), (
+            event["event_type"], event["actor_kind"], event["actor_id"],
+        ))
+        self.assertEqual(result["binding"], json.loads(event["payload_json"])["binding"])
+
+        implementer = work_item_id + "-implementer-2"
+        self.claim(work_item_id, 2, implementer, "IMPLEMENTER")
+        set_task_status(
+            self.database, work_item_id, work_item_id + "-T02", implementer,
+            "IN_PROGRESS",
+        )
+        self.complete(work_item_id, 2, implementer)
+        transition(
+            self.database, work_item_id, "submit_implementation", implementer,
+            local_tests_passed=True, quality_baseline=self.quality(),
+        )
+        final_reviewer = work_item_id + "-final-reviewer"
+        self.claim(work_item_id, 3, final_reviewer, "REVIEWER")
+        done = record_agent_review(
+            self.database, work_item_id, "FINAL", final_reviewer, "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
+        )
+        self.assertEqual("FINAL_ACCEPTANCE_APPROVED", done["state"])
+        self.assertEqual("COMPLETED", done["tasks"][2]["status"])
+
+    def test_plan_deviation_recovery_does_not_unblock_and_public_flow_resumes(self):
+        work_item_id = "AWB-DEV"
+        self.create_orphaned_review_task(work_item_id, deviation=True)
+        recovered = recover_review_task(
+            self.database, work_item_id, work_item_id + "-T03", "human-a",
+            "recover only reviewer availability", "recover-deviation",
+        )
+        self.assertEqual("OK", recovered["status"])
+        item = get_work_item(self.database, work_item_id)
+        self.assertEqual(("DRAFT", "BLOCKED", "PLANNER", "PLAN_DEVIATION"), (
+            item["state"], item["queue_state"], item["current_role"], item["blocked_reason"],
+        ))
+        self.assertEqual("BLOCKED", item["tasks"][1]["status"])
+        unblock_task(
+            self.database, work_item_id, work_item_id + "-T02", "human-a",
+            "approved plan may be resubmitted",
+        )
+        planner = work_item_id + "-planner-2"
+        self.claim(work_item_id, 1, planner, "PLANNER")
+        transition(self.database, work_item_id, "submit_plan", planner)
+        reviewer = work_item_id + "-plan-reviewer-2"
+        self.claim(work_item_id, 3, reviewer, "REVIEWER")
+        approved = record_agent_review(
+            self.database, work_item_id, "PLAN", reviewer, "APPROVED",
+            self.structured_review("PLAN", "PASS"),
+        )
+        self.assertEqual("NOT_STARTED", approved["tasks"][2]["status"])
+        implementer = work_item_id + "-implementer-2"
+        self.claim(work_item_id, 2, implementer, "IMPLEMENTER")
+        transition(self.database, work_item_id, "start_implementation", implementer)
+        set_task_status(
+            self.database, work_item_id, work_item_id + "-T02", implementer,
+            "IN_PROGRESS",
+        )
+        self.complete(work_item_id, 2, implementer)
+        transition(
+            self.database, work_item_id, "submit_implementation", implementer,
+            local_tests_passed=True, quality_baseline=self.quality(),
+        )
+        self.claim(work_item_id, 3, work_item_id + "-final", "REVIEWER")
+
+    def test_recovery_replay_conflict_second_request_and_active_claim_are_zero_write(self):
+        work_item_id = "AWB-IDEM"
+        self.create_orphaned_review_task(work_item_id)
+        arguments = (
+            self.database, work_item_id, work_item_id + "-T03", "human-a",
+            "recover orphan", "recover-idempotent",
+        )
+        first = recover_review_task(*arguments)
+        self.assertEqual("OK", first["status"])
+        snapshot = self.database_snapshot()
+        replay = recover_review_task(*arguments)
+        self.assertEqual(("NO_OP", "EXACT_REPLAY"), (replay["status"], replay["reasonCode"]))
+        self.assertEqual(snapshot, self.database_snapshot())
+        conflict = recover_review_task(
+            self.database, work_item_id, work_item_id + "-T03", "human-a",
+            "different reason", "recover-idempotent",
+        )
+        self.assertEqual("REQUEST_ID_CONFLICT", conflict["reasonCode"])
+        self.assertEqual(snapshot, self.database_snapshot())
+        second = recover_review_task(
+            self.database, work_item_id, work_item_id + "-T03", "human-a",
+            "recover again", "recover-second",
+        )
+        self.assertEqual("TASK_NOT_ORPHANED", second["reasonCode"])
+        self.assertEqual(snapshot, self.database_snapshot())
+
+        active_id = "AWB-ACTIVE"
+        self.create_orphaned_review_task(active_id, leave_claim=True)
+        active_snapshot = self.database_snapshot()
+        active = recover_review_task(
+            self.database, active_id, active_id + "-T03", "human-a",
+            "must refuse active claim", "recover-active",
+        )
+        self.assertEqual("ACTIVE_CLAIM", active["reasonCode"])
+        self.assertEqual(active_snapshot, self.database_snapshot())
+
+    def test_recovery_rejects_invalid_input_writer_ambiguity_and_evidence_drift_zero_write(self):
+        invalid = recover_review_task(
+            self.database, "AWB-X", "AWB-X-T03", " ", "reason", "request",
+        )
+        self.assertEqual(("REFUSED", "INPUT_REQUIRED"), (
+            invalid["status"], invalid["reasonCode"],
+        ))
+
+        writer_id = "AWB-WRITER"
+        self.create_orphaned_review_task(writer_id)
+        connection = open_database(self.database)
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+            connection.execute(
+                "INSERT INTO repository_locks VALUES(?,?,?,?,?,'ACTIVE',?,?,NULL)",
+                ("writer-only", "repo-writer-only", writer_id, "stale-agent", 1,
+                 now, self.expires()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        writer_snapshot = self.database_snapshot()
+        refused = recover_review_task(
+            self.database, writer_id, writer_id + "-T03", "human-a",
+            "writer is active", "recover-writer",
+        )
+        self.assertEqual("ACTIVE_REPOSITORY_WRITER", refused["reasonCode"])
+        self.assertEqual(writer_snapshot, self.database_snapshot())
+
+        ambiguous_id = "AWB-AMB"
+        self.create_orphaned_review_task(ambiguous_id)
+        connection = open_database(self.database)
+        try:
+            created = get_work_item(self.database, ambiguous_id)["created_at"]
+            connection.execute(
+                "INSERT INTO tasks VALUES(?,?,?,?,?,'NOT_STARTED',1,'[]',?,?)",
+                (ambiguous_id + "-T04", ambiguous_id, 4, "second reviewer", "REVIEWER",
+                 created, created),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        ambiguous_snapshot = self.database_snapshot()
+        refused = recover_review_task(
+            self.database, ambiguous_id, ambiguous_id + "-T03", "human-a",
+            "ambiguous target", "recover-ambiguous",
+        )
+        self.assertEqual("REVIEWER_TASK_NOT_UNIQUE", refused["reasonCode"])
+        self.assertEqual(ambiguous_snapshot, self.database_snapshot())
+
+        drift_id = "AWB-DRIFT"
+        self.create_orphaned_review_task(drift_id)
+        connection = open_database(self.database)
+        try:
+            connection.execute(
+                "UPDATE claims SET status='EXPIRED' WHERE work_item_id=? AND role='REVIEWER'",
+                (drift_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        drift_snapshot = self.database_snapshot()
+        refused = recover_review_task(
+            self.database, drift_id, drift_id + "-T03", "human-a",
+            "claim drift", "recover-drift",
+        )
+        self.assertEqual("RELEASED_REVIEWER_CLAIM_NOT_UNIQUE", refused["reasonCode"])
+        self.assertEqual(drift_snapshot, self.database_snapshot())
+
+    def test_recovery_fault_rolls_back_and_concurrent_requests_have_one_winner(self):
+        fault_id = "AWB-FAULT"
+        self.create_orphaned_review_task(fault_id)
+        snapshot = self.database_snapshot()
+        with mock.patch("agent_workboard.lite._event", side_effect=RuntimeError("fault")):
+            with self.assertRaisesRegex(RuntimeError, "fault"):
+                recover_review_task(
+                    self.database, fault_id, fault_id + "-T03", "human-a",
+                    "fault injection", "recover-fault",
+                )
+        self.assertEqual(snapshot, self.database_snapshot())
+
+        concurrent_id = "AWB-CONCURRENT"
+        self.create_orphaned_review_task(concurrent_id)
+        barrier = threading.Barrier(2)
+        results = []
+
+        def recover(number):
+            barrier.wait()
+            results.append(recover_review_task(
+                self.database, concurrent_id, concurrent_id + "-T03", "human-a",
+                "concurrent recovery", "recover-concurrent-{0}".format(number),
+            ))
+
+        threads = [threading.Thread(target=recover, args=(number,)) for number in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(2, len(results))
+        self.assertEqual(["REFUSED", "OK"], sorted(
+            (result["status"] for result in results), reverse=True
+        ))
+        self.assertEqual(1, sum(
+            event["event_type"] == "HUMAN_REVIEW_TASK_RECOVERED"
+            for event in timeline(self.database, concurrent_id)
+        ))
+
+    def test_recovery_cli_exit_json_and_transfer_exact_replay(self):
+        work_item_id = "AWB-CLI-REC"
+        self.create_orphaned_review_task(work_item_id)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = main([
+                "--database", self.database, "recover-review-task", work_item_id,
+                work_item_id + "-T03", "--human", "human-a", "--reason",
+                "public CLI", "--request-id", "recover-cli",
+            ])
+        payload = json.loads(output.getvalue())
+        self.assertEqual((0, "OK"), (code, payload["status"]))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = main([
+                "--database", self.database, "recover-review-task", work_item_id,
+                work_item_id + "-T03", "--human", "human-a", "--reason",
+                "different", "--request-id", "recover-cli",
+            ])
+        self.assertEqual((2, "REQUEST_ID_CONFLICT"), (
+            code, json.loads(output.getvalue())["reasonCode"],
+        ))
+
+        bundle = os.path.join(self.temporary.name, "recovery-transfer.json")
+        transfer_export(self.database, [work_item_id], bundle)
+        target = os.path.join(self.temporary.name, "target.db")
+        initialize_database(target)
+        self.assertEqual("ok", transfer_import(target, bundle)["status"])
+        imported = recover_review_task(
+            target, work_item_id, work_item_id + "-T03", "human-a",
+            "public CLI", "recover-cli",
+        )
+        self.assertEqual(("NO_OP", "EXACT_REPLAY"), (
+            imported["status"], imported["reasonCode"],
+        ))
 
     def cli(self, *arguments):
         output = io.StringIO()

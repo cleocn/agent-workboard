@@ -43,7 +43,7 @@ class ReleaseGateTest(unittest.TestCase):
                                   stdout=subprocess.DEVNULL)
             subprocess.check_call(["git", "tag", "-a", "v0.3.0b1", "-m", "v0.3.0b1"],
                                   cwd=repository)
-            base = self._git(repository, "rev-parse", "HEAD")
+            v030b1 = self._git(repository, "rev-parse", "HEAD")
             subprocess.check_call(["git", "switch", "-c", "release/awb-015-v0.3.1b1"],
                                   cwd=repository, stdout=subprocess.DEVNULL)
             with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
@@ -53,26 +53,39 @@ class ReleaseGateTest(unittest.TestCase):
                                   stdout=subprocess.DEVNULL)
             subprocess.check_call(["git", "tag", "-a", "v0.3.1b1", "-m", "v0.3.1b1"],
                                   cwd=repository)
+            base = self._git(repository, "rev-parse", "HEAD")
+            subprocess.check_call(["git", "switch", "-c", "release/awb-018-v0.3.1b2"],
+                                  cwd=repository, stdout=subprocess.DEVNULL)
+            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
+                handle.write("0.3.1b2\n")
+            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
+            subprocess.check_call(["git", "commit", "-m", "v0.3.1b2"], cwd=repository,
+                                  stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "tag", "-a", "v0.3.1b2", "-m", "v0.3.1b2"],
+                                  cwd=repository)
             script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools", "release_gate.py")
             subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
                                    "--base", base, "--v0.1-commit", v01, "--v0.2-commit", v02,
-                                   "--v0.2.1-commit", v021, "--v0.3.0b1-commit", base,
+                                   "--v0.2.1-commit", v021, "--v0.3.0b1-commit", v030b1,
+                                   "--v0.3.1b1-commit", base,
                                    "--path", "release.txt"],
                                   stdout=subprocess.DEVNULL)
             with self.assertRaises(subprocess.CalledProcessError):
                 subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
                                        "--base", base, "--v0.1-commit", v01, "--v0.2-commit", v02,
-                                       "--v0.2.1-commit", v021, "--v0.3.0b1-commit", base,
+                                       "--v0.2.1-commit", v021, "--v0.3.0b1-commit", v030b1,
+                                       "--v0.3.1b1-commit", base,
                                        "--path", "stable.txt"],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            subprocess.check_call(["git", "tag", "-d", "v0.3.1b1"], cwd=repository,
+            subprocess.check_call(["git", "tag", "-d", "v0.3.1b2"], cwd=repository,
                                   stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "v0.3.1b1"], cwd=repository)
+            subprocess.check_call(["git", "tag", "v0.3.1b2"], cwd=repository)
             with self.assertRaises(subprocess.CalledProcessError):
                 subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
                                        "--base", base, "--v0.1-commit", v01, "--v0.2-commit", v02,
-                                       "--v0.2.1-commit", v021, "--v0.3.0b1-commit", base,
+                                       "--v0.2.1-commit", v021, "--v0.3.0b1-commit", v030b1,
+                                       "--v0.3.1b1-commit", base,
                                        "--path", "release.txt"],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

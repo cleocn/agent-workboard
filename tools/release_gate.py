@@ -33,7 +33,7 @@ def scan(repository):
 
 
 def check_successor(repository, base, candidate, preserved, allowlist,
-                    expected_branch="release/awb-015-v0.3.1b1"):
+                    expected_branch="release/awb-018-v0.3.1b2"):
     repository = os.path.realpath(repository)
     base = run(repository, "rev-parse", base + "^{commit}").strip()
     candidate = run(repository, "rev-parse", candidate + "^{commit}").strip()
@@ -52,14 +52,14 @@ def check_successor(repository, base, candidate, preserved, allowlist,
             raise ValueError(tag + " moved")
         if subprocess.call(["git", "merge-base", "--is-ancestor", expected, candidate], cwd=repository):
             raise ValueError(tag + " history is not preserved")
-    if run(repository, "cat-file", "-t", "v0.3.1b1").strip() != "tag":
-        raise ValueError("v0.3.1b1 must be an annotated tag")
-    if run(repository, "rev-parse", "v0.3.1b1^{commit}").strip() != candidate:
-        raise ValueError("v0.3.1b1 tag does not identify the candidate")
+    if run(repository, "cat-file", "-t", "v0.3.1b2").strip() != "tag":
+        raise ValueError("v0.3.1b2 must be an annotated tag")
+    if run(repository, "rev-parse", "v0.3.1b2^{commit}").strip() != candidate:
+        raise ValueError("v0.3.1b2 tag does not identify the candidate")
     exact_tags = sorted(line for line in run(repository, "tag", "--points-at", candidate).splitlines()
                         if line)
-    if exact_tags != ["v0.3.1b1"]:
-        raise ValueError("release candidate must have the unique exact v0.3.1b1 tag")
+    if exact_tags != ["v0.3.1b2"]:
+        raise ValueError("release candidate must have the unique exact v0.3.1b2 tag")
     changed = sorted(line for line in run(repository, "diff", "--name-only", base, candidate).splitlines() if line)
     if (set(changed) != set(allowlist) or len(changed) != len(set(allowlist)) or
             len(allowlist) != len(set(allowlist))):
@@ -68,7 +68,7 @@ def check_successor(repository, base, candidate, preserved, allowlist,
         raise ValueError("release candidate worktree is not clean")
     scanned = scan(repository)
     return {"base": base, "candidate": candidate, "preservedTags": preserved,
-            "v0.3.1b1": candidate,
+            "v0.3.1b2": candidate,
             "changedPaths": changed, "reachableObjectCount": len(scanned["objects"]),
             "refs": scanned["refs"]}
 
@@ -84,14 +84,16 @@ def main(argv=None):
     check.add_argument("--v0.2-commit", dest="v02_commit", required=True)
     check.add_argument("--v0.2.1-commit", dest="v021_commit", required=True)
     check.add_argument("--v0.3.0b1-commit", dest="v030b1_commit", required=True)
-    check.add_argument("--branch", default="release/awb-015-v0.3.1b1")
+    check.add_argument("--v0.3.1b1-commit", dest="v031b1_commit", required=True)
+    check.add_argument("--branch", default="release/awb-018-v0.3.1b2")
     check.add_argument("--path", action="append", required=True)
     scan_parser = sub.add_parser("scan")
     scan_parser.add_argument("--repository", required=True)
     args = parser.parse_args(argv)
     if args.command == "check-successor":
         preserved = {"v0.1.0": args.v01_commit, "v0.2.0": args.v02_commit,
-                     "v0.2.1": args.v021_commit, "v0.3.0b1": args.v030b1_commit}
+                     "v0.2.1": args.v021_commit, "v0.3.0b1": args.v030b1_commit,
+                     "v0.3.1b1": args.v031b1_commit}
         result = check_successor(args.repository, args.base, args.candidate, preserved,
                                  args.path, expected_branch=args.branch)
     else:

@@ -25,6 +25,7 @@ MANAGEMENT_CONTRACT_VERSION = "AWB-WORKITEM-MGMT-v1"
 TEMPLATE_CONTRACT_VERSION = "AWB-MANAGEMENT-v1"
 AUTO_GATE_SCHEMA_VERSION = "AWB-AUTO-GATE-v1"
 CREATION_RISK_PROTOCOL = "AWB-CREATION-RISK-v1"
+REVIEW_TASK_RECOVERY_PROTOCOL = "AWB-REVIEW-TASK-RECOVERY-v1"
 HUMAN_GATE_POLICIES = ("AUTO_ON_PASS", "MANUAL")
 CREATION_RISK_KINDS = ("REMOTE", "DESTRUCTIVE", "ANOMALOUS_STATE")
 BUSY_TIMEOUT_MS = 5000
@@ -1791,6 +1792,312 @@ def unblock_task(database, work_item_id, task_id, human_id, reason, request_id=N
         connection.close()
 
 
+def _review_task_recovery_result(status, reason_code, work_item_id, task_id,
+                                 human_id, reason, request_id, binding=None):
+    result = {
+        "protocolVersion": REVIEW_TASK_RECOVERY_PROTOCOL,
+        "operation": "RECOVER_REVIEW_TASK",
+        "status": status,
+        "reasonCode": reason_code,
+        "workItemId": work_item_id,
+        "taskId": task_id,
+        "humanId": human_id,
+        "requestId": request_id,
+    }
+    if binding is not None:
+        result["binding"] = binding
+    return result
+
+
+def _event_payload(row):
+    try:
+        value = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def recover_review_task(database, work_item_id, task_id, human_id, reason,
+                        request_id):
+    """Recover one precisely bound orphaned PLAN Reviewer task.
+
+    This is intentionally not a general task reset.  Every refusal rolls the
+    transaction back and returns a stable structured result; unexpected faults
+    are rolled back and re-raised so callers cannot mistake them for recovery.
+    """
+    values = (work_item_id, task_id, human_id, reason, request_id)
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        return _review_task_recovery_result(
+            "REFUSED", "INPUT_REQUIRED", work_item_id, task_id, human_id,
+            reason, request_id,
+        )
+    work_item_id, task_id, human_id, reason, request_id = (
+        value.strip() for value in values
+    )
+    connection = open_database(database)
+
+    def refused(code):
+        connection.rollback()
+        return _review_task_recovery_result(
+            "REFUSED", code, work_item_id, task_id, human_id, reason, request_id,
+        )
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        replay = connection.execute(
+            "SELECT * FROM events WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if replay is not None:
+            payload = _event_payload(replay)
+            exact = (
+                replay["event_type"] == "HUMAN_REVIEW_TASK_RECOVERED" and
+                replay["actor_kind"] == "HUMAN" and replay["actor_id"] == human_id and
+                replay["work_item_id"] == work_item_id and
+                payload.get("protocolVersion") == REVIEW_TASK_RECOVERY_PROTOCOL and
+                payload.get("workItemId") == work_item_id and
+                payload.get("taskId") == task_id and payload.get("humanId") == human_id and
+                payload.get("reason") == reason and payload.get("requestId") == request_id and
+                payload.get("from") == "IN_PROGRESS" and
+                payload.get("to") == "NOT_STARTED"
+            )
+            if not exact:
+                return refused("REQUEST_ID_CONFLICT")
+            binding = payload.get("binding")
+            connection.rollback()
+            return _review_task_recovery_result(
+                "NO_OP", "EXACT_REPLAY", work_item_id, task_id, human_id,
+                reason, request_id, binding,
+            )
+
+        try:
+            item = _item(connection, work_item_id)
+        except LiteError:
+            return refused("WORK_ITEM_NOT_FOUND")
+        if item["state"] == "FINAL_ACCEPTANCE_APPROVED" or item["closed_at"] is not None:
+            return refused("TERMINAL_WORK_ITEM")
+        management = _management_from_events(connection, work_item_id)
+        if not isinstance(management, dict):
+            return refused("MANAGEMENT_REQUIRED")
+
+        reviewer_tasks = connection.execute(
+            "SELECT * FROM tasks WHERE work_item_id=? AND owner_role='REVIEWER' ORDER BY seq",
+            (work_item_id,),
+        ).fetchall()
+        if len(reviewer_tasks) != 1 or reviewer_tasks[0]["task_id"] != task_id:
+            return refused("REVIEWER_TASK_NOT_UNIQUE")
+        task = reviewer_tasks[0]
+        if task["status"] != "IN_PROGRESS":
+            return refused("TASK_NOT_ORPHANED")
+        in_progress = connection.execute(
+            "SELECT task_id FROM tasks WHERE work_item_id=? AND status='IN_PROGRESS'",
+            (work_item_id,),
+        ).fetchall()
+        if len(in_progress) != 1 or in_progress[0]["task_id"] != task_id:
+            return refused("IN_PROGRESS_TASK_AMBIGUOUS")
+        if connection.execute(
+            "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE' LIMIT 1",
+            (work_item_id,),
+        ).fetchone() is not None:
+            return refused("ACTIVE_CLAIM")
+        if connection.execute(
+            "SELECT 1 FROM repository_locks WHERE work_item_id=? AND status='ACTIVE' LIMIT 1",
+            (work_item_id,),
+        ).fetchone() is not None:
+            return refused("ACTIVE_REPOSITORY_WRITER")
+
+        implementer_tasks = connection.execute(
+            "SELECT * FROM tasks WHERE work_item_id=? AND owner_role='IMPLEMENTER' ORDER BY seq",
+            (work_item_id,),
+        ).fetchall()
+        if len(implementer_tasks) != 1:
+            return refused("IMPLEMENTER_TASK_NOT_UNIQUE")
+        implementer_status = implementer_tasks[0]["status"]
+        implementing_shape = (
+            item["state"] == "IMPLEMENTING" and item["queue_state"] == "CLAIMABLE" and
+            item["current_role"] == "IMPLEMENTER" and item["held_reason"] is None and
+            item["blocked_reason"] is None and
+            implementer_status not in ("COMPLETED", "CANCELLED")
+        )
+        deviation_shape = (
+            item["state"] == "DRAFT" and item["queue_state"] == "BLOCKED" and
+            item["current_role"] == "PLANNER" and item["held_reason"] is None and
+            item["blocked_reason"] == "PLAN_DEVIATION" and
+            implementer_status == "BLOCKED"
+        )
+        if not (implementing_shape or deviation_shape):
+            return refused("UNSUPPORTED_RUNTIME_SHAPE")
+
+        projection = _review_projection(connection, work_item_id)
+        if (projection["PLAN"]["latestResult"] != "PASS" or
+                projection["PLAN"]["openFindings"]):
+            return refused("PLAN_REVIEW_NOT_PASS_OPEN_ZERO")
+        if connection.execute(
+            "SELECT 1 FROM reviews WHERE work_item_id=? AND stage='FINAL' LIMIT 1",
+            (work_item_id,),
+        ).fetchone() is not None:
+            return refused("FINAL_REVIEW_ALREADY_EXISTS")
+
+        task_events = []
+        for row in connection.execute(
+                "SELECT * FROM events WHERE work_item_id=? AND event_type='TASK_STATUS_CHANGED' "
+                "ORDER BY event_id", (work_item_id,)):
+            payload = _event_payload(row)
+            if payload.get("taskId") == task_id:
+                task_events.append((row, payload))
+        if not task_events or task_events[-1][1].get("status") != "IN_PROGRESS":
+            return refused("TASK_EVENT_NOT_BOUND")
+        task_event, task_payload = task_events[-1]
+        reviewer_agent_id = task_event["actor_id"]
+        if (task_event["actor_kind"] != "AGENT" or
+                task_payload.get("from") != "NOT_STARTED"):
+            return refused("TASK_EVENT_NOT_BOUND")
+
+        claims = []
+        for claim in connection.execute(
+                "SELECT * FROM claims WHERE work_item_id=? AND task_id=? AND agent_id=? "
+                "AND role='REVIEWER'", (work_item_id, task_id, reviewer_agent_id)):
+            acquired_event = connection.execute(
+                "SELECT * FROM events WHERE work_item_id=? AND event_type='CLAIM_ACQUIRED' "
+                "AND actor_kind='AGENT' AND actor_id=? ORDER BY event_id",
+                (work_item_id, reviewer_agent_id),
+            ).fetchall()
+            acquired_event = [
+                row for row in acquired_event
+                if _event_payload(row).get("claimId") == claim["claim_id"] and
+                _event_payload(row).get("taskId") == task_id and
+                _event_payload(row).get("generation") == claim["generation"]
+            ]
+            if (claim["status"] == "RELEASED" and claim["released_at"] and
+                    len(acquired_event) == 1 and
+                    claim["acquired_at"] == acquired_event[0]["created_at"] and
+                    acquired_event[0]["event_id"] < task_event["event_id"]):
+                claims.append((claim, acquired_event[0]))
+        if len(claims) != 1:
+            return refused("RELEASED_REVIEWER_CLAIM_NOT_UNIQUE")
+        claim, claim_event = claims[0]
+
+        review_candidates = []
+        for review in connection.execute(
+                "SELECT rowid AS review_rowid,* FROM reviews WHERE work_item_id=? "
+                "AND stage='PLAN' ORDER BY created_at,rowid", (work_item_id,)):
+            decoded = _decoded_review(review)
+            if (review["reviewer_agent_id"] != reviewer_agent_id or
+                    decoded.get("protocolVersion") != "AWB-REVIEW-v1" or
+                    decoded.get("result") != "PASS" or decoded.get("findings") != []):
+                continue
+            matching_events = []
+            for event in connection.execute(
+                    "SELECT * FROM events WHERE work_item_id=? AND event_type='AGENT_PLAN_REVIEW' "
+                    "AND actor_kind='AGENT' AND actor_id=? ORDER BY event_id",
+                    (work_item_id, reviewer_agent_id)):
+                event_payload = _event_payload(event)
+                if (event_payload.get("decision") == "APPROVED" and
+                        event_payload.get("review") == decoded and
+                        event["created_at"] == review["created_at"] and
+                        event["event_id"] > task_event["event_id"]):
+                    matching_events.append((event, event_payload))
+            if len(matching_events) != 1:
+                continue
+            review_event, review_payload = matching_events[0]
+            gate_events = []
+            for gate_event in connection.execute(
+                    "SELECT * FROM events WHERE work_item_id=? AND event_type IN "
+                    "('AUTO_GATE_APPROVED','HUMAN_PLAN_GATE') ORDER BY event_id",
+                    (work_item_id,)):
+                if gate_event["event_id"] <= review_event["event_id"]:
+                    continue
+                gate_payload = _event_payload(gate_event)
+                if gate_event["event_type"] == "AUTO_GATE_APPROVED":
+                    valid_gate = (
+                        gate_event["actor_kind"] == "SYSTEM" and
+                        gate_payload.get("stage") == "PLAN" and
+                        gate_payload.get("reviewId") == review["review_id"] and
+                        gate_payload.get("reviewRequestId") == review_event["request_id"] and
+                        gate_payload.get("reviewEventId") == review_event["event_id"] and
+                        gate_payload.get("reviewRound") == decoded.get("round")
+                    )
+                else:
+                    human_gate = connection.execute(
+                        "SELECT 1 FROM human_gates WHERE work_item_id=? AND stage='PLAN' "
+                        "AND human_id=? AND decision='APPROVED' AND reason=? AND created_at=?",
+                        (work_item_id, gate_event["actor_id"], gate_payload.get("reason"),
+                         gate_event["created_at"]),
+                    ).fetchone()
+                    valid_gate = (
+                        gate_event["actor_kind"] == "HUMAN" and
+                        gate_payload.get("decision") == "APPROVED" and
+                        human_gate is not None
+                    )
+                if valid_gate:
+                    gate_events.append(gate_event)
+            for gate_event in gate_events:
+                starts = connection.execute(
+                    "SELECT * FROM events WHERE work_item_id=? AND event_type='START_IMPLEMENTATION' "
+                    "AND event_id>? ORDER BY event_id", (work_item_id, gate_event["event_id"]),
+                ).fetchall()
+                if len(starts) == 1 and starts[0]["actor_kind"] == "AGENT" and _event_payload(
+                        starts[0]) == {
+                            "from": "PLAN_REVIEW_APPROVED", "to": "IMPLEMENTING",
+                        }:
+                    review_candidates.append((review, review_event, gate_event, starts[0]))
+        if len(review_candidates) != 1:
+            return refused("PLAN_EVIDENCE_NOT_UNIQUE")
+        review, review_event, gate_event, start_event = review_candidates[0]
+        if claim["released_at"] != review["created_at"]:
+            return refused("CLAIM_REVIEW_TIMELINE_DRIFT")
+
+        binding = {
+            "reviewerAgentId": reviewer_agent_id,
+            "claimId": claim["claim_id"],
+            "claimGeneration": claim["generation"],
+            "claimEventId": claim_event["event_id"],
+            "taskStatusEventId": task_event["event_id"],
+            "planReviewId": review["review_id"],
+            "planReviewRound": _decoded_review(review).get("round"),
+            "planReviewRequestId": review_event["request_id"],
+            "planReviewEventId": review_event["event_id"],
+            "planGateEventId": gate_event["event_id"],
+            "startImplementationEventId": start_event["event_id"],
+        }
+        payload = {
+            "protocolVersion": REVIEW_TASK_RECOVERY_PROTOCOL,
+            "workItemId": work_item_id,
+            "taskId": task_id,
+            "from": "IN_PROGRESS",
+            "to": "NOT_STARTED",
+            "humanId": human_id,
+            "reason": reason,
+            "requestId": request_id,
+            "binding": binding,
+        }
+        now = _now()
+        updated_task = connection.execute(
+            "UPDATE tasks SET status='NOT_STARTED',updated_at=? "
+            "WHERE work_item_id=? AND task_id=? AND status='IN_PROGRESS'",
+            (now, work_item_id, task_id),
+        )
+        if updated_task.rowcount != 1:
+            return refused("TASK_NOT_ORPHANED")
+        connection.execute(
+            "UPDATE work_items SET row_version=row_version+1,updated_at=? WHERE work_item_id=?",
+            (now, work_item_id),
+        )
+        _event(
+            connection, work_item_id, request_id, "HUMAN_REVIEW_TASK_RECOVERED",
+            "HUMAN", human_id, payload,
+        )
+        connection.commit()
+        return _review_task_recovery_result(
+            "OK", "RECOVERED", work_item_id, task_id, human_id, reason,
+            request_id, binding,
+        )
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def report_plan_deviation(database, work_item_id, task_id, agent_id, evidence,
                           request_id=None):
     if not isinstance(evidence, dict) or not evidence.get("reason") or not evidence.get("impact"):
@@ -2077,6 +2384,12 @@ def main(argv=None):
     unblock.add_argument("task_id")
     unblock.add_argument("--human", required=True)
     unblock.add_argument("--reason", required=True)
+    recover = sub.add_parser("recover-review-task")
+    recover.add_argument("work_item_id")
+    recover.add_argument("task_id")
+    recover.add_argument("--human")
+    recover.add_argument("--reason")
+    recover.add_argument("--request-id")
     backfill = sub.add_parser("management-backfill")
     backfill.add_argument("work_item_id")
     backfill.add_argument("--agent", required=True)
@@ -2156,6 +2469,14 @@ def main(argv=None):
             _print(set_hold(args.database, args.work_item_id, args.human, args.command == "hold", args.reason))
         elif args.command == "unblock":
             _print(unblock_task(args.database, args.work_item_id, args.task_id, args.human, args.reason))
+        elif args.command == "recover-review-task":
+            result = recover_review_task(
+                args.database, args.work_item_id, args.task_id, args.human,
+                args.reason, args.request_id,
+            )
+            _print(result)
+            if result["status"] == "REFUSED":
+                return 2
         elif args.command == "management-backfill":
             _print(backfill_management(
                 args.database, args.work_item_id, args.agent,

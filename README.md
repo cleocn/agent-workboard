@@ -5,15 +5,15 @@ planner → reviewer → policy gate → implementer → reviewer workflow. It h
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install the 0.3.1b1 Preview
+## Install the 0.3.1b2 Preview
 
 This release is an opt-in, local-only, observation-only Preview. Download the
-wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b1` prerelease, verify both
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b2` prerelease, verify both
 artifacts, then initialize a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b1-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b2-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -36,27 +36,27 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an exact 0.3.0b1 project
+## Upgrade an exact 0.3.1b1 project
 
-Retain the exact old 0.3.0b1 wheel and install the verified 0.3.1b1 wheel. If the
-project uses an official GitHub URL lock, place its verified 0.3.0b1 wheel beside
+Retain the exact old 0.3.1b1 wheel and install the verified 0.3.1b2 wheel. If the
+project uses an official GitHub URL lock, place its verified 0.3.1b1 wheel beside
 the Preview wheel; a local file lock continues to use its recorded path. Always
 run the read-only preflight first, then execute only its one structured
 `nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b1-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b1-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b2-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b2-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
 
-Upgrade accepts only the exact released 0.3.0b1→0.3.1b1 identity pair. It refuses
+Upgrade accepts only the exact released 0.3.1b1→0.3.1b2 identity pair. It refuses
 an invalid database, active claim/writer/Orchestrator lease, identity drift,
 missing or partial source extensions, and customized package-owned Codex files.
-Execution first makes an online backup, preserves `AWB-USAGE-v1`, then installs
-`AWB-ORCHESTRATOR-v1` and `AWB-AUTO-GATE-v1` in one transaction. Existing
-WorkItems remain `MANUAL`. The bound rollback manifest includes the database;
+Execution first makes an online backup, then validates existing `AWB-USAGE-v1`,
+`AWB-ORCHESTRATOR-v1` and `AWB-AUTO-GATE-v1` in one transaction without schema
+DDL. Existing WorkItems preserve their policies. The bound rollback manifest includes the database;
 any post-upgrade workflow or usage write makes rollback fail closed rather than discard data.
 Use `awb upgrade --check --rollback <manifest>` before the exact rollback
 command. Do not restore files or database tables by hand.
@@ -79,6 +79,15 @@ Independent Reviewer and strict 3+1+1 review remain mandatory. Only the latest
 PASS with zero open Findings and valid state/quality evidence can produce a
 `SYSTEM/AUTO_GATE_APPROVED` event. Failures and drift fall back to human
 handling; no HUMAN record is fabricated.
+
+## HUMAN-only orphan Reviewer recovery
+
+`awb lite --project <project> recover-review-task <WorkItem> <Task> --human
+<human-id> --reason <reason> --request-id <unique-id>` can reset only one
+strictly evidenced orphaned PLAN Reviewer task from `IN_PROGRESS` to
+`NOT_STARTED`. It is not a general reset and never unblocks, approves, submits,
+claims, publishes, upgrades, or resumes implementation. Conflicts and runtime
+drift fail closed with zero writes.
 
 ## Usage observation Preview
 

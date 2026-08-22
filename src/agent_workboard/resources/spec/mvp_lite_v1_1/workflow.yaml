@@ -178,6 +178,34 @@ managementPolicy:
   defaultProgress: required_completed_over_required_total
   weightedProgress: {type: FE, explicit: true, stableStageIds: true, weightsTotal: 100}
 
+reviewTaskRecoveryPolicy:
+  protocol: AWB-REVIEW-TASK-RECOVERY-v1
+  command: recover-review-task
+  actor: HUMAN
+  onlyTransition: {from: IN_PROGRESS, to: NOT_STARTED, ownerRole: REVIEWER}
+  requires:
+    - non_empty_human_reason_request_id
+    - non_terminal_managed_work_item
+    - unique_reviewer_task_and_unique_in_progress_task
+    - no_active_claim_or_repository_writer
+    - released_matching_reviewer_claim
+    - structured_plan_review_PASS_open_findings_zero
+    - matching_plan_review_event_and_approved_gate
+    - later_start_implementation
+    - exact_IMPLEMENTING_or_PLAN_DEVIATION_runtime_shape
+    - no_final_review
+    - unique_evidence_binding
+  event:
+    {type: HUMAN_REVIEW_TASK_RECOVERED, actorKind: HUMAN,
+     payloadProtocol: AWB-REVIEW-TASK-RECOVERY-v1}
+  idempotency:
+    exactReplay: NO_OP
+    conflictingReplay: REFUSED_ZERO_WRITE
+    secondRecovery: REFUSED_ZERO_WRITE
+  neverGrants:
+    [unblock, approve, submit, claim, release, publish, deploy, upgrade,
+     remote_write, destructive_action]
+
 implementationQualityPolicy:
   baselineFields: [passedAcceptance, tests, modifiedScope, knownNonBlockingIssues,
                    addressedFindingIds, complexityChanges, regressions]
