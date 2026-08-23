@@ -20,6 +20,7 @@ class _SelectiveJSON(object):
     STRING = "string"
     INTEGER = "integer"
     NUMBER = "number"
+    KIND = "kind"
 
     def __init__(self, data, materialization_audit=None):
         if not isinstance(data, bytes):
@@ -105,6 +106,33 @@ class _SelectiveJSON(object):
         while self.pos < self.length and self.data[self.pos] not in b",}] \t\r\n":
             self.pos += 1
 
+    def _lexical_kind(self):
+        """Return a JSON value's lexical kind without materializing its value."""
+        self._ws()
+        if self.pos >= self.length:
+            raise AdapterError("missing JSON value", "MALFORMED_JSON")
+        byte = self.data[self.pos]
+        if byte == 34:
+            self._skip_string()
+            return "string"
+        if byte == 123:
+            self._skip()
+            return "object"
+        if byte == 91:
+            self._skip()
+            return "array"
+        start = self.pos
+        self._skip()
+        token = self.data[start:self.pos]
+        if token == b"null":
+            return "null"
+        if token in (b"true", b"false"):
+            return "boolean"
+        signless = token[1:] if token.startswith(b"-") else token
+        if signless and (signless[:1].isdigit()):
+            return "number"
+        raise AdapterError("selected JSON value had invalid lexical kind", "MALFORMED_JSON")
+
     def _lexical_number(self, integer_only):
         self._ws()
         start = self.pos
@@ -135,6 +163,8 @@ class _SelectiveJSON(object):
             return self._lexical_number(True)
         if tree == self.NUMBER:
             return self._lexical_number(False)
+        if tree == self.KIND:
+            return self._lexical_kind()
         if self.pos >= self.length or self.data[self.pos] != 123:
             raise AdapterError("selected usage object was not an object", "SCHEMA_DRIFT")
         self.pos += 1
@@ -157,6 +187,8 @@ class _SelectiveJSON(object):
                     output_key = key.decode("utf-8")
                 except UnicodeDecodeError:
                     raise AdapterError("selected object key was invalid", "SCHEMA_DRIFT")
+                if output_key in output:
+                    raise AdapterError("duplicate selected object field", "SCHEMA_DRIFT")
                 output[output_key] = self._selected(branch)
             self._ws()
             if self.pos < self.length and self.data[self.pos] == 44:
@@ -178,14 +210,18 @@ class _SelectiveJSON(object):
 _STRING = _SelectiveJSON.STRING
 _INTEGER = _SelectiveJSON.INTEGER
 _NUMBER = _SelectiveJSON.NUMBER
+_KIND = _SelectiveJSON.KIND
 _DISCRIMINATOR_TREE = {b"type": _STRING, b"payload": {b"type": _STRING}}
-_SESSION_TREE = {
+_SESSION_BASE_TREE = {
     b"timestamp": _STRING, b"type": _STRING,
     b"payload": {
         b"id": _STRING, b"session_id": _STRING, b"parent_thread_id": _STRING,
         b"cli_version": _STRING,
-        b"source": {b"subagent": {b"agent_role": _STRING}},
     },
+}
+_SESSION_SOURCE_KIND_TREE = {b"payload": {b"source": _KIND}}
+_SESSION_SOURCE_OBJECT_TREE = {
+    b"payload": {b"source": {b"subagent": {b"agent_role": _STRING}}},
 }
 _TOKEN_TREE = {
     b"timestamp": _STRING, b"type": _STRING,
@@ -226,6 +262,7 @@ class CodexLocalAdapter(object):
     provider = "codex-local"
     adapter_version = "codex-local-v1"
     parser_version = "codex-local-selective-v2"
+    multi_metadata_parser_version = "codex-local-selective-v3"
 
     def __init__(self, sessions_root=None, materialization_audit=None):
         configured = sessions_root or os.path.join(os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex")), "sessions")
@@ -257,8 +294,11 @@ class CodexLocalAdapter(object):
         return matches[0]
 
     def read(self, session_id):
+        self.parser_version = "codex-local-selective-v2"
         path = self._locate(session_id)
         identity, snapshots, quota = None, [], []
+        metadata_ids, expected_ancestor = set(), None
+        metadata_count, token_seen = 0, False
         with open(path, "rb") as handle:
             for ordinal, line in enumerate(handle, 1):
                 raw = line.rstrip(b"\r\n")
@@ -267,15 +307,46 @@ class CodexLocalAdapter(object):
                 record_type = discriminator.get("type")
                 event_subtype = discriminator.get("payload", {}).get("type")
                 if record_type == "session_meta":
+                    if token_seen:
+                        raise AdapterError("session metadata followed token count", "SCHEMA_DRIFT")
                     selected = _SelectiveJSON(
-                        raw, self.materialization_audit).parse(_SESSION_TREE)
+                        raw, self.materialization_audit).parse(_SESSION_BASE_TREE)
                     payload = selected.get("payload", {})
-                    if identity is not None:
-                        raise AdapterError("duplicate session metadata", "SCHEMA_DRIFT")
-                    identity = {"id": payload.get("id"), "parent_session_id": payload.get("parent_thread_id"),
-                                "cli_version": payload.get("cli_version"),
-                                "agent_role": payload.get("source", {}).get("subagent", {}).get("agent_role")}
+                    current_id = payload.get("id")
+                    if not isinstance(current_id, str) or not current_id:
+                        raise AdapterError("session metadata identity is missing", "SCHEMA_DRIFT")
+                    if current_id in metadata_ids:
+                        raise AdapterError("session metadata identity was repeated", "SCHEMA_DRIFT")
+                    if metadata_count == 0:
+                        if current_id != session_id:
+                            raise AdapterError("session metadata head mismatch", "SESSION_ID_MISMATCH")
+                    elif current_id != expected_ancestor:
+                        raise AdapterError("session metadata ancestor chain is broken", "SCHEMA_DRIFT")
+                    source_shape = _SelectiveJSON(
+                        raw, self.materialization_audit).parse(_SESSION_SOURCE_KIND_TREE)
+                    source_kind = source_shape.get("payload", {}).get("source")
+                    agent_role = None
+                    if source_kind == "object" and metadata_count == 0:
+                        source_selected = _SelectiveJSON(
+                            raw, self.materialization_audit).parse(_SESSION_SOURCE_OBJECT_TREE)
+                        agent_role = source_selected.get("payload", {}).get(
+                            "source", {}).get("subagent", {}).get("agent_role")
+                    elif source_kind not in (None, "string", "object"):
+                        raise AdapterError("session source shape is unsupported", "SCHEMA_DRIFT")
+                    if metadata_count == 0:
+                        identity = {"id": current_id,
+                                    "parent_session_id": payload.get("parent_thread_id"),
+                                    "cli_version": payload.get("cli_version"),
+                                    "agent_role": agent_role}
+                    else:
+                        self.parser_version = self.multi_metadata_parser_version
+                    metadata_ids.add(current_id)
+                    expected_ancestor = payload.get("parent_thread_id")
+                    metadata_count += 1
                 elif record_type == "event_msg" and event_subtype == "token_count":
+                    if identity is None:
+                        raise AdapterError("token count preceded session metadata", "SCHEMA_DRIFT")
+                    token_seen = True
                     selected = _SelectiveJSON(
                         raw, self.materialization_audit).parse(_TOKEN_TREE)
                     payload = selected.get("payload", {})

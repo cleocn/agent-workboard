@@ -42,7 +42,7 @@
     },
     {
       "path": ".codex/skills/awb-orchestrator/references/upgrade-and-rollback.md",
-      "sha256": "9608ca5efccc8127ca7796942caeb2b17055c2cb9ec5905ae022ca26169f1d56"
+      "sha256": "b723f4d5809486b9794d2b845889f77da44b58ca227fdd27cecaa0bbeea2de82"
     },
     {
       "path": ".gitignore",
@@ -50,7 +50,7 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "1c90dc1421e677e1d2b528153929cc30ea5f118857ba60f65c4a1f9a20eb6713"
+      "sha256": "3b1e86c56bd7a33ebc0f0ce411deb6c804334b0290735eef6b07327d8abdcb1b"
     },
     {
       "path": "CONTRIBUTING.md",
@@ -62,7 +62,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "2b3f37eb24ca3b0e42d04ffb9b6c91727fbb6b5ab294b506de016524c699f1a4"
+      "sha256": "0bc0cdec1b16ed2bff6b6c98600ceb10f69bf3a36a2a87ddf549c78178e47b52"
     },
     {
       "path": "docs/evidence/awb-004-release.md",
@@ -85,6 +85,10 @@
       "sha256": "09da67cd274c09bf2b0ba32bf779923164129d8ceb065d9904f55240e3ccf314"
     },
     {
+      "path": "docs/evidence/awb-019-release.md",
+      "sha256": "18ff072103a25b074e101681c4898d16560bf921dbda4bcd82aa181febb59199"
+    },
+    {
       "path": "docs/history.md",
       "sha256": "17a3c1ea157045b75b27151b4c25d6b6f0f5cc9758adbaa92875decf07988b18"
     },
@@ -98,7 +102,7 @@
     },
     {
       "path": "docs/usage/quickstart.md",
-      "sha256": "ed857c49c21bd90b553940d7c809fecd6c696b9a87b2d67ec37e997beba35891"
+      "sha256": "2e2a8b0b5f00049147adcd5f49bd171c31d427f550d9d5bd236c5ea5fa927ddc"
     },
     {
       "path": "docs/work-item-templates/README.md",
@@ -142,7 +146,7 @@
     },
     {
       "path": "src/agent_workboard/__init__.py",
-      "sha256": "cbfb2863e20a965ef7b3d0a78e2e0f9f3f95dc27b925c7206c693475a0fa7ad1"
+      "sha256": "854dcc3442fc37c8dff6e0a22198950df16c52a411ac22571857fbd825af4931"
     },
     {
       "path": "src/agent_workboard/__main__.py",
@@ -150,7 +154,7 @@
     },
     {
       "path": "src/agent_workboard/_build.py",
-      "sha256": "3965549ec50737259f4a53e8c9e48342c9d06f7eadd334a594f23b2de9135ed8"
+      "sha256": "9feee8e4812f90eab07ed16a6e736f508699d21e8fc4722e28235d7d88dfd300"
     },
     {
       "path": "src/agent_workboard/cli.py",
@@ -166,7 +170,7 @@
     },
     {
       "path": "src/agent_workboard/project.py",
-      "sha256": "f7f7f21b1f1f490f9b99e14aad95700be51de2ec83ecd4a9da737257b83f5e45"
+      "sha256": "e711079a052e71c7d0fdc7996547117d926092cf12d9d43b739ef155a9fe6e92"
     },
     {
       "path": "src/agent_workboard/resources/codex/agents/convergence-reviewer.toml",
@@ -194,7 +198,7 @@
     },
     {
       "path": "src/agent_workboard/resources/codex/skills/awb-orchestrator/references/upgrade-and-rollback.md",
-      "sha256": "9608ca5efccc8127ca7796942caeb2b17055c2cb9ec5905ae022ca26169f1d56"
+      "sha256": "b723f4d5809486b9794d2b845889f77da44b58ca227fdd27cecaa0bbeea2de82"
     },
     {
       "path": "src/agent_workboard/resources/spec/mvp_lite_v1_1/AGENT-GUIDE.md",
@@ -258,7 +262,7 @@
     },
     {
       "path": "src/agent_workboard/usage_adapters/codex_local.py",
-      "sha256": "e55dba5c6ad78d797951fec097f67e1127c64ce08400d47b9650ef7dd185e03d"
+      "sha256": "80c5534bff4596803a869906f336576bffb4f6c20955609e818931c51b852a0a"
     },
     {
       "path": "tests/fixtures/requirements-local-wheel.txt",
@@ -274,26 +278,26 @@
     },
     {
       "path": "tests/test_project.py",
-      "sha256": "480631186ef849189abaf3766f44e4d6edae393ef0f236f54571c92990a8f3c1"
+      "sha256": "257e4f8a97a6b956eea18a3644f9abaac0038c0181bf7bbc1984dd4ae5f571b2"
     },
     {
       "path": "tests/test_release_build.py",
-      "sha256": "a2b7eade9dbc239c457c590d15885b6d6d26ead5556a76c5559b1d877b8f788b"
+      "sha256": "f613342d7425f22c2a23ada54df77eaf4f035415afae32774d1f760d9bcc9639"
     },
     {
       "path": "tests/test_release_gate.py",
-      "sha256": "ade2a2457e813128f11cb1a930790f80c34980b01e6ff9e717e9d7c3a11073fc"
+      "sha256": "a189b82e5e171d5d19f3d243c688cfde8f0d569d9b66ca004c393e4e6fbbd034"
     },
     {
       "path": "tests/test_usage.py",
-      "sha256": "6c729e8804bbe376558ef891cf76ed150a75231ff0e622039c247b71f74a4fbc"
+      "sha256": "4bc8b2b0ef70098586d2b99cb1655688852f336463b8d4fdd78d1beb8704d41d"
     },
     {
       "path": "tools/release_gate.py",
-      "sha256": "b7eb8e04e46a78dbf60f7114420e40101ae24c6417962221bdda9e8993241f5a"
+      "sha256": "a415bc8fc5155e0f42cabcd9af397b60eb77e4e9d290e72de26eab4e83648782"
     }
   ],
-  "manifestVersion": "AWB-018-public-v1",
+  "manifestVersion": "AWB-019-public-v1",
   "scope": "candidate tracked public source files excluding this non-recursive manifest",
-  "status": "AGENT WORKBOARD 0.3.1b2 PREVIEW RELEASE TREE"
+  "status": "AGENT WORKBOARD 0.3.1b3 PREVIEW RELEASE TREE"
 }

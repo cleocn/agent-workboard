@@ -1,11 +1,11 @@
 # Quickstart
 
-Agent Workboard 0.3.1b2 is an opt-in, local-only, observation-only Preview. Use
+Agent Workboard 0.3.1b3 is an opt-in, local-only, observation-only Preview. Use
 a hash-verified GitHub prerelease wheel, then initialize and inspect a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b2-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b3-py3-none-any.whl
 awb init --project ./example
 awb doctor --project ./example
 awb lite --project ./example list
@@ -14,13 +14,13 @@ awb lite --project ./example list
 Use `awb bootstrap --project ./example` when a managed project has no database
 yet. Do not point a stable project at an arbitrary database path.
 
-For an exact verified 0.3.1b1 project, retain its old wheel and install the
-verified 0.3.1b2 Preview wheel. Run the zero-write check first and execute only
+For an exact verified 0.3.1b2 project, retain its old wheel and install the
+verified 0.3.1b3 Preview wheel. Run the zero-write check first and execute only
 its single structured `nextStep`:
 
 ```bash
-awb upgrade --check --project ./example --wheel ./agent_workboard-0.3.1b2-py3-none-any.whl --with-codex
-awb upgrade --project ./example --wheel ./agent_workboard-0.3.1b2-py3-none-any.whl --with-codex
+awb upgrade --check --project ./example --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
+awb upgrade --project ./example --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
 awb doctor --project ./example
 awb codex check --project ./example
 ```
@@ -47,8 +47,9 @@ awb usage show AWB-123 --project ./example --group-by role
 awb usage export --project ./example --work-item AWB-123 --group-by role --format json --output usage-redacted.json
 ```
 
-The `codex-local` adapter consumes only allowlisted metadata and cumulative
-counter snapshots. It treats that local schema as `OBSERVED` and fails closed on
+The `codex-local` adapter accepts a single requested-head metadata record as
+parser v2 or a strict requested-head-to-ancestor chain as parser v3, then consumes only
+allowlisted metadata and cumulative counter snapshots. It treats that local schema as `OBSERVED` and fails closed on
 unknown input. Exports hash session identifiers and contain no local paths;
 prompts, responses, tool output, source, credentials, session files and
 databases are neither exported nor uploaded.

@@ -7,17 +7,17 @@ Protocol: `AWB-UPGRADE-RUNBOOK-v1`
 Use this runbook only for an existing stable managed project with
 `.awb/config.json` and an exact source/target pair listed by the installed AWB
 release. The current Preview matrix supports only the exact released
-`0.3.1b1/v0.3.1b1` identity to the exact running `0.3.1b2/v0.3.1b2` wheel, and
-an exact same-identity 0.3.1b2 no-op when the usage, Orchestrator, and auto-gate
+`0.3.1b2/v0.3.1b2` identity to the exact running `0.3.1b3/v0.3.1b3` wheel, and
+an exact same-identity 0.3.1b3 no-op when the usage, Orchestrator, and auto-gate
 schemas are installed and valid. This recovery-only hotfix performs no schema DDL.
 
 ## DOES_NOT_APPLY
 
 Do not use it for a new project, a development database, standalone `awb
 migrate`, package download or publication, a remote consumer migration, a
-direct `0.3.0b1` or earlier jump, or any unlisted future version. Never infer
+direct `0.3.1b1` or earlier jump, or any unlisted future version. Never infer
 compatibility from a semantic-version wildcard; older projects must first reach
-exact 0.3.1b1 with the released 0.3.1b1 procedure.
+exact 0.3.1b2 with the released 0.3.1b2 procedure.
 
 ## AUTHORITY
 
@@ -64,8 +64,8 @@ single `nextStep`, then run preflight again.
 
 Stop for an unsupported identity/pair, source or target drift, active claim,
 repository writer, or Orchestrator lease, a missing or invalid usage,
-Orchestrator, or auto-gate extension on the 0.3.1b1 source or same-identity
-0.3.1b2 project,
+Orchestrator, or auto-gate extension on the 0.3.1b2 source or same-identity
+0.3.1b3 project,
 customized/unowned/symlink Codex content, wrong project, path traversal,
 duplicate target, manifest replay, or any live/backup/staging hash drift. Do not
 delete, copy, or edit files by hand to bypass the refusal.

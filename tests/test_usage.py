@@ -78,6 +78,46 @@ class UsageObservationTest(unittest.TestCase):
                        "payload": {"type": "token_count", "info": info,
                                    "message": self.sentinel}})
 
+    def source_fixture(self, source=None, include_source=True):
+        payload = {"id": self.session_id, "session_id": "parent",
+                   "cli_version": "0.148.0", "base_instructions": self.sentinel,
+                   "cwd": "/private/secret/path"}
+        if include_source:
+            payload["source"] = source
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "timestamp": "2026-08-22T00:00:00+00:00", "type": "session_meta",
+                "payload": payload}, sort_keys=True) + "\n")
+        self.line({"timestamp": "2026-08-22T00:00:02+00:00", "type": "event_msg",
+                   "payload": {"type": "token_count", "info": {
+                       "total_token_usage": self.counters(),
+                       "last_token_usage": self.counters(1, 0, 0, 1, 0),
+                       "summary": self.sentinel}, "message": self.sentinel}})
+
+    def session_meta(self, identity, parent=None, include_parent=False,
+                     source=None, include_source=False):
+        payload = {"id": identity, "session_id": "opaque-session",
+                   "cli_version": "0.148.0", "base_instructions": self.sentinel,
+                   "cwd": "/private/secret/path"}
+        if include_parent:
+            payload["parent_thread_id"] = parent
+        if include_source:
+            payload["source"] = source
+        return {"timestamp": "2026-08-22T00:00:00+00:00", "type": "session_meta",
+                "payload": payload}
+
+    def token_record(self, counters=None):
+        return {"timestamp": "2026-08-22T00:00:02+00:00", "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "total_token_usage": counters or self.counters(),
+                    "last_token_usage": self.counters(1, 0, 0, 1, 0),
+                    "summary": self.sentinel}, "message": self.sentinel}}
+
+    def records_fixture(self, records):
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+
     def counters(self, input_tokens=100, cached=40, cache_write=10,
                  output=20, reasoning=5, extensions=None):
         return {"input_tokens": input_tokens, "cached_input_tokens": cached,
@@ -130,6 +170,245 @@ class UsageObservationTest(unittest.TestCase):
         self.assertEqual(self.session_id, parsed["identity"]["id"])
         self.assertEqual(1, len(parsed["snapshots"]))
         self.assertEqual(1, len(parsed["quota"]))
+
+    def test_session_source_union_is_private_and_snapshot_stable(self):
+        cases = (
+            ("object", {"subagent": {"agent_role": "implementer",
+                                       "prompt": self.sentinel}}, True, "implementer"),
+            ("string", self.sentinel, True, None),
+            ("missing", None, False, None),
+        )
+        snapshot_keys = []
+        for label, source, include_source, expected_role in cases:
+            with self.subTest(source=label):
+                self.source_fixture(source, include_source)
+                materialized = []
+                parsed = CodexLocalAdapter(
+                    self.sessions, materialization_audit=materialized.append).read(
+                        self.session_id)
+                encoded = json.dumps(parsed, sort_keys=True)
+                self.assertEqual(expected_role, parsed["identity"]["agent_role"])
+                self.assertEqual("codex-local-v1", parsed["snapshots"][0]["adapter_version"])
+                self.assertEqual("codex-local-selective-v2",
+                                 parsed["snapshots"][0]["parser_version"])
+                self.assertNotIn(self.sentinel, materialized)
+                self.assertNotIn(self.sentinel, encoded)
+                self.assertNotIn("/private/secret/path", encoded)
+                snapshot_keys.append(parsed["snapshots"][0]["source_snapshot_key"])
+        self.assertEqual(1, len(set(snapshot_keys)))
+
+        ancestor_one = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        ancestor_two = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        self.records_fixture([
+            self.session_meta(self.session_id, ancestor_one, True,
+                              {"subagent": {"agent_role": "implementer",
+                                             "prompt": self.sentinel}}, True),
+            self.session_meta(ancestor_one, ancestor_two, True, self.sentinel, True),
+            self.session_meta(ancestor_two, source={"subagent": {
+                "agent_role": "reviewer", "prompt": self.sentinel}}, include_source=True),
+            self.token_record(),
+        ])
+        materialized = []
+        adapter = CodexLocalAdapter(self.sessions, materialization_audit=materialized.append)
+        parsed = adapter.read(self.session_id)
+        self.assertEqual(self.session_id, parsed["identity"]["id"])
+        self.assertEqual("implementer", parsed["identity"]["agent_role"])
+        self.assertEqual("codex-local-selective-v3", adapter.parser_version)
+        self.assertEqual("codex-local-selective-v3",
+                         parsed["snapshots"][0]["parser_version"])
+        self.assertNotIn("reviewer", parsed["identity"].values())
+        self.assertNotIn(self.sentinel, materialized)
+        self.assertNotIn(self.sentinel, json.dumps(parsed, sort_keys=True))
+
+        self.source_fixture(self.sentinel)
+        parsed = adapter.read(self.session_id)
+        self.assertEqual("codex-local-selective-v2", adapter.parser_version)
+        self.assertEqual("codex-local-selective-v2",
+                         parsed["snapshots"][0]["parser_version"])
+
+    def test_invalid_session_source_shapes_fail_closed_without_materialization(self):
+        cases = (("null", None), ("array", [self.sentinel]),
+                 ("number", 7), ("boolean", True))
+        for label, source in cases:
+            with self.subTest(source=label):
+                self.source_fixture(source)
+                materialized = []
+                with self.assertRaises(AdapterError) as raised:
+                    CodexLocalAdapter(
+                        self.sessions, materialization_audit=materialized.append).read(
+                            self.session_id)
+                self.assertEqual("SCHEMA_DRIFT", raised.exception.reason_code)
+                self.assertNotIn(self.sentinel, materialized)
+                self.assertNotIn(self.sentinel, str(raised.exception))
+
+                ancestor = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                self.records_fixture([
+                    self.session_meta(self.session_id, ancestor, True,
+                                      {"subagent": {"agent_role": "implementer"}}, True),
+                    self.session_meta(ancestor, source=source, include_source=True),
+                    self.token_record(),
+                ])
+                materialized = []
+                with self.assertRaises(AdapterError) as ancestor_error:
+                    CodexLocalAdapter(
+                        self.sessions, materialization_audit=materialized.append).read(
+                            self.session_id)
+                self.assertEqual("SCHEMA_DRIFT", ancestor_error.exception.reason_code)
+                self.assertNotIn(self.sentinel, materialized)
+                self.assertNotIn(self.sentinel, str(ancestor_error.exception))
+
+    def test_duplicate_escaped_and_malformed_session_source_fail_closed(self):
+        meta = ('{"timestamp":"2026-08-22T00:00:00+00:00",'
+                '"type":"session_meta","payload":{"id":"%s",'
+                '"source":"opaque","source":"opaque-two"}}\n' % self.session_id)
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            handle.write(meta)
+        with self.assertRaises(AdapterError) as duplicate:
+            CodexLocalAdapter(self.sessions).read(self.session_id)
+        self.assertEqual("SCHEMA_DRIFT", duplicate.exception.reason_code)
+
+        escaped = meta.replace('"source":"opaque","source":"opaque-two"',
+                               '"so\\u0075rce":"opaque"')
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            handle.write(escaped)
+        with self.assertRaises(AdapterError) as escaped_error:
+            CodexLocalAdapter(self.sessions).read(self.session_id)
+        self.assertEqual("SCHEMA_DRIFT", escaped_error.exception.reason_code)
+
+        malformed = meta.replace('"source":"opaque","source":"opaque-two"',
+                                 '"source":[}')
+        with open(self.session_path, "w", encoding="utf-8") as handle:
+            handle.write(malformed)
+        with self.assertRaises(AdapterError) as malformed_error:
+            CodexLocalAdapter(self.sessions).read(self.session_id)
+        self.assertEqual("MALFORMED_JSON", malformed_error.exception.reason_code)
+
+        ancestor = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        other = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        lineage_cases = (
+            ("broken", [self.session_meta(self.session_id, ancestor, True),
+                        self.session_meta(other), self.token_record()], "SCHEMA_DRIFT"),
+            ("cycle", [self.session_meta(self.session_id, ancestor, True),
+                       self.session_meta(ancestor, self.session_id, True),
+                       self.session_meta(self.session_id), self.token_record()], "SCHEMA_DRIFT"),
+            ("duplicate", [self.session_meta(self.session_id, ancestor, True),
+                           self.session_meta(ancestor, ancestor, True),
+                           self.session_meta(ancestor), self.token_record()], "SCHEMA_DRIFT"),
+            ("requested-not-head", [self.session_meta(ancestor, self.session_id, True),
+                                    self.session_meta(self.session_id), self.token_record()],
+             "SESSION_ID_MISMATCH"),
+            ("metadata-after-token", [self.session_meta(self.session_id, ancestor, True),
+                                      self.token_record(), self.session_meta(ancestor)],
+             "SCHEMA_DRIFT"),
+            ("token-before-lineage", [self.token_record(), self.session_meta(self.session_id)],
+             "SCHEMA_DRIFT"),
+            ("multiple-requested", [self.session_meta(
+                self.session_id, self.session_id, True),
+                self.session_meta(self.session_id), self.token_record()], "SCHEMA_DRIFT"),
+            ("missing-parent", [self.session_meta(self.session_id),
+                                self.session_meta(ancestor), self.token_record()], "SCHEMA_DRIFT"),
+            ("null-parent", [self.session_meta(self.session_id, None, True),
+                             self.session_meta(ancestor), self.token_record()], "MALFORMED_JSON"),
+        )
+        for label, records, reason_code in lineage_cases:
+            with self.subTest(lineage=label):
+                self.records_fixture(records)
+                materialized = []
+                with self.assertRaises(AdapterError) as lineage_error:
+                    CodexLocalAdapter(
+                        self.sessions, materialization_audit=materialized.append).read(
+                            self.session_id)
+                self.assertEqual(reason_code, lineage_error.exception.reason_code)
+                self.assertNotIn(self.sentinel, materialized)
+                self.assertNotIn(self.sentinel, str(lineage_error.exception))
+
+    def test_root_string_source_claim_binding_is_atomic_and_private(self):
+        self.source_fixture(self.sentinel)
+        self.create()
+        result = acquire_claim(
+            self.database, "AWB-101", "AWB-101-T01", "planner", "PLANNER",
+            self.expires(), session_id=self.session_id, usage_provider="codex-local",
+            model="gpt-5.6-terra", sessions_root=self.sessions)
+        self.assertTrue(result["claimId"].startswith("claim-"))
+        connection = open_database(self.database)
+        try:
+            stored = "\n".join(row[0] for row in connection.execute(
+                "SELECT payload_json FROM usage_events").fetchall())
+            self.assertEqual(1, connection.execute(
+                "SELECT count(*) FROM usage_events "
+                "WHERE event_type='USAGE_BINDING_RECORDED'").fetchone()[0])
+        finally:
+            connection.close()
+        self.assertNotIn(self.sentinel, stored)
+        self.assertNotIn(self.sessions, stored)
+
+        ancestor = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        self.records_fixture([
+            self.session_meta(self.session_id, ancestor, True,
+                              {"subagent": {"agent_role": "planner",
+                                             "prompt": self.sentinel}}, True),
+            self.session_meta(ancestor, source=self.sentinel, include_source=True),
+            self.token_record(),
+        ])
+        multi_database = os.path.join(self.temporary.name, "multi-workboard.db")
+        initialize_database(multi_database)
+        create_work_item(multi_database, "AWB-102", "AWB", "usage",
+                         management=self.management("AWB-102"))
+        acquire_claim(
+            multi_database, "AWB-102", "AWB-102-T01", "planner-v3", "PLANNER",
+            self.expires(), session_id=self.session_id, usage_provider="codex-local",
+            model="gpt-5.6-terra", sessions_root=self.sessions)
+        connection = open_database(multi_database)
+        try:
+            payload = json.loads(connection.execute(
+                "SELECT payload_json FROM usage_events "
+                "WHERE event_type='USAGE_BINDING_RECORDED' AND work_item_id='AWB-102'"
+            ).fetchone()[0])
+            stored = "\n".join(row[0] for row in connection.execute(
+                "SELECT payload_json FROM usage_events").fetchall())
+        finally:
+            connection.close()
+        self.assertEqual("codex-local-selective-v3", payload["parserVersion"])
+        self.assertEqual("OBSERVED", payload["baselineStatus"])
+        self.assertNotIn(self.sentinel, stored)
+        self.assertNotIn(self.sessions, stored)
+
+    def test_invalid_source_rejects_claim_before_any_workflow_write(self):
+        self.source_fixture(None)
+        self.create()
+        with self.assertRaises(LiteError) as raised:
+            acquire_claim(
+                self.database, "AWB-101", "AWB-101-T01", "planner", "PLANNER",
+                self.expires(), session_id=self.session_id, usage_provider="codex-local",
+                model="gpt-5.6-terra", sessions_root=self.sessions)
+        self.assertNotIn(self.sentinel, str(raised.exception))
+        connection = open_database(self.database)
+        try:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM claims").fetchone()[0])
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM usage_events").fetchone()[0])
+        finally:
+            connection.close()
+
+        ancestor = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        other = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        self.records_fixture([
+            self.session_meta(self.session_id, ancestor, True,
+                              {"subagent": {"agent_role": "planner"}}, True),
+            self.session_meta(other, source=self.sentinel, include_source=True),
+            self.token_record(),
+        ])
+        with self.assertRaises(LiteError) as lineage_error:
+            acquire_claim(
+                self.database, "AWB-101", "AWB-101-T01", "planner", "PLANNER",
+                self.expires(), session_id=self.session_id, usage_provider="codex-local",
+                model="gpt-5.6-terra", sessions_root=self.sessions)
+        self.assertNotIn(self.sentinel, str(lineage_error.exception))
+        connection = open_database(self.database)
+        try:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM claims").fetchone()[0])
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM usage_events").fetchone()[0])
+        finally:
+            connection.close()
 
     def test_non_usage_payload_and_invalid_counter_string_are_never_materialized(self):
         self.fixture(self.counters(), quota=False)
@@ -274,10 +553,14 @@ class UsageObservationTest(unittest.TestCase):
         self.assertEqual(2, len(report["quotaWindows"]))
 
     def test_claim_boundary_skips_all_pre_binding_snapshots(self):
-        self.fixture(self.counters(10, 2, 0, 2, 1), quota=False)
-        self.line({"timestamp": "2026-08-22T00:00:03+00:00", "type": "event_msg",
-                   "payload": {"type": "token_count", "info": {
-                       "total_token_usage": self.counters(50, 10, 0, 10, 2)}}})
+        ancestor = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        self.records_fixture([
+            self.session_meta(self.session_id, ancestor, True,
+                              {"subagent": {"agent_role": "planner"}}, True),
+            self.session_meta(ancestor, source=self.sentinel, include_source=True),
+            self.token_record(self.counters(10, 2, 0, 2, 1)),
+            self.token_record(self.counters(50, 10, 0, 10, 2)),
+        ])
         self.create()
         acquire_claim(self.database, "AWB-101", "AWB-101-T01", "planner", "PLANNER",
                       self.expires(), session_id=self.session_id, usage_provider="codex-local",

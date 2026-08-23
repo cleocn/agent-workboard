@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1b3 Preview
+
+- Accept Codex 0.148 multi-`session_meta` records only as a strict, unique
+  requested-HEAD-to-ancestor chain; keep single metadata on parser v2 and mark
+  legal multi-metadata input as parser v3.
+- Keep the claim role authoritative, inspect only the HEAD source role as a
+  quality cross-check, and fail closed on broken, reordered, duplicate, cyclic,
+  ambiguous, or post-token metadata without materializing session content.
+- Support only exact 0.3.1b2→0.3.1b3 backup-first upgrades with no schema DDL,
+  database-bound rollback, and same-identity no-op validation.
+- Keep AWB-010 unstarted, usage evidence pre-cohort, and PyPI, stable/GA,
+  consumer migration, runner, daemon, and remote-control claims out of scope.
+
 ## 0.3.1b2 Preview
 
 - Add a HUMAN-only, fail-closed `recover-review-task` command for one precisely

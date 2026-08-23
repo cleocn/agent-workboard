@@ -5,15 +5,15 @@ planner → reviewer → policy gate → implementer → reviewer workflow. It h
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install the 0.3.1b2 Preview
+## Install the 0.3.1b3 Preview
 
 This release is an opt-in, local-only, observation-only Preview. Download the
-wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b2` prerelease, verify both
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b3` prerelease, verify both
 artifacts, then initialize a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b2-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b3-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -36,22 +36,22 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an exact 0.3.1b1 project
+## Upgrade an exact 0.3.1b2 project
 
-Retain the exact old 0.3.1b1 wheel and install the verified 0.3.1b2 wheel. If the
-project uses an official GitHub URL lock, place its verified 0.3.1b1 wheel beside
+Retain the exact old 0.3.1b2 wheel and install the verified 0.3.1b3 wheel. If the
+project uses an official GitHub URL lock, place its verified 0.3.1b2 wheel beside
 the Preview wheel; a local file lock continues to use its recorded path. Always
 run the read-only preflight first, then execute only its one structured
 `nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b2-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b2-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
 
-Upgrade accepts only the exact released 0.3.1b1→0.3.1b2 identity pair. It refuses
+Upgrade accepts only the exact released 0.3.1b2→0.3.1b3 identity pair. It refuses
 an invalid database, active claim/writer/Orchestrator lease, identity drift,
 missing or partial source extensions, and customized package-owned Codex files.
 Execution first makes an online backup, then validates existing `AWB-USAGE-v1`,
@@ -93,7 +93,8 @@ drift fail closed with zero writes.
 
 Usage collection is off until sessions are explicitly bound and `awb usage
 sync` is invoked. The `codex-local` adapter observes a local, non-public schema
-and fails closed on drift. It reads only allowlisted session metadata and usage
+and fails closed on drift. It accepts a single requested-head metadata record as
+parser v2 or a strict requested-head-to-ancestor chain as parser v3, then reads only allowlisted metadata and usage
 counters; it does not upload prompts, responses, tool output, source, sessions
 or databases. See `docs/usage/quickstart.md` for the opt-in workflow.
 
