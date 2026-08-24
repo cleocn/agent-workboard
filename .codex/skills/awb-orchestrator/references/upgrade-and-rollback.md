@@ -6,9 +6,10 @@ Protocol: `AWB-UPGRADE-RUNBOOK-v1`
 
 Use this runbook only for an existing stable managed project with
 `.awb/config.json` and an exact source/target pair listed by the installed AWB
-release. The current Preview matrix supports only the exact released
-`0.3.1b3/v0.3.1b3` identity to the exact running `0.3.1b4/v0.3.1b4` wheel, and
-an exact same-identity 0.3.1b4 no-op when the usage, Orchestrator, and auto-gate
+release. The current Preview matrix supports exact released
+`0.3.1b3/v0.3.1b3` and `0.3.1b4/v0.3.1b4` identities directly to the exact
+running `0.3.1b5/v0.3.1b5` wheel, and an exact same-identity 0.3.1b5 no-op when
+the usage, Orchestrator, and auto-gate
 schemas are installed and valid. This recovery-only hotfix performs no schema DDL.
 
 ## DOES_NOT_APPLY
@@ -43,6 +44,15 @@ awb upgrade --check --project <project> --rollback <exact-manifest>
 Do not perform the write unless the result is `READY` and contains exactly one
 non-empty `nextStep` object.
 
+The check distinguishes effective LIVE activity from persisted ACTIVE rows
+whose expiry has passed. LIVE (including mixed LIVE plus stale) returns one
+`STOP_LIVE_ACTIVITY_OWNER_AND_RECHECK` step and performs no write. Stale-only
+returns one `EXECUTE_UPGRADE_WITH_RECONCILIATION` step containing the exact
+`expectedStaleActivity` fingerprint and `reconciliationRequestId`; pass those
+arguments unchanged to `awb upgrade`. The target wheel creates and verifies the
+backup first, rechecks the snapshot, reconciles it transactionally, and then
+upgrades. No manual cleanup or SQLite command is part of the consumer path.
+
 ## RESULT_READY
 
 Execute only the single `nextStep`, with its exact project, wheel, Codex flag, or
@@ -65,7 +75,7 @@ single `nextStep`, then run preflight again.
 Stop for an unsupported identity/pair, source or target drift, active claim,
 repository writer, or Orchestrator lease, a missing or invalid usage,
 Orchestrator, or auto-gate extension on the 0.3.1b3 source or same-identity
-0.3.1b4 project,
+0.3.1b5 project,
 customized/unowned/symlink Codex content, wrong project, path traversal,
 duplicate target, manifest replay, or any live/backup/staging hash drift. Do not
 delete, copy, or edit files by hand to bypass the refusal.

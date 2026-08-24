@@ -15,9 +15,10 @@ from agent_workboard.lite import (LiteError, acquire_claim, acquire_repository_l
                                   open_database, release_claim,
                                   release_repository_lock, set_task_status)
 from agent_workboard.orchestrator import (ORCHESTRATOR_SCHEMA_VERSION, claim,
-                                          claim_next, list_leases, recover,
+                                          activity_snapshot, claim_next, list_activity,
+                                          list_leases, reconcile_expired, recover,
                                           register, release, renew, schema_state,
-                                          show)
+                                          show, show_activity)
 import agent_workboard.orchestrator as orchestrator_module
 
 
@@ -97,6 +98,114 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         self.assertEqual({"AWB-101", "AWB-102"},
                          set(row["work_item_id"] for row in active["leases"]))
 
+    def test_effective_projection_and_exact_reconciliation_are_zero_write_and_idempotent(self):
+        self.create("AWB-103")
+        stale = claim(self.database, "AWB-103", "old-owner", 10, "claim-old",
+                      self.now(-30))["lease"]
+        connection = open_database(self.database)
+        before = "\n".join(connection.iterdump())
+        snapshot = activity_snapshot(connection)
+        connection.close()
+        self.assertEqual(1, snapshot["counts"]["staleOrchestratorLeases"])
+        self.assertEqual(0, snapshot["counts"]["liveOrchestratorLeases"])
+        shown = show_activity(self.database, "orchestrator-lease", stale["lease_id"])
+        self.assertEqual("STALE", shown["resource"]["effectiveStatus"])
+        listed = list_activity(self.database, "AWB-103", "STALE")
+        self.assertEqual([stale["lease_id"]],
+                         [row["resourceId"] for row in listed["resources"]])
+        connection = open_database(self.database)
+        self.assertEqual(before, "\n".join(connection.iterdump()))
+        connection.close()
+
+        wrong = reconcile_expired(
+            self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
+            "wrong-owner", stale["generation"], "reconcile-wrong",
+        )
+        self.assertEqual("WRONG_OWNER", wrong["reasonCode"])
+        with mock.patch.object(orchestrator_module, "_activity_event",
+                               side_effect=RuntimeError("event fault")):
+            with self.assertRaisesRegex(RuntimeError, "event fault"):
+                reconcile_expired(
+                    self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
+                    "old-owner", stale["generation"], "reconcile-fault",
+                )
+        connection = open_database(self.database)
+        self.assertEqual("ACTIVE", connection.execute(
+            "SELECT status FROM orchestrator_leases WHERE lease_id=?",
+            (stale["lease_id"],),
+        ).fetchone()[0])
+        connection.close()
+        reconciled = reconcile_expired(
+            self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
+            "old-owner", stale["generation"], "reconcile-exact",
+        )
+        self.assertEqual("OK", reconciled["status"])
+        replay = reconcile_expired(
+            self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
+            "old-owner", stale["generation"], "reconcile-exact",
+        )
+        self.assertEqual("NO_OP", replay["status"])
+        connection = open_database(self.database)
+        self.assertEqual(1, connection.execute(
+            "SELECT count(*) FROM events WHERE event_type='ACTIVITY_RECONCILED'"
+        ).fetchone()[0])
+        connection.close()
+
+    def test_reconciliation_refuses_live_conflict_and_concurrent_mutation_has_one_winner(self):
+        self.create("AWB-104")
+        active_claim = acquire_claim(
+            self.database, "AWB-104", "AWB-104-T01", "planner", "PLANNER",
+            self.agent_expiry(),
+        )
+        stale = acquire_repository_lock(
+            self.database, "AWB-104", "repo", "planner", self.now(-30)
+        )
+        refused = reconcile_expired(
+            self.database, "AWB-104", "repository-writer", stale["lockId"],
+            "planner", stale["generation"], "reconcile-conflict",
+        )
+        self.assertEqual("CONFLICTING_LIVE_ACTIVITY", refused["reasonCode"])
+        release_repository_lock(self.database, "AWB-104", "repo", "planner")
+        release_claim(self.database, "AWB-104", "planner")
+        second_claim = acquire_claim(
+            self.database, "AWB-104", "AWB-104-T01", "planner", "PLANNER",
+            self.agent_expiry(),
+        )
+        stale = acquire_repository_lock(
+            self.database, "AWB-104", "repo", "planner", self.now(-30)
+        )
+        release_claim_before_race = False
+        release_repository_lock(self.database, "AWB-104", "repo", "planner")
+        # Recreate a stale persisted ACTIVE writer without a conflicting live claim.
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE repository_locks SET status='ACTIVE',released_at=NULL WHERE lock_id=?",
+            (stale["lockId"],),
+        )
+        connection.execute(
+            "UPDATE claims SET status='RELEASED',released_at=? WHERE claim_id=?",
+            (self.now(), second_claim["claimId"]),
+        )
+        connection.commit()
+        connection.close()
+        barrier = threading.Barrier(2)
+        results = []
+        def compete(suffix):
+            barrier.wait()
+            results.append(reconcile_expired(
+                self.database, "AWB-104", "repository-writer", stale["lockId"],
+                "planner", stale["generation"], "race-" + suffix,
+            ))
+        threads = [threading.Thread(target=compete, args=(value,))
+                   for value in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(1, sum(result["status"] == "OK" for result in results))
+        self.assertEqual(1, sum(result["reasonCode"] == "RESOURCE_NOT_STALE"
+                                for result in results))
+
     def test_claim_next_stable_order_and_concurrent_single_winner(self):
         self.create("AWB-202", "P1")
         self.create("AWB-201", "P0")
@@ -169,7 +278,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         self.assertEqual(before, self.snapshot("AWB-301"))
         stale = renew(self.database, "AWB-301", "owner-a", generation, 30,
                       "renew-stale")
-        self.assertEqual("STALE_FENCE", stale["reasonCode"])
+        self.assertEqual("NO_ACTIVE_LEASE", stale["reasonCode"])
 
         self.create("AWB-302")
         recovery_clock = self.now()
@@ -185,7 +294,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         self.assertEqual("OK", recovered["status"])
         self.assertEqual(expired["lease"]["generation"] + 1,
                          recovered["lease"]["generation"])
-        self.assertEqual("STALE_FENCE", release(
+        self.assertEqual("WRONG_OWNER", release(
             self.database, "AWB-302", "owner-old",
             expired["lease"]["generation"], "old-release")["reasonCode"])
         connection = open_database(self.database)
@@ -299,7 +408,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             "2025-01-01T00:00:02+00:00",
         )
         self.assertEqual("REFUSED", refused["status"])
-        self.assertEqual("STALE_FENCE", refused["reasonCode"])
+        self.assertEqual("EXPIRED_FENCE", refused["reasonCode"])
         self.assertEqual(before, self.database_dump())
         recovered = recover(
             self.database, "AWB-303", "new-owner", 30, "recover-303",

@@ -1,5 +1,10 @@
 # Local multi-Orchestrator quickstart
 
+In b5, persisted `ACTIVE` and effective activity are separate. An unexpired row
+is `LIVE`; an expired persisted row is visible as `STALE` until an audited
+reconciliation or a true terminal transition closes it. `doctor`, `activity`
+and Orchestrator list/show use the same transaction clock.
+
 `AWB-ORCHESTRATOR-v1` lets independent local host runtimes own different
 WorkItems without sharing one WorkItem. AWB supplies one-shot SQLite/JSON
 coordination commands; the host runtime owns polling, Agent sessions and process
@@ -58,6 +63,7 @@ awb orchestrator show AWB-012 --project .
 awb orchestrator list --project . --status ACTIVE
 awb orchestrator release AWB-012 --project . --orchestrator local-1 \
   --generation 1 --request-id release-1
+awb activity list --project . --work-item AWB-012
 ```
 
 `claim-next` uses P0→P3, `updated_at`, then WorkItem ID ordering inside the same
@@ -68,6 +74,10 @@ The host should renew before expiry. `WAITING_HUMAN` may be renewed, but an
 Orchestrator cannot perform a HUMAN gate. `HELD` and `BLOCKED` refuse renewal.
 Releasing or losing the Orchestrator lease does not revoke a previously valid
 Agent task claim.
+
+Only `FINAL_ACCEPTANCE_APPROVED` is a true terminal state and atomically closes
+its claim, writer, and lease. `BLOCKED`, `WAITING_HUMAN`, task `CANCELLED`, and
+nonterminal `HELD` remain resumable and do not trigger cleanup.
 
 ## Recover an expired owner
 

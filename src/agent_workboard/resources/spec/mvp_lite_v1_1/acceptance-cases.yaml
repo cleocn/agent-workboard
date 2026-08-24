@@ -65,3 +65,13 @@ cases:
   - {id: AWB-020-AC-008, priority: P0, title: Implementation Reviewer 只读与既有质量复审完全不变}
   - {id: AWB-020-AC-009, priority: P0, title: runtime 单一过程审计和最终 summary/postflight 精简}
   - {id: AWB-020-AC-010, priority: P0, title: Preview one clean full fresh allowlist secret asset hash drift 底线}
+  - {id: AWB-022-AC-001, priority: P0, title: 三类活动共享单时钟 LIVE STALE INACTIVE 投影且读操作零写}
+  - {id: AWB-022-AC-002, priority: P0, title: true FINAL 同事务关闭活动而暂停阻塞状态不误清}
+  - {id: AWB-022-AC-003, priority: P0, title: public reconcile exact 幂等审计并发 fault 拒绝均安全}
+  - {id: AWB-022-AC-004, priority: P0, title: doctor upgrade 与 fence reason 精确且只有一个 nextStep}
+  - {id: AWB-022-AC-005, priority: P0, title: exact b3 stale residue 经 b5 两步路径自动收口升级}
+  - {id: AWB-022-AC-006, priority: P0, title: exact b3 b4 upgrade rollback same-b5 no-op 均闭合}
+  - {id: AWB-022-AC-007, priority: P0, title: b5 是 public b4 exact single-parent exact22 候选}
+  - {id: AWB-022-AC-008, priority: P0, title: Preview 三资产 immutable release 与远程 ref 精确}
+  - {id: AWB-022-AC-009, priority: P0, title: 当前 workspace 经 public b5 唯一 nextStep 友好升级}
+  - {id: AWB-022-AC-010, priority: P0, title: 独立 review AUTO gate 与授权边界不回归}

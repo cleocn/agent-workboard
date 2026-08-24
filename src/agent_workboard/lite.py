@@ -774,11 +774,21 @@ def amend_management(database, work_item_id, human_id, management, reason, reque
 
 
 def _expire_claims(connection, work_item_id, now):
+    rows = connection.execute(
+        "SELECT claim_id,work_item_id,agent_id,generation,expires_at FROM claims "
+        "WHERE work_item_id=? AND status='ACTIVE' AND expires_at<=?",
+        (work_item_id, now),
+    ).fetchall()
     connection.execute(
         "UPDATE claims SET status='EXPIRED',released_at=? "
         "WHERE work_item_id=? AND status='ACTIVE' AND expires_at<=?",
         (now, work_item_id, now),
     )
+    return [{"kind": "AGENT_CLAIM", "resourceId": row["claim_id"],
+             "workItemId": row["work_item_id"], "ownerId": row["agent_id"],
+             "generation": row["generation"], "expiresAt": row["expires_at"],
+             "beforeStatus": "ACTIVE", "effectiveStatus": "STALE",
+             "afterStatus": "EXPIRED"} for row in rows]
 
 
 def _validate_orchestrator_fence(connection, work_item_id, orchestrator_id,
@@ -850,7 +860,7 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         _validate_orchestrator_fence(
             connection, work_item_id, orchestrator_id, orchestrator_generation, now
         )
-        _expire_claims(connection, work_item_id, now)
+        reconciled = _expire_claims(connection, work_item_id, now)
         active = connection.execute(
             "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE'", (work_item_id,)
         ).fetchone()
@@ -889,7 +899,8 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
             "WHERE work_item_id=?", (role, now, work_item_id),
         )
         _event(connection, work_item_id, request_id, "CLAIM_ACQUIRED", "AGENT", agent_id,
-               {"claimId": claim_id, "taskId": task_id, "role": role, "generation": generation})
+               {"claimId": claim_id, "taskId": task_id, "role": role,
+                "generation": generation, "reconciledActivity": reconciled})
         if all(usage_values) and usage_policy == "BEST_EFFORT":
             try:
                 from .usage import record_binding
@@ -973,6 +984,11 @@ def acquire_repository_lock(database, work_item_id, repository_key, agent_id, ex
         if claim is None or claim["role"] not in ("PLANNER", "IMPLEMENTER"):
             raise LiteError("repository lock requires Planner or Implementer claim")
         now = _now()
+        stale = connection.execute(
+            "SELECT lock_id,work_item_id,agent_id,generation,expires_at "
+            "FROM repository_locks WHERE repository_key=? AND status='ACTIVE' "
+            "AND expires_at<=?", (repository_key, now),
+        ).fetchall()
         connection.execute(
             "UPDATE repository_locks SET status='EXPIRED',released_at=? "
             "WHERE repository_key=? AND status='ACTIVE' AND expires_at<=?",
@@ -993,7 +1009,14 @@ def acquire_repository_lock(database, work_item_id, repository_key, agent_id, ex
             (lock_id, repository_key, work_item_id, agent_id, generation, now, expires_at),
         )
         _event(connection, work_item_id, request_id, "REPOSITORY_LOCK_ACQUIRED", "AGENT", agent_id,
-               {"repositoryKey": repository_key, "generation": generation})
+               {"repositoryKey": repository_key, "generation": generation,
+                "reconciledActivity": [
+                    {"kind": "REPOSITORY_WRITER", "resourceId": row["lock_id"],
+                     "workItemId": row["work_item_id"], "ownerId": row["agent_id"],
+                     "generation": row["generation"], "expiresAt": row["expires_at"],
+                     "beforeStatus": "ACTIVE", "effectiveStatus": "STALE",
+                     "afterStatus": "EXPIRED"} for row in stale
+                ]})
         connection.commit()
         return {"lockId": lock_id, "generation": generation}
     except Exception:
@@ -1626,7 +1649,7 @@ def _approved_gate_preconditions(connection, item, stage):
     return review
 
 
-def _approve_gate(connection, item, stage, now):
+def _approve_gate(connection, item, stage, now, trigger_request_id):
     _approved_gate_preconditions(connection, item, stage)
     if stage == "PLAN":
         state, queue, role, held, closed = (
@@ -1642,6 +1665,12 @@ def _approve_gate(connection, item, stage, now):
         "WHERE work_item_id=?",
         (state, queue, role, held, closed, now, item["work_item_id"]),
     )
+    if stage == "FINAL":
+        from .orchestrator import reconcile_terminal_activity
+        reconcile_terminal_activity(
+            connection, item["work_item_id"], now,
+            trigger_request_id + "-terminal-activity",
+        )
 
 
 def _auto_gate_context(connection, work_item_id):
@@ -1714,7 +1743,6 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
             "INSERT INTO reviews VALUES(?,?,?,?,?,?,?)",
             (review_id, work_item_id, stage, reviewer_agent_id, stored_decision, _json(review), now),
         )
-        _release_active(connection, work_item_id, now)
         result = review["result"]
         round_number = review["round"]
         policy = item["human_gate_policy"] if "human_gate_policy" in item.keys() else "MANUAL"
@@ -1755,12 +1783,14 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
                 policy == "AUTO_ON_PASS" and item["queue_state"] == "CLAIMED" and
                 item["held_reason"] is None and item["blocked_reason"] is None):
             try:
-                _approve_gate(connection, item, stage, now)
+                _approve_gate(connection, item, stage, now, request_id)
                 auto_approved = True
             except LiteError as exc:
                 # The independent PASS remains recorded, but runtime drift or
                 # incomplete quality evidence deliberately falls back to HUMAN.
                 auto_gate_failure = str(exc)
+        if not (auto_approved and stage == "FINAL"):
+            _release_active(connection, work_item_id, now)
         if not auto_approved:
             connection.execute(
                 "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,"
@@ -1952,6 +1982,11 @@ def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_fil
                 not set(resolved).issubset(open_ids) or open_ids - set(resolved)):
             raise LiteError("AMENDED must close every open Finding it changes")
         now = _now()
+        stale_locks = connection.execute(
+            "SELECT lock_id,work_item_id,agent_id,generation,expires_at "
+            "FROM repository_locks WHERE repository_key=? AND status='ACTIVE' "
+            "AND expires_at<=?", (repository_key, now),
+        ).fetchall()
         connection.execute(
             "UPDATE repository_locks SET status='EXPIRED',released_at=? "
             "WHERE repository_key=? AND status='ACTIVE' AND expires_at<=?",
@@ -1980,6 +2015,13 @@ def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_fil
                    "purpose": "PLAN_AMEND", "reviewerAgentId": reviewer_agent_id,
                    "path": relative, "baseRevision": head["revision"],
                    "baseSha256": head["sha256"], "requestId": request_id,
+                   "reconciledActivity": [
+                       {"kind": "REPOSITORY_WRITER", "resourceId": row["lock_id"],
+                        "workItemId": row["work_item_id"], "ownerId": row["agent_id"],
+                        "generation": row["generation"], "expiresAt": row["expires_at"],
+                        "beforeStatus": "ACTIVE", "effectiveStatus": "STALE",
+                        "afterStatus": "EXPIRED"} for row in stale_locks
+                   ],
                })
         connection.commit()
     except Exception:
@@ -2128,7 +2170,7 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
             (_id("gate"), work_item_id, stage, human_id, decision, reason, now),
         )
         if decision == "APPROVED":
-            _approve_gate(connection, item, stage, now)
+            _approve_gate(connection, item, stage, now, request_id)
             state = None
         elif stage == "PLAN":
             state = "PLAN_REVIEW_APPROVED" if decision == "APPROVED" else "DRAFT"

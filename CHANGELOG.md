@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1b5 Preview
+
+- Project claims, repository writers, and Orchestrator leases now share one
+  effective LIVE versus persisted STALE projection in doctor and public
+  `activity list/show` diagnostics.
+- True FINAL transitions atomically close their activity, while exact
+  `activity reconcile-expired` remains audited, idempotent, and fenced.
+- Exact public b3 and b4 consumers can upgrade directly to b5. Stale-only
+  projects receive one backup-first reconciliation-aware next step; live or
+  mixed projects stop at the live owner, without manual SQLite cleanup.
+
 ## 0.3.1b4 Preview
 
 - Make Usage collection project-level and default it to `OFF`; explicit

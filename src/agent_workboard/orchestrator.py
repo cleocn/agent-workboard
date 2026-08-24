@@ -5,6 +5,7 @@ transactional SQLite coordination primitives and stable JSON results.
 """
 
 import datetime
+import hashlib
 import json
 import re
 import sqlite3
@@ -15,6 +16,7 @@ from .lite import LiteError, _management_from_events, _now, open_database
 
 ORCHESTRATOR_SCHEMA_VERSION = "AWB-ORCHESTRATOR-v1"
 PROTOCOL_VERSION = ORCHESTRATOR_SCHEMA_VERSION
+ACTIVITY_PROTOCOL_VERSION = "AWB-ACTIVITY-v1"
 DEFAULT_TTL = 900
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EXPECTED_SCHEMA_FINGERPRINT = None
@@ -223,13 +225,329 @@ def _validate_id(value, field):
         raise LiteError("{0} must be 1-128 safe printable characters".format(field))
 
 
-def _lease(row):
+def _lease(row, now=None):
     if row is None:
         return None
-    return {key: row[key] for key in (
+    value = {key: row[key] for key in (
         "lease_id", "work_item_id", "orchestrator_id", "generation", "status",
         "acquired_at", "renewed_at", "expires_at", "released_at",
     )}
+    if now is not None:
+        value.update(_activity_projection(
+            "ORCHESTRATOR_LEASE", row, now,
+            terminal=False,
+        ))
+    return value
+
+
+_ACTIVITY_KINDS = {
+    "claim": ("AGENT_CLAIM", "claims", "claim_id", "agent_id"),
+    "repository-writer": (
+        "REPOSITORY_WRITER", "repository_locks", "lock_id", "agent_id"
+    ),
+    "orchestrator-lease": (
+        "ORCHESTRATOR_LEASE", "orchestrator_leases", "lease_id", "orchestrator_id"
+    ),
+}
+_SAFE_ACTIONS = {
+    "AGENT_CLAIM": "RELEASE_CLAIM_BY_OWNER",
+    "REPOSITORY_WRITER": "RELEASE_REPOSITORY_WRITER_BY_OWNER",
+    "ORCHESTRATOR_LEASE": "RELEASE_ORCHESTRATOR_LEASE_BY_OWNER",
+}
+
+
+def _effective_status(status, expires_at, now):
+    if status != "ACTIVE":
+        return "INACTIVE"
+    return "LIVE" if expires_at > now else "STALE"
+
+
+def _activity_projection(kind, row, now, terminal):
+    effective = _effective_status(row["status"], row["expires_at"], now)
+    if effective == "LIVE":
+        reason = "LIVE_ACTIVITY_HELD"
+        safe = _SAFE_ACTIONS[kind]
+    elif effective == "STALE":
+        reason = ("TERMINAL_ACTIVITY_RESIDUE" if terminal else
+                  "EXPIRED_ACTIVITY_RESIDUE")
+        safe = "RECONCILE_EXPIRED_ACTIVITY"
+    else:
+        reason, safe = None, "NONE"
+    return {
+        "persistedStatus": row["status"], "effectiveStatus": effective,
+        "terminal": bool(terminal), "reasonCode": reason, "safeAction": safe,
+    }
+
+
+def _activity_row(kind_key, row, now, terminal):
+    kind, unused_table, resource_column, owner_column = _ACTIVITY_KINDS[kind_key]
+    value = {
+        "kind": kind, "resourceId": row[resource_column],
+        "workItemId": row["work_item_id"],
+        "ownerKind": "ORCHESTRATOR" if kind == "ORCHESTRATOR_LEASE" else "AGENT",
+        "ownerId": row[owner_column], "generation": row["generation"],
+        "expiresAt": row["expires_at"],
+    }
+    value.update(_activity_projection(kind, row, now, terminal))
+    return value
+
+
+def activity_snapshot(connection, now=None, work_item_id=None, include_inactive=False):
+    """Return all three activity classes from one snapshot and one UTC clock."""
+    current = _timestamp(now)
+    terminal = {
+        row[0]: row[1] == "FINAL_ACCEPTANCE_APPROVED"
+        for row in connection.execute("SELECT work_item_id,state FROM work_items")
+    }
+    rows = []
+    for key, (unused_kind, table, unused_resource, unused_owner) in _ACTIVITY_KINDS.items():
+        if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is None:
+            continue
+        query = "SELECT * FROM " + table
+        values = []
+        if work_item_id:
+            query += " WHERE work_item_id=?"
+            values.append(work_item_id)
+        query += " ORDER BY work_item_id,generation"
+        for row in connection.execute(query, values):
+            value = _activity_row(key, row, current, terminal.get(row["work_item_id"], False))
+            if include_inactive or value["effectiveStatus"] != "INACTIVE":
+                rows.append(value)
+    rows.sort(key=lambda value: (value["kind"], value["workItemId"],
+                                 value["generation"], value["resourceId"]))
+    counts = {
+        "liveAgentClaims": 0, "staleAgentClaims": 0,
+        "liveRepositoryWriters": 0, "staleRepositoryWriters": 0,
+        "liveOrchestratorLeases": 0, "staleOrchestratorLeases": 0,
+    }
+    prefixes = {
+        "AGENT_CLAIM": "AgentClaims", "REPOSITORY_WRITER": "RepositoryWriters",
+        "ORCHESTRATOR_LEASE": "OrchestratorLeases",
+    }
+    for value in rows:
+        if value["effectiveStatus"] in ("LIVE", "STALE"):
+            counts[value["effectiveStatus"].lower() + prefixes[value["kind"]]] += 1
+    counts.update({
+        "activeClaims": counts["liveAgentClaims"],
+        "activeWriters": counts["liveRepositoryWriters"],
+        "activeOrchestratorLeases": counts["liveOrchestratorLeases"],
+    })
+    return {"clock": current, "counts": counts, "resources": rows}
+
+
+def activity_fingerprint(resources):
+    selected = [{key: row[key] for key in (
+        "kind", "resourceId", "workItemId", "ownerId", "generation", "expiresAt"
+    )} for row in resources if row.get("effectiveStatus") == "STALE"]
+    return hashlib.sha256(
+        _json(sorted(selected, key=lambda value: (
+            value["kind"], value["workItemId"], value["resourceId"]
+        ))).encode("utf-8")
+    ).hexdigest()
+
+
+def list_activity(database, work_item_id=None, effective_status=None):
+    if effective_status and effective_status not in ("LIVE", "STALE", "INACTIVE"):
+        raise LiteError("effective-status is invalid")
+    connection, refusal = _open("ACTIVITY_LIST", database)
+    if refusal:
+        return refusal
+    try:
+        snapshot = activity_snapshot(
+            connection, work_item_id=work_item_id, include_inactive=True
+        )
+        resources = snapshot["resources"]
+        if effective_status:
+            resources = [row for row in resources
+                         if row["effectiveStatus"] == effective_status]
+        return {"protocolVersion": ACTIVITY_PROTOCOL_VERSION, "operation": "LIST",
+                "status": "OK", "reasonCode": None,
+                "clock": snapshot["clock"], "counts": snapshot["counts"],
+                "resources": resources, "nextStep": _next("NONE")}
+    finally:
+        connection.close()
+
+
+def show_activity(database, kind, resource_id):
+    if kind not in _ACTIVITY_KINDS:
+        raise LiteError("activity kind is invalid")
+    _validate_id(resource_id, "resource-id")
+    connection, refusal = _open("ACTIVITY_SHOW", database)
+    if refusal:
+        return refusal
+    try:
+        unused_kind, table, resource_column, unused_owner = _ACTIVITY_KINDS[kind]
+        row = connection.execute(
+            "SELECT * FROM {0} WHERE {1}=?".format(table, resource_column),
+            (resource_id,),
+        ).fetchone()
+        if row is None:
+            return {"protocolVersion": ACTIVITY_PROTOCOL_VERSION, "operation": "SHOW",
+                    "status": "REFUSED", "reasonCode": "RESOURCE_NOT_FOUND",
+                    "resource": None, "nextStep": _next("STOP")}
+        terminal = connection.execute(
+            "SELECT state FROM work_items WHERE work_item_id=?", (row["work_item_id"],)
+        ).fetchone()[0] == "FINAL_ACCEPTANCE_APPROVED"
+        return {"protocolVersion": ACTIVITY_PROTOCOL_VERSION, "operation": "SHOW",
+                "status": "OK", "reasonCode": None,
+                "resource": _activity_row(kind, row, _timestamp(), terminal),
+                "nextStep": _next("NONE")}
+    finally:
+        connection.close()
+
+
+def _activity_event(connection, work_item_id, request_id, event_type, payload, now,
+                    actor_id="activity-reconciler"):
+    connection.execute(
+        "INSERT INTO events(work_item_id,request_id,event_type,actor_kind,"
+        "actor_id,payload_json,created_at) VALUES(?,?,?,?,?,?,?)",
+        (work_item_id, request_id, event_type, "SYSTEM", actor_id,
+         _json(payload), now),
+    )
+
+
+def _reconcile_result(status, reason=None, resource=None, next_action="NONE"):
+    return {"protocolVersion": ACTIVITY_PROTOCOL_VERSION,
+            "operation": "RECONCILE_EXPIRED", "status": status,
+            "reasonCode": reason, "resource": resource,
+            "nextStep": _next(next_action)}
+
+
+def reconcile_expired(database, work_item_id, kind, resource_id, owner,
+                      generation, request_id, now=None):
+    """Expire one exact stale resource, with immutable request replay evidence."""
+    if kind not in _ACTIVITY_KINDS:
+        raise LiteError("activity kind is invalid")
+    for value, field in ((work_item_id, "work-item"), (resource_id, "resource-id"),
+                         (owner, "owner"), (request_id, "request-id")):
+        _validate_id(value, field)
+    if type(generation) is not int or generation < 1:
+        raise LiteError("generation must be positive")
+    request = {"operation": "RECONCILE_EXPIRED", "workItemId": work_item_id,
+               "kind": kind, "resourceId": resource_id, "owner": owner,
+               "generation": generation}
+    fingerprint = hashlib.sha256(_json(request).encode("utf-8")).hexdigest()
+    connection, refusal = _open("RECONCILE_EXPIRED", database)
+    if refusal:
+        return refusal
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        replay = connection.execute(
+            "SELECT payload_json FROM events WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if replay is not None:
+            payload = json.loads(replay[0])
+            if (payload.get("requestFingerprint") != fingerprint or
+                    payload.get("request") != request):
+                connection.rollback()
+                return _reconcile_result("REFUSED", "REQUEST_ID_REUSED", None,
+                                         "USE_NEW_REQUEST_ID")
+            result = dict(payload["result"])
+            result["status"] = "NO_OP"
+            result["nextStep"] = _next("NONE")
+            connection.rollback()
+            return result
+        current = _timestamp(now)
+        item = connection.execute(
+            "SELECT state FROM work_items WHERE work_item_id=?", (work_item_id,)
+        ).fetchone()
+        if item is None:
+            connection.rollback()
+            return _reconcile_result("REFUSED", "WORK_ITEM_NOT_FOUND", None, "STOP")
+        projected_kind, table, resource_column, owner_column = _ACTIVITY_KINDS[kind]
+        row = connection.execute(
+            "SELECT * FROM {0} WHERE {1}=?".format(table, resource_column),
+            (resource_id,),
+        ).fetchone()
+        if row is None or row["work_item_id"] != work_item_id:
+            connection.rollback()
+            return _reconcile_result("REFUSED", "RESOURCE_NOT_FOUND", None, "STOP")
+        terminal = item["state"] == "FINAL_ACCEPTANCE_APPROVED"
+        projected = _activity_row(kind, row, current, terminal)
+        if row[owner_column] != owner:
+            connection.rollback()
+            return _reconcile_result("REFUSED", "WRONG_OWNER", projected, "VERIFY_OWNER")
+        if row["generation"] != generation:
+            connection.rollback()
+            return _reconcile_result("REFUSED", "WRONG_GENERATION", projected,
+                                     "VERIFY_GENERATION")
+        if row["status"] != "ACTIVE" or row["expires_at"] > current:
+            connection.rollback()
+            reason = ("LIVE_ACTIVITY_HELD" if row["status"] == "ACTIVE" else
+                      "RESOURCE_NOT_STALE")
+            action = (_SAFE_ACTIONS[projected_kind] if reason == "LIVE_ACTIVITY_HELD" else
+                      "NONE")
+            return _reconcile_result("REFUSED", reason, projected, action)
+        snapshot = activity_snapshot(connection, current)
+        conflicts = [value for value in snapshot["resources"]
+                     if value["effectiveStatus"] == "LIVE" and
+                     value["workItemId"] == work_item_id]
+        if kind == "repository-writer":
+            repository_key = row["repository_key"]
+            live_writers = connection.execute(
+                "SELECT * FROM repository_locks WHERE repository_key=? AND status='ACTIVE' "
+                "AND expires_at>?", (repository_key, current)
+            ).fetchall()
+            conflicts.extend(_activity_row("repository-writer", value, current, False)
+                             for value in live_writers)
+        if conflicts:
+            connection.rollback()
+            return _reconcile_result("REFUSED", "CONFLICTING_LIVE_ACTIVITY", projected,
+                                     "STOP_LIVE_ACTIVITY_OWNER")
+        connection.execute(
+            "UPDATE {0} SET status='EXPIRED',released_at=? WHERE {1}=? AND status='ACTIVE'"
+            .format(table, resource_column), (current, resource_id),
+        )
+        updated = connection.execute(
+            "SELECT * FROM {0} WHERE {1}=?".format(table, resource_column),
+            (resource_id,),
+        ).fetchone()
+        result = _reconcile_result(
+            "OK", None, _activity_row(kind, updated, current, terminal), "NONE"
+        )
+        _activity_event(connection, work_item_id, request_id, "ACTIVITY_RECONCILED",
+                        {"request": request, "requestFingerprint": fingerprint,
+                         "result": result}, current)
+        connection.commit()
+        return result
+    except sqlite3.OperationalError as exc:
+        connection.rollback()
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            return _reconcile_result("CONFLICT", "DATABASE_BUSY", None,
+                                     "RETRY_SAME_REQUEST")
+        raise
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def reconcile_terminal_activity(connection, work_item_id, now, request_id):
+    """Close all persisted ACTIVE activity in the caller's final-gate transaction."""
+    snapshot = activity_snapshot(connection, now, work_item_id=work_item_id)
+    changed = []
+    for value in snapshot["resources"]:
+        if value["persistedStatus"] != "ACTIVE":
+            continue
+        kind_key = {value[0]: key for key, value in _ACTIVITY_KINDS.items()}[value["kind"]]
+        unused_kind, table, resource_column, unused_owner = _ACTIVITY_KINDS[kind_key]
+        after = "RELEASED" if value["effectiveStatus"] == "LIVE" else "EXPIRED"
+        connection.execute(
+            "UPDATE {0} SET status=?,released_at=? WHERE {1}=? AND status='ACTIVE'"
+            .format(table, resource_column), (after, now, value["resourceId"]),
+        )
+        record = dict(value)
+        record["afterStatus"] = after
+        changed.append(record)
+    _activity_event(
+        connection, work_item_id, request_id, "TERMINAL_ACTIVITY_RECONCILED",
+        {"triggerRequestId": request_id, "resources": changed}, now,
+        actor_id="terminal-reconciler",
+    )
+    return changed
 
 
 def _next(action, **arguments):
@@ -378,11 +696,16 @@ def register(database, orchestrator_id, request_id, now=None):
 
 
 def _expire_target(connection, work_item_id, now):
+    rows = connection.execute(
+        "SELECT * FROM orchestrator_leases WHERE work_item_id=? AND status='ACTIVE' "
+        "AND expires_at<=?", (work_item_id, now),
+    ).fetchall()
     connection.execute(
         "UPDATE orchestrator_leases SET status='EXPIRED',released_at=? "
         "WHERE work_item_id=? AND status='ACTIVE' AND expires_at<=?",
         (now, work_item_id, now),
     )
+    return [_activity_row("orchestrator-lease", row, now, False) for row in rows]
 
 
 def _eligible(connection, work_item_id, now):
@@ -390,9 +713,9 @@ def _eligible(connection, work_item_id, now):
         "SELECT * FROM work_items WHERE work_item_id=?", (work_item_id,)
     ).fetchone()
     if item is None:
-        return None, "WORK_ITEM_NOT_FOUND"
+        return None, "WORK_ITEM_NOT_FOUND", []
     if _management_from_events(connection, work_item_id) is None:
-        return item, "NOT_ELIGIBLE"
+        return item, "NOT_ELIGIBLE", []
     if (item["state"] == "FINAL_ACCEPTANCE_APPROVED" or
             item["queue_state"] != "CLAIMABLE" or not item["current_role"]):
         return item, "NOT_ELIGIBLE"
@@ -400,14 +723,14 @@ def _eligible(connection, work_item_id, now):
         "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE' AND expires_at>?",
         (work_item_id, now),
     ).fetchone():
-        return item, "NOT_ELIGIBLE"
-    _expire_target(connection, work_item_id, now)
+        return item, "NOT_ELIGIBLE", []
+    reconciled = _expire_target(connection, work_item_id, now)
     if connection.execute(
         "SELECT 1 FROM orchestrator_leases WHERE work_item_id=? AND status='ACTIVE'",
         (work_item_id,),
     ).fetchone():
-        return item, "LEASE_HELD"
-    return item, None
+        return item, "LEASE_HELD", reconciled
+    return item, None, reconciled
 
 
 def _new_lease(connection, work_item_id, orchestrator_id, ttl, now):
@@ -434,14 +757,14 @@ def claim(database, work_item_id, orchestrator_id, ttl, request_id, now=None):
                        orchestratorId=orchestrator_id, ttl=ttl)
 
     def action(connection, current):
-        item, reason = _eligible(connection, work_item_id, current)
+        item, reason, reconciled = _eligible(connection, work_item_id, current)
         if reason:
             status = "CONFLICT" if reason == "LEASE_HELD" else "REFUSED"
             result = _result("CLAIM", status, reason=reason,
                              next_step=_next("SELECT_ANOTHER_OR_RETRY"))
             return result, "ORCHESTRATOR_CLAIM_REFUSED", work_item_id, None, False
         lease = _new_lease(connection, work_item_id, orchestrator_id, ttl, current)
-        result = _result("CLAIM", "OK", lease=lease,
+        result = _result("CLAIM", "OK", lease=lease, reconciledActivity=reconciled,
                          next_step=_next("DISPATCH_AGENT", workItemId=work_item_id,
                                          orchestrator=orchestrator_id,
                                          generation=lease["generation"]))
@@ -462,17 +785,21 @@ def claim_next(database, orchestrator_id, ttl, request_id, now=None):
             "updated_at,work_item_id"
         ).fetchall()
         selected = None
+        reconciled = []
         for row in rows:
-            _, reason = _eligible(connection, row["work_item_id"], current)
+            _, reason, found_reconciled = _eligible(connection, row["work_item_id"], current)
+            reconciled.extend(found_reconciled)
             if reason is None:
                 selected = row["work_item_id"]
                 break
         if selected is None:
             result = _result("CLAIM_NEXT", "NO_OP", reason="NO_CANDIDATE",
-                             next_step=_next("WAIT_OR_CLAIM_EXPLICIT"))
+                             next_step=_next("WAIT_OR_CLAIM_EXPLICIT"),
+                             reconciledActivity=reconciled)
             return result, "ORCHESTRATOR_NO_CANDIDATE", None, None, True
         lease = _new_lease(connection, selected, orchestrator_id, ttl, current)
         result = _result("CLAIM_NEXT", "OK", lease=lease,
+                         reconciledActivity=reconciled,
                          next_step=_next("DISPATCH_AGENT", workItemId=selected,
                                          orchestrator=orchestrator_id,
                                          generation=lease["generation"]))
@@ -486,9 +813,12 @@ def _fenced(connection, work_item_id, orchestrator_id, generation, now):
         "SELECT * FROM orchestrator_leases WHERE work_item_id=? AND status='ACTIVE'",
         (work_item_id,),
     ).fetchone()
-    if (lease is None or lease["orchestrator_id"] != orchestrator_id or
-            lease["generation"] != generation):
-        return None, "STALE_FENCE"
+    if lease is None:
+        return None, "NO_ACTIVE_LEASE"
+    if lease["orchestrator_id"] != orchestrator_id:
+        return None, "WRONG_OWNER"
+    if lease["generation"] != generation:
+        return None, "WRONG_GENERATION"
     if lease["expires_at"] <= now:
         return None, "EXPIRED_FENCE"
     return lease, None
@@ -516,9 +846,9 @@ def renew(database, work_item_id, orchestrator_id, generation, ttl, request_id, 
             connection, work_item_id, orchestrator_id, generation, current
         )
         if lease is None:
-            result = _result("RENEW", "REFUSED", reason="STALE_FENCE",
+            result = _result("RENEW", "REFUSED", reason=fence_reason,
                              next_step=_next("STOP_STALE_OWNER"))
-            return result, "ORCHESTRATOR_RENEW_REFUSED", work_item_id, None, False
+            return result, None, work_item_id, None, False
         connection.execute(
             "UPDATE orchestrator_leases SET renewed_at=?,expires_at=? WHERE lease_id=?",
             (current, _expires(current, ttl), lease["lease_id"]),
@@ -545,11 +875,9 @@ def release(database, work_item_id, orchestrator_id, generation, request_id, now
             connection, work_item_id, orchestrator_id, generation, current
         )
         if lease is None:
-            result = _result("RELEASE", "REFUSED", reason="STALE_FENCE",
+            result = _result("RELEASE", "REFUSED", reason=fence_reason,
                              next_step=_next("STOP_STALE_OWNER"))
-            event_type = (None if fence_reason == "EXPIRED_FENCE" else
-                          "ORCHESTRATOR_RELEASE_REFUSED")
-            return result, event_type, work_item_id, None, False
+            return result, None, work_item_id, None, False
         connection.execute(
             "UPDATE orchestrator_leases SET status='RELEASED',released_at=? WHERE lease_id=?",
             (current, lease["lease_id"]),
@@ -592,6 +920,7 @@ def recover(database, work_item_id, orchestrator_id, ttl, request_id, now=None):
                              reason=reason, next_step=_next("WAIT_OR_CLAIM"))
             return result, "ORCHESTRATOR_RECOVER_REFUSED", work_item_id, None, False
         if latest["status"] == "ACTIVE":
+            reconciled = _activity_row("orchestrator-lease", latest, current, False)
             connection.execute(
                 "UPDATE orchestrator_leases SET status='EXPIRED',released_at=? WHERE lease_id=?",
                 (current, latest["lease_id"]),
@@ -605,6 +934,7 @@ def recover(database, work_item_id, orchestrator_id, ttl, request_id, now=None):
             return result, "ORCHESTRATOR_RECOVER_REFUSED", work_item_id, None, False
         lease = _new_lease(connection, work_item_id, orchestrator_id, ttl, current)
         result = _result("RECOVER", "OK", lease=lease,
+                         reconciledActivity=([reconciled] if latest["status"] == "ACTIVE" else []),
                          next_step=_next("OBSERVE_OR_DISPATCH", workItemId=work_item_id,
                                          generation=lease["generation"]))
         return result, "ORCHESTRATOR_LEASE_RECOVERED", work_item_id, lease, False
@@ -632,7 +962,17 @@ def list_leases(database, orchestrator_id=None, status=None):
         if where:
             query += " WHERE " + " AND ".join(where)
         query += " ORDER BY work_item_id,generation"
-        leases = [_lease(row) for row in connection.execute(query, values)]
+        current = _timestamp()
+        terminal = {row[0]: row[1] == "FINAL_ACCEPTANCE_APPROVED" for row in
+                    connection.execute("SELECT work_item_id,state FROM work_items")}
+        leases = []
+        for row in connection.execute(query, values):
+            value = _lease(row)
+            value.update(_activity_projection(
+                "ORCHESTRATOR_LEASE", row, current,
+                terminal.get(row["work_item_id"], False),
+            ))
+            leases.append(value)
         return _result("LIST", "OK", next_step=_next("NONE"), leases=leases)
     finally:
         connection.close()
@@ -649,10 +989,21 @@ def show(database, work_item_id):
         if item is None:
             return _result("SHOW", "REFUSED", reason="WORK_ITEM_NOT_FOUND",
                            next_step=_next("STOP"))
-        leases = [_lease(row) for row in connection.execute(
+        lease_rows = connection.execute(
             "SELECT * FROM orchestrator_leases WHERE work_item_id=? ORDER BY generation",
             (work_item_id,),
-        )]
+        ).fetchall()
+        current = _timestamp()
+        terminal = connection.execute(
+            "SELECT state FROM work_items WHERE work_item_id=?", (work_item_id,)
+        ).fetchone()[0] == "FINAL_ACCEPTANCE_APPROVED"
+        leases = []
+        for row in lease_rows:
+            value = _lease(row)
+            value.update(_activity_projection(
+                "ORCHESTRATOR_LEASE", row, current, terminal
+            ))
+            leases.append(value)
         events = []
         for row in connection.execute(
             "SELECT orchestrator_event_id,request_id,operation,event_type,orchestrator_id,"
@@ -660,7 +1011,8 @@ def show(database, work_item_id):
             "WHERE work_item_id=? ORDER BY orchestrator_event_id", (work_item_id,),
         ):
             events.append(dict(row))
-        active = next((entry for entry in reversed(leases) if entry["status"] == "ACTIVE"), None)
+        active = next((entry for entry in reversed(leases)
+                       if entry["effectiveStatus"] == "LIVE"), None)
         return _result("SHOW", "OK", lease=active, next_step=_next("NONE"),
                        leases=leases, events=events)
     finally:
@@ -670,6 +1022,8 @@ def show(database, work_item_id):
 def active_count(connection):
     if not schema_installed(connection):
         return 0
+    now = _timestamp()
     return connection.execute(
-        "SELECT count(*) FROM orchestrator_leases WHERE status='ACTIVE'"
+        "SELECT count(*) FROM orchestrator_leases WHERE status='ACTIVE' AND expires_at>?",
+        (now,),
     ).fetchone()[0]

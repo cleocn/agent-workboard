@@ -2,7 +2,7 @@
   "manifestVersion": "MVP-LITE-v1.1",
   "status": "ACTIVE / AUTHORITATIVE",
   "databaseSchemaVersion": "MVP-LITE-v1 + AWB-USAGE-v1 + AWB-ORCHESTRATOR-v1 + AWB-AUTO-GATE-v1",
-  "planRevision": "AWB-020 lean workflow candidate",
+  "planRevision": "AWB-022 activity lifecycle and recovery-aware upgrade",
   "composition": {
     "databaseSchema": "schema.sql",
     "workItemSchema": "workitem.schema.json",

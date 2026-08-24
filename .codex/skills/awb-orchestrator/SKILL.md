@@ -83,6 +83,14 @@ Under `BEST_EFFORT`, preserve the existing binding/span/sync privacy behavior;
 failures remain diagnostic and do not authorize displaying prompt, response,
 tool output, credentials, session content, or local session paths.
 
+Treat `awb doctor` and `awb activity list/show` as the effective activity
+projection. LIVE resources must be released by their exact owner. STALE rows
+remain visible history and may be reconciled only through the exact public
+request-id/owner/generation command. A true FINAL transition closes all activity
+atomically; BLOCKED, WAITING_HUMAN and nonterminal HELD never imply cleanup.
+For b3/b4 upgrades, consume the single recovery-aware b5 nextStep unchanged;
+never ask the user to edit SQLite or perform a separate stale cleanup first.
+
 Runtime events are the process audit authority.  Do not require per-round
 submission JSON, per-round quality hashes, duplicate postflight files, or a
 Release body hash.  A normal WorkItem retains one final implementation summary;

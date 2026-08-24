@@ -26,6 +26,7 @@ from .lite import (AUTO_GATE_SCHEMA_VERSION, LiteError, SCHEMA_VERSION,
                    human_gate_schema_sql, human_gate_schema_state,
                    initialize_database, open_database)
 from .orchestrator import (ORCHESTRATOR_SCHEMA_VERSION, active_count,
+                           activity_fingerprint, activity_snapshot,
                            schema_sql as orchestrator_schema_sql,
                            schema_state as orchestrator_schema_state)
 from .usage import USAGE_SCHEMA_VERSION, schema_installed, usage_schema_sql
@@ -47,7 +48,13 @@ RELEASE_0_3_1B3_IDENTITY = {
     "sourceTree": "096631605e45d3bfa8df00a4f05546d7aedbf582",
     "sourceTag": "v0.3.1b3",
 }
-SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_1B3_IDENTITY,)
+RELEASE_0_3_1B4_IDENTITY = {
+    "packageVersion": "0.3.1b4",
+    "sourceCommit": "2a81ed29cc29afa015a62455afe5586d19e58db3",
+    "sourceTree": "7de811338c01aa47a047f08b2b036379a39fac53",
+    "sourceTag": "v0.3.1b4",
+}
+SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_1B3_IDENTITY, RELEASE_0_3_1B4_IDENTITY)
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
 
 
@@ -394,7 +401,7 @@ def _validate_project_contract(root):
     elif (parsed.scheme != "https" or parsed.netloc != "github.com" or
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
                   for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1",
-                              "v0.3.1b2", "v0.3.1b3", "v0.3.1b4"))):
+                              "v0.3.1b2", "v0.3.1b3", "v0.3.1b4", "v0.3.1b5"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -604,8 +611,7 @@ def doctor(path):
     try:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
-        active_claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
-        writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
+        activity = activity_snapshot(connection)
         usage_version = (USAGE_SCHEMA_VERSION if schema_installed(connection) else None)
         usage_triggers = (connection.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='trigger' "
@@ -614,7 +620,6 @@ def doctor(path):
         orchestrator_state = orchestrator_schema_state(connection)
         orchestrator_version = (ORCHESTRATOR_SCHEMA_VERSION
                                 if orchestrator_state == "INSTALLED" else None)
-        active_orchestrators = active_count(connection)
         gate_policy_state = human_gate_schema_state(connection)
     finally:
         connection.close()
@@ -629,8 +634,8 @@ def doctor(path):
             "gatePolicySchemaVersion": (AUTO_GATE_SCHEMA_VERSION
                                         if gate_policy_state == "INSTALLED" else None),
             "gatePolicySchemaState": gate_policy_state,
-            "activeClaims": active_claims, "activeWriters": writers,
-            "activeOrchestratorLeases": active_orchestrators,
+            **activity["counts"], "activityClock": activity["clock"],
+            "activity": activity["resources"],
             "nextStep": ({"action": "MIGRATE", "arguments": {}}
                          if (orchestrator_state == "ABSENT" or
                              gate_policy_state == "ABSENT") else
@@ -908,17 +913,16 @@ def _database_preflight(database):
             if os.path.isfile(source):
                 shutil.copyfile(source, snapshot + suffix)
         connection = sqlite3.connect(snapshot)
+        connection.row_factory = sqlite3.Row
         try:
             version = connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
-            claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
-            writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
+            activity = activity_snapshot(connection)
             usage_state = _usage_schema_state(connection)
             coordinator_state = orchestrator_schema_state(connection)
-            coordinators = active_count(connection)
             gate_policy_state = human_gate_schema_state(connection)
         except sqlite3.Error as exc:
             raise LiteError("upgrade cannot read database: {0}".format(exc))
@@ -926,19 +930,19 @@ def _database_preflight(database):
             connection.close()
     if not version or version[0] != SCHEMA_VERSION or integrity != "ok" or foreign_keys:
         raise LiteError("upgrade refuses an invalid database")
-    if claims or writers or coordinators:
-        raise LiteError("upgrade refuses active claim or repository writer or orchestrator lease")
     if usage_state == "INVALID":
         raise LiteError("upgrade refuses an invalid or unexpected usage extension")
     if coordinator_state == "INVALID":
         raise LiteError("upgrade refuses an invalid or unexpected orchestrator extension")
     if gate_policy_state == "INVALID":
         raise LiteError("upgrade refuses an invalid or unexpected auto-gate extension")
-    return {"activeClaims": claims, "activeWriters": writers, "integrity": integrity,
-            "activeOrchestratorLeases": coordinators,
-            "usageSchemaState": usage_state,
-            "orchestratorSchemaState": coordinator_state,
-            "gatePolicySchemaState": gate_policy_state}
+    result = {"integrity": integrity, "activityClock": activity["clock"],
+              "activity": activity["resources"],
+              "usageSchemaState": usage_state,
+              "orchestratorSchemaState": coordinator_state,
+              "gatePolicySchemaState": gate_policy_state}
+    result.update(activity["counts"])
+    return result
 
 
 def _wheel_resource_optional(wheel, resource):
@@ -960,7 +964,9 @@ def _path_entry(root, path, before, after, action=None):
     return entry
 
 
-def _upgrade_preflight(path, wheel_path, with_codex, operation):
+def _upgrade_preflight(path, wheel_path, with_codex, operation,
+                       expected_stale_activity=None,
+                       reconciliation_request_id=None):
     root = _project_root(path)
     evidence = []
     try:
@@ -980,9 +986,9 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.1b4" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b4"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.1b4 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b5" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b5"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b5 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
@@ -992,7 +998,7 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
             if (database_status["usageSchemaState"] != "INSTALLED" or
                     database_status["orchestratorSchemaState"] != "INSTALLED" or
                     database_status["gatePolicySchemaState"] != "INSTALLED"):
-                raise LiteError("same-identity 0.3.1b4 project is missing a required schema extension")
+                raise LiteError("same-identity 0.3.1b5 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -1003,13 +1009,57 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
             return {"result": result, "root": root, "config": config, "database": database}
 
         if current_identity not in SUPPORTED_UPGRADE_SOURCES:
-            raise LiteError("upgrade source identity is outside the exact 0.3.1b3 to 0.3.1b4 matrix")
+            raise LiteError("upgrade source identity is outside the exact b3/b4 to b5 matrix")
         if database_status["usageSchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a 0.3.1b3 database without the exact usage extension")
+            raise LiteError("upgrade refuses a b3/b4 database without the exact usage extension")
         if database_status["orchestratorSchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a 0.3.1b3 database without the exact orchestrator extension")
+            raise LiteError("upgrade refuses a b3/b4 database without the exact orchestrator extension")
         if database_status["gatePolicySchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a 0.3.1b3 database without the exact auto-gate extension")
+            raise LiteError("upgrade refuses a b3/b4 database without the exact auto-gate extension")
+        live_count = sum(database_status[key] for key in (
+            "liveAgentClaims", "liveRepositoryWriters", "liveOrchestratorLeases"
+        ))
+        stale_count = sum(database_status[key] for key in (
+            "staleAgentClaims", "staleRepositoryWriters", "staleOrchestratorLeases"
+        ))
+        stale_fingerprint = activity_fingerprint(database_status["activity"])
+        deterministic_request = "upgrade-reconcile-" + stale_fingerprint[:32]
+        if live_count:
+            refused = _upgrade_refused(
+                operation, root, "live activity is held", current_identity,
+                target_identity, evidence=evidence,
+                next_step=_next_step(
+                    "STOP_LIVE_ACTIVITY_OWNER_AND_RECHECK", project=root,
+                    wheel=target_wheel, withCodex=with_codex,
+                ),
+            )
+            refused["reasonCode"] = "LIVE_ACTIVITY_HELD"
+            return {"result": refused, "root": root, "config": config,
+                    "database": database}
+        if operation != "CHECK":
+            if stale_count:
+                if (expected_stale_activity != stale_fingerprint or
+                        reconciliation_request_id != deterministic_request):
+                    refused = _upgrade_refused(
+                        operation, root, "activity snapshot changed or reconciliation arguments are missing",
+                        current_identity, target_identity, evidence=evidence,
+                        next_step=_next_step("RECHECK_UPGRADE", project=root,
+                                             wheel=target_wheel,
+                                             withCodex=with_codex),
+                    )
+                    refused["reasonCode"] = "ACTIVITY_SNAPSHOT_DRIFT"
+                    return {"result": refused, "root": root, "config": config,
+                            "database": database}
+            elif expected_stale_activity or reconciliation_request_id:
+                refused = _upgrade_refused(
+                    operation, root, "stale reconciliation arguments are invalid for an empty snapshot",
+                    current_identity, target_identity, evidence=evidence,
+                    next_step=_next_step("RECHECK_UPGRADE", project=root,
+                                         wheel=target_wheel, withCodex=with_codex),
+                )
+                refused["reasonCode"] = "ACTIVITY_SNAPSHOT_DRIFT"
+                return {"result": refused, "root": root, "config": config,
+                        "database": database}
         old_wheel, old_digest = _locked_wheel(root, os.path.dirname(target_wheel))
         old_identity = _wheel_identity(old_wheel)
         if old_identity != current_identity:
@@ -1080,8 +1130,18 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
                  "replaced": sorted(changed + [database_entry], key=lambda item: item["path"]),
                  "created": sorted(created, key=lambda item: item["path"]),
                  "untouched": sorted(untouched, key=lambda item: item["path"])}
-        next_step = (_next_step("EXECUTE_UPGRADE", project=root, wheel=target_wheel,
-                                withCodex=with_codex) if operation == "CHECK" else
+        if operation == "CHECK" and stale_count:
+            next_step = _next_step(
+                "EXECUTE_UPGRADE_WITH_RECONCILIATION", project=root,
+                wheel=target_wheel, withCodex=with_codex,
+                expectedStaleActivity=stale_fingerprint,
+                reconciliationRequestId=deterministic_request,
+            )
+        elif operation == "CHECK":
+            next_step = _next_step("EXECUTE_UPGRADE", project=root,
+                                   wheel=target_wheel, withCodex=with_codex)
+        else:
+            next_step = (
                      _next_step("RUN_POST_UPGRADE_VALIDATION", project=root,
                                 withCodex=with_codex))
         result = _upgrade_envelope(
@@ -1092,7 +1152,11 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
         return {"result": result, "root": root, "config": config, "database": database,
                 "targetWheel": target_wheel, "targetDigest": target_digest,
                 "oldWheel": old_wheel, "oldDigest": old_digest,
-                "replacements": effective, "paths": paths, "withCodex": with_codex}
+                "replacements": effective, "paths": paths, "withCodex": with_codex,
+                "staleFingerprint": stale_fingerprint if stale_count else None,
+                "reconciliationRequestId": (deterministic_request if stale_count else None),
+                "staleResources": [row for row in database_status["activity"]
+                                   if row["effectiveStatus"] == "STALE"]}
     except LiteError as exc:
         return {"result": _upgrade_refused(operation, root, str(exc),
                                             locals().get("current_identity"),
@@ -1121,6 +1185,57 @@ def _restore_database(database, backup_path):
     _atomic_bytes(database, _file_bytes(backup_path))
 
 
+def _write_upgrade_reconciliation(plan):
+    if not plan.get("staleFingerprint"):
+        return None
+    connection = open_database(plan["database"])
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        snapshot = activity_snapshot(connection)
+        live = [row for row in snapshot["resources"]
+                if row["effectiveStatus"] == "LIVE"]
+        stale = [row for row in snapshot["resources"]
+                 if row["effectiveStatus"] == "STALE"]
+        if (live or activity_fingerprint(stale) != plan["staleFingerprint"] or
+                stale != plan["staleResources"]):
+            raise LiteError("ACTIVITY_SNAPSHOT_DRIFT")
+        request_id = plan["reconciliationRequestId"]
+        if connection.execute(
+                "SELECT 1 FROM events WHERE request_id=?", (request_id,)
+        ).fetchone():
+            raise LiteError("reconciliation request-id already exists")
+        targets = {
+            "AGENT_CLAIM": ("claims", "claim_id"),
+            "REPOSITORY_WRITER": ("repository_locks", "lock_id"),
+            "ORCHESTRATOR_LEASE": ("orchestrator_leases", "lease_id"),
+        }
+        for row in stale:
+            table, column = targets[row["kind"]]
+            changed = connection.execute(
+                "UPDATE {0} SET status='EXPIRED',released_at=? WHERE {1}=? "
+                "AND status='ACTIVE' AND expires_at<=?".format(table, column),
+                (snapshot["clock"], row["resourceId"], snapshot["clock"]),
+            ).rowcount
+            if changed != 1:
+                raise LiteError("ACTIVITY_SNAPSHOT_DRIFT")
+        payload = {"protocolVersion": "AWB-ACTIVITY-v1",
+                   "staleFingerprint": plan["staleFingerprint"],
+                   "resources": stale}
+        connection.execute(
+            "INSERT INTO events(work_item_id,request_id,event_type,actor_kind,actor_id,"
+            "payload_json,created_at) VALUES(?,?,?,?,?,?,?)",
+            (stale[0]["workItemId"], request_id, "UPGRADE_ACTIVITY_RECONCILED",
+             "SYSTEM", "upgrade-reconciler", _json(payload), snapshot["clock"]),
+        )
+        connection.commit()
+        return payload
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def _write_upgrade(plan):
     root = plan["root"]
     stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -1146,6 +1261,8 @@ def _write_upgrade(plan):
         os.makedirs(os.path.dirname(database_backup), exist_ok=True)
         _database_backup(plan["database"], database_backup)
 
+        reconciliation = _write_upgrade_reconciliation(plan)
+
         actions = []
         for target, replacement, before, action in plan["replacements"]:
             relative = os.path.relpath(target, root).replace(os.sep, "/")
@@ -1169,7 +1286,7 @@ def _write_upgrade(plan):
                     human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("0.3.1b4 no-DDL extension validation failed")
+                raise LiteError("0.3.1b5 no-DDL extension validation failed")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1198,6 +1315,7 @@ def _write_upgrade(plan):
             "from": _identity_from_config(plan["config"]),
             "to": dict(BUILD_IDENTITY),
             "withCodex": plan["withCodex"],
+            "activityReconciliation": reconciliation,
             "actions": actions,
             "retained": [],
             "untouched": [dict({"action": "UNTOUCHED"}, **entry) for entry in plan["paths"]["untouched"]],
@@ -1373,12 +1491,20 @@ def _load_rollback(path, manifest_path, operation):
             raise LiteError("rollback manifest structure is invalid")
         required = {"protocolVersion", "state", "upgradeId", "createdAt", "projectId",
                     "repositoryKey", "projectRoot", "database", "backupRoot", "from", "to",
-                    "withCodex", "actions", "retained", "untouched"}
+                    "withCodex", "activityReconciliation", "actions", "retained", "untouched"}
         allowed = required | ({"consumedAt"} if manifest.get("state") == "CONSUMED" else set())
         if set(manifest) != allowed or manifest["protocolVersion"] != ROLLBACK_PROTOCOL:
             raise LiteError("rollback manifest structure is invalid")
         if manifest["state"] not in ("ACTIVE", "CONSUMED"):
             raise LiteError("rollback manifest state is invalid")
+        reconciliation = manifest["activityReconciliation"]
+        if reconciliation is not None:
+            if (not isinstance(reconciliation, dict) or
+                    reconciliation.get("protocolVersion") != "AWB-ACTIVITY-v1" or
+                    not isinstance(reconciliation.get("staleFingerprint"), str) or
+                    not isinstance(reconciliation.get("resources"), list) or
+                    not reconciliation["resources"]):
+                raise LiteError("rollback activity reconciliation binding is invalid")
         backup_root = os.path.dirname(manifest_path)
         config, database = _load_config(root)
         if (manifest["projectRoot"] != root or manifest["backupRoot"] != backup_root or
@@ -1392,6 +1518,10 @@ def _load_rollback(path, manifest_path, operation):
         _validate_project_contract(root)
         database_status = _database_preflight(database)
         evidence.append(dict({"id": "DATABASE", "status": "PASS"}, **database_status))
+        if (database_status["liveAgentClaims"] or
+                database_status["liveRepositoryWriters"] or
+                database_status["liveOrchestratorLeases"]):
+            raise LiteError("rollback refuses live activity")
         if manifest["state"] == "CONSUMED":
             raise LiteError("rollback manifest was already consumed")
 
@@ -1630,8 +1760,10 @@ def _write_rollback(plan):
     return result
 
 
-def upgrade_project(path, wheel_path=None, with_codex=False, check=False, rollback_manifest=None):
-    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b4."""
+def upgrade_project(path, wheel_path=None, with_codex=False, check=False,
+                    rollback_manifest=None, expected_stale_activity=None,
+                    reconciliation_request_id=None):
+    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b5."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",
@@ -1643,7 +1775,11 @@ def upgrade_project(path, wheel_path=None, with_codex=False, check=False, rollba
             return plan["result"]
         return _write_rollback(plan)
     operation = "CHECK" if check else "UPGRADE"
-    plan = _upgrade_preflight(path, wheel_path, with_codex, operation)
+    plan = _upgrade_preflight(
+        path, wheel_path, with_codex, operation,
+        expected_stale_activity=expected_stale_activity,
+        reconciliation_request_id=reconciliation_request_id,
+    )
     if check or plan["result"]["status"] in ("NO_OP", "REFUSED", "BLOCKED"):
         return plan["result"]
     try:
@@ -1665,11 +1801,9 @@ def migrate(path, check=False):
     _validate_identity(config, database)
     connection = open_database(database)
     try:
-        claims = connection.execute("SELECT count(*) FROM claims WHERE status='ACTIVE'").fetchone()[0]
-        writers = connection.execute("SELECT count(*) FROM repository_locks WHERE status='ACTIVE'").fetchone()[0]
+        activity = activity_snapshot(connection)
         usage_state = _usage_schema_state(connection)
         coordinator_state = orchestrator_schema_state(connection)
-        coordinators = active_count(connection)
         gate_policy_state = human_gate_schema_state(connection)
     finally:
         connection.close()
@@ -1686,11 +1820,13 @@ def migrate(path, check=False):
     result = {"current": SCHEMA_VERSION, "target": USAGE_SCHEMA_VERSION,
               "targetExtensions": [USAGE_SCHEMA_VERSION, ORCHESTRATOR_SCHEMA_VERSION,
                                    AUTO_GATE_SCHEMA_VERSION],
-              "pending": pending, "activeClaims": claims, "activeWriters": writers,
-              "activeOrchestratorLeases": coordinators}
+              "pending": pending}
+    result.update(activity["counts"])
     if check:
         return result
-    if claims or writers or coordinators:
+    if (activity["counts"]["liveAgentClaims"] or
+            activity["counts"]["liveRepositoryWriters"] or
+            activity["counts"]["liveOrchestratorLeases"]):
         raise LiteError("migrate refuses active claim, repository writer, or orchestrator lease")
     if not pending:
         result["status"] = "no-op"
@@ -1791,22 +1927,19 @@ def _row_hash(row):
 def transfer_export(database, work_item_ids, destination):
     source = open_database(database)
     try:
-        active = source.execute("SELECT count(*) FROM claims WHERE work_item_id IN ({0}) AND status='ACTIVE'".format(
-            ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
-        writers = source.execute("SELECT count(*) FROM repository_locks WHERE work_item_id IN ({0}) AND status='ACTIVE'".format(
-            ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
+        activity = activity_snapshot(source)
+        selected_activity = [row for row in activity["resources"]
+                             if row["workItemId"] in work_item_ids]
         coordinator_state = orchestrator_schema_state(source)
         if coordinator_state == "INVALID":
             raise LiteError("transfer export refuses invalid orchestrator extension")
         gate_policy_state = human_gate_schema_state(source)
         if gate_policy_state == "INVALID":
             raise LiteError("transfer export refuses invalid gate policy extension")
-        coordinators = (source.execute(
-            "SELECT count(*) FROM orchestrator_leases WHERE work_item_id IN ({0}) AND status='ACTIVE'".format(
-                ",".join("?" for _ in work_item_ids)), work_item_ids).fetchone()[0]
-                        if coordinator_state == "INSTALLED" else 0)
-        if active or writers or coordinators:
+        if any(row["effectiveStatus"] == "LIVE" for row in selected_activity):
             raise LiteError("transfer export refuses active claim, writer, or orchestrator lease")
+        if any(row["effectiveStatus"] == "STALE" for row in selected_activity):
+            raise LiteError("EXPIRED_ACTIVITY_RECONCILIATION_REQUIRED")
         bundle = {"schemaVersion": SCHEMA_VERSION, "bundleId": "bundle-" + uuid.uuid4().hex,
                   "sourceDatabaseId": _sha(os.path.realpath(database)),
                   "workItemIds": sorted(work_item_ids), "tables": {}}

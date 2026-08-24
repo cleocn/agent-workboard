@@ -98,6 +98,20 @@ Agent claim 不受 lease 后续过期、释放或接管影响。
 HUMAN gate、hold/block 和同 repositoryKey 单 writer 规则保持不变。AWB 只提供一次性
 本地 JSON 命令，不创建、监督、终止或迁移宿主进程和 Agent session。
 
+## 活动有效态与升级恢复
+
+claim、repository writer、Orchestrator lease 的持久状态与有效状态正交：`ACTIVE` 且
+未到期才是 LIVE，已到期的 `ACTIVE` 明确投影为 STALE。`doctor`、`activity list/show`
+与 Orchestrator list/show 使用同一个时钟且只读零写。公共 `reconcile-expired` 必须绑定
+精确 WorkItem、kind、resource id、owner、generation 和 request-id；LIVE、歧义 owner、
+错误 generation 或并发冲突均拒绝且不删除历史。
+
+只有 `FINAL_ACCEPTANCE_APPROVED` 在原 gate transaction 内关闭三类活动并写
+`TERMINAL_ACTIVITY_RECONCILED`。BLOCKED、WAITING_HUMAN、task CANCELLED 与非终态
+HELD 不触发清理。exact b3/b4 consumer 升 b5 时先运行零写 check：stale-only 的唯一
+nextStep 在完整备份后指纹重验并审计收口，LIVE 或 mixed 状态先停止于真实 owner。
+用户不需要手工清理或修改 SQLite。
+
 ## 主 Agent 活动期保障
 
 `.awb/config.json` 的 `usagePolicy` 缺失时按 `OFF`。OFF 时不绑定 session、不创建 span、

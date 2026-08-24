@@ -200,6 +200,19 @@ evidencePolicy:
                        per_file_manifest_sha, double_clean_reproducibility,
                        no_git_rebuild, reachable_object_closure]
 
+activityPolicy:
+  protocol: AWB-ACTIVITY-v1
+  kinds: [AGENT_CLAIM, REPOSITORY_WRITER, ORCHESTRATOR_LEASE]
+  effective: {LIVE: "ACTIVE and expires_at > clock", STALE: "ACTIVE and expires_at <= clock"}
+  readsAreZeroWrite: true
+  exactReconciliation: [workItemId, kind, resourceId, ownerId, generation, requestId]
+  trueTerminal: [FINAL_ACCEPTANCE_APPROVED]
+  nonTerminal: [BLOCKED, WAITING_HUMAN, HELD, TASK_CANCELLED]
+  upgradeSources: [exact_0_3_1b3, exact_0_3_1b4]
+  upgradeTarget: exact_0_3_1b5
+  staleOnlyNextStep: EXECUTE_UPGRADE_WITH_RECONCILIATION
+  liveOrMixedNextStep: STOP_LIVE_ACTIVITY_OWNER_AND_RECHECK
+
 managementPolicy:
   runtimeAuthority: sqlite_projection
   createRequiresCompleteEnvelope: true

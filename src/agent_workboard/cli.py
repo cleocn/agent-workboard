@@ -147,6 +147,23 @@ def _orchestrator_command(args):
     return 2 if result["status"] in ("REFUSED", "CONFLICT") else 0
 
 
+def _activity_command(args):
+    database = _project_database(args.project)
+    if args.activity_command == "list":
+        result = orchestrator.list_activity(
+            database, args.work_item, args.effective_status
+        )
+    elif args.activity_command == "show":
+        result = orchestrator.show_activity(database, args.kind, args.resource_id)
+    else:
+        result = orchestrator.reconcile_expired(
+            database, args.work_item, args.kind, args.resource_id, args.owner,
+            args.generation, args.request_id,
+        )
+    _print(result)
+    return 2 if result["status"] in ("REFUSED", "CONFLICT") else 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="awb")
     parser.add_argument("--version", action="version", version=__version__)
@@ -172,6 +189,8 @@ def main(argv=None):
     upgrade_source.add_argument("--rollback")
     upgrade.add_argument("--check", action="store_true")
     upgrade.add_argument("--with-codex", action="store_true")
+    upgrade.add_argument("--expected-stale-activity")
+    upgrade.add_argument("--reconciliation-request-id")
     codex = sub.add_parser("codex")
     codex_sub = codex.add_subparsers(dest="codex_command", required=True)
     for name in ("install", "check"):
@@ -286,6 +305,24 @@ def main(argv=None):
     coordinator_show = coordinator_sub.add_parser("show")
     coordinator_show.add_argument("work_item", metavar="work-item")
     coordinator_show.add_argument("--project", default=".")
+    activity = sub.add_parser("activity")
+    activity_sub = activity.add_subparsers(dest="activity_command", required=True)
+    activity_list = activity_sub.add_parser("list")
+    activity_list.add_argument("--project", default=".")
+    activity_list.add_argument("--work-item")
+    activity_list.add_argument("--effective-status", choices=("LIVE", "STALE", "INACTIVE"))
+    activity_show = activity_sub.add_parser("show")
+    activity_show.add_argument("--project", default=".")
+    activity_show.add_argument("--kind", choices=("claim", "repository-writer", "orchestrator-lease"), required=True)
+    activity_show.add_argument("--resource-id", required=True)
+    activity_reconcile = activity_sub.add_parser("reconcile-expired")
+    activity_reconcile.add_argument("--project", default=".")
+    activity_reconcile.add_argument("--work-item", required=True)
+    activity_reconcile.add_argument("--kind", choices=("claim", "repository-writer", "orchestrator-lease"), required=True)
+    activity_reconcile.add_argument("--resource-id", required=True)
+    activity_reconcile.add_argument("--owner", required=True)
+    activity_reconcile.add_argument("--generation", type=int, required=True)
+    activity_reconcile.add_argument("--request-id", required=True)
     lite_parser = sub.add_parser("lite", help="compatibility access to MVP-LITE commands")
     lite_parser.add_argument("--project", default=".")
     lite_parser.add_argument("--database")
@@ -312,8 +349,12 @@ def main(argv=None):
         elif args.command == "upgrade":
             if args.rollback and args.with_codex:
                 parser.error("--with-codex is only valid with --wheel")
-            result = upgrade_project(args.project, args.wheel, args.with_codex,
-                                     check=args.check, rollback_manifest=args.rollback)
+            result = upgrade_project(
+                args.project, args.wheel, args.with_codex, check=args.check,
+                rollback_manifest=args.rollback,
+                expected_stale_activity=args.expected_stale_activity,
+                reconciliation_request_id=args.reconciliation_request_id,
+            )
             _print(result)
             return 2 if result["status"] in ("REFUSED", "BLOCKED") else 0
         elif args.command == "codex":
@@ -327,6 +368,8 @@ def main(argv=None):
             _usage_command(args)
         elif args.command == "orchestrator":
             return _orchestrator_command(args)
+        elif args.command == "activity":
+            return _activity_command(args)
         elif args.command == "serve":
             database = _lite_args(args)
             return lite.main(database + ["serve", "--host", args.host, "--port", str(args.port)])

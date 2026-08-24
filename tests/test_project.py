@@ -50,9 +50,9 @@ class ProjectLifecycleTest(unittest.TestCase):
                          digest + "\n")
 
     def target_wheel(self):
-        identity = {"packageVersion": "0.3.1b4", "sourceCommit": "3" * 40,
-                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b4"}
-        path = os.path.join(self.temporary.name, "agent_workboard-0.3.1b4-py3-none-any.whl")
+        identity = {"packageVersion": "0.3.1b5", "sourceCommit": "3" * 40,
+                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b5"}
+        path = os.path.join(self.temporary.name, "agent_workboard-0.3.1b5-py3-none-any.whl")
         self.fake_wheel(path, identity, include_codex=True)
         return path, identity
 
@@ -711,9 +711,9 @@ class ProjectLifecycleTest(unittest.TestCase):
         with open(os.path.join(self.root, ".awb", "requirements-awb.txt"), "w", encoding="utf-8") as handle:
             handle.write("--require-hashes\nhttps://github.com/cleocn/agent-workboard/releases/download/v0.3.1b3/" +
                          os.path.basename(old_wheel) + "#egg=agent-workboard --hash=sha256:" + old_digest + "\n")
-        target_identity = {"packageVersion": "0.3.1b4", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b4"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b4-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b5", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b5"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b5-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity), \
                 mock.patch.object(project_module, "_is_editable", return_value=False):
@@ -737,7 +737,7 @@ class ProjectLifecycleTest(unittest.TestCase):
             self.assertEqual("ok", transfer_import(imported, bundle)["status"])
             self.assertEqual("AUTO_ON_PASS", get_work_item(imported, "AWB-LEGACY")["humanGatePolicy"])
         with open(os.path.join(self.root, ".awb", "config.json"), "r", encoding="utf-8") as handle:
-            self.assertEqual("0.3.1b4", json.load(handle)["requiredPackageVersion"])
+            self.assertEqual("0.3.1b5", json.load(handle)["requiredPackageVersion"])
 
     def test_exact_0_3_1b3_source_upgrades_and_rolls_back_missing_usage_policy_bytes(self):
         old_wheel = self.prepare_old_project(
@@ -785,11 +785,79 @@ class ProjectLifecycleTest(unittest.TestCase):
             else:
                 self.assertEqual(expected, self.read_bytes(path), path)
 
+    def test_exact_b4_direct_upgrade_and_b3_stale_recovery_use_two_step_public_route(self):
+        self.prepare_old_project(source_identity=project_module.RELEASE_0_3_1B4_IDENTITY)
+        target_wheel, target_identity = self.target_wheel()
+        with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
+            checked = upgrade_project(self.root, target_wheel, check=True)
+            self.assertEqual("EXECUTE_UPGRADE", checked["nextStep"]["action"])
+            upgraded = upgrade_project(self.root, target_wheel)
+        self.assertEqual("OK", upgraded["status"])
+
+        second = os.path.join(self.temporary.name, "stale-b3")
+        os.mkdir(second)
+        previous = self.root
+        self.root = second
+        try:
+            self.prepare_old_project(source_identity=project_module.RELEASE_0_3_1B3_IDENTITY)
+            database = os.path.join(self.root, ".awb", "workboard.db")
+            create_work_item(database, "AWB-STALE", "AWB", "stale terminal",
+                             management=self.management("AWB-STALE"))
+            lease = orchestrator_claim(
+                database, "AWB-STALE", "old-orchestrator", 10, "stale-lease",
+                now="2020-01-01T00:00:00+00:00",
+            )["lease"]
+            connection = open_database(database)
+            connection.execute(
+                "UPDATE work_items SET state='FINAL_ACCEPTANCE_APPROVED',queue_state='HELD',"
+                "current_role=NULL,held_reason='TERMINAL_STATE',"
+                "closed_at='2020-01-01T00:01:00+00:00' WHERE work_item_id='AWB-STALE'"
+            )
+            connection.commit()
+            connection.close()
+            before = self.tree_snapshot()
+            with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity), \
+                    mock.patch.object(project_module, "_is_editable", return_value=False):
+                checked = upgrade_project(self.root, target_wheel, check=True)
+                self.assertEqual("READY", checked["status"])
+                self.assertEqual("EXECUTE_UPGRADE_WITH_RECONCILIATION",
+                                 checked["nextStep"]["action"])
+                arguments = checked["nextStep"]["arguments"]
+                self.assertEqual(before, self.tree_snapshot())
+                upgraded = upgrade_project(
+                    self.root, target_wheel,
+                    expected_stale_activity=arguments["expectedStaleActivity"],
+                    reconciliation_request_id=arguments["reconciliationRequestId"],
+                )
+                self.assertEqual("OK", upgraded["status"])
+                self.assertEqual(0, doctor(self.root)["staleOrchestratorLeases"])
+                rollback = upgrade_project(
+                    self.root, rollback_manifest=upgraded["rollback"]["manifest"],
+                    check=True,
+                )
+                self.assertEqual("READY", rollback["status"])
+                restored = upgrade_project(
+                    self.root, rollback_manifest=upgraded["rollback"]["manifest"]
+                )
+                self.assertEqual("OK", restored["status"])
+            connection = open_database(database)
+            restored_lease = connection.execute(
+                "SELECT status,released_at FROM orchestrator_leases WHERE lease_id=?",
+                (lease["lease_id"],),
+            ).fetchone()
+            self.assertEqual(("ACTIVE", None), tuple(restored_lease))
+            self.assertEqual(0, connection.execute(
+                "SELECT count(*) FROM events WHERE event_type='UPGRADE_ACTIVITY_RECONCILED'"
+            ).fetchone()[0])
+            connection.close()
+        finally:
+            self.root = previous
+
     def test_upgrade_refuses_customized_codex_without_changing_contract(self):
         self.prepare_old_project(with_codex=True)
-        target_identity = {"packageVersion": "0.3.1b4", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b4"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b4-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b5", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b5"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b5-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         config_path = os.path.join(self.root, ".awb", "config.json")
         with open(config_path, "rb") as handle:
@@ -844,7 +912,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                           "withCodex": False},
                          refused["nextStep"]["arguments"])
 
-        unsupported.update({"requiredPackageVersion": "0.3.1b4",
+        unsupported.update({"requiredPackageVersion": "0.3.1b5",
                             "requiredSourceCommit": target_identity["sourceCommit"],
                             "requiredSourceTree": target_identity["sourceTree"],
                             "requiredSourceTag": target_identity["sourceTag"]})
@@ -894,7 +962,7 @@ class ProjectLifecycleTest(unittest.TestCase):
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
             result = upgrade_project(self.root, target_wheel, check=True)
         self.assertEqual("REFUSED", result["status"])
-        self.assertIn("exact 0.3.1b3 to 0.3.1b4 matrix", result["reason"])
+        self.assertIn("exact b3/b4 to b5 matrix", result["reason"])
         self.assertEqual(before, self.tree_snapshot())
 
     def test_upgrade_refuses_symbolic_backup_root_before_any_internal_or_external_write(self):
@@ -1270,9 +1338,9 @@ class ProjectLifecycleTest(unittest.TestCase):
         create_work_item(database, "AWB-777", "AWB", "active", management=self.management("AWB-777"))
         acquire_claim(database, "AWB-777", "AWB-777-T01", "planner", "PLANNER",
                       "2099-01-01T00:00:00+00:00")
-        target_identity = {"packageVersion": "0.3.1b4", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b4"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b4-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b5", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b5"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b5-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         config_path = os.path.join(self.root, ".awb", "config.json")
         with open(config_path, "rb") as handle:
@@ -1280,7 +1348,7 @@ class ProjectLifecycleTest(unittest.TestCase):
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
             result = upgrade_project(self.root, target_wheel)
             self.assertEqual("REFUSED", result["status"])
-            self.assertEqual("RELEASE_ACTIVE_USE_AND_RECHECK_UPGRADE",
+            self.assertEqual("STOP_LIVE_ACTIVITY_OWNER_AND_RECHECK",
                              result["nextStep"]["action"])
             self.assertEqual({"project": os.path.realpath(self.root),
                               "wheel": os.path.realpath(target_wheel),
@@ -1322,7 +1390,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                 refused = upgrade_project(self.root, rollback_manifest=upgraded["rollback"]["manifest"],
                                            check=True)
             self.assertEqual("REFUSED", refused["status"])
-            self.assertIn("active", refused["reason"])
+            self.assertIn("live", refused["reason"])
             self.assertEqual(before, self.tree_snapshot())
         finally:
             self.root = original_root
@@ -1334,14 +1402,14 @@ class ProjectLifecycleTest(unittest.TestCase):
                          management=self.management("AWB-780"))
         claimed = orchestrator_claim(database, "AWB-780", "local-owner", 900,
                                      "orchestrator-active",
-                                     now="2026-08-22T00:00:00+00:00")
+                                     now="2099-01-01T00:00:00+00:00")
         self.assertEqual("OK", claimed["status"])
         target_wheel, target_identity = self.target_wheel()
         before = self.tree_snapshot()
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
             result = upgrade_project(self.root, target_wheel, check=True)
         self.assertEqual("REFUSED", result["status"])
-        self.assertIn("active", result["reason"])
+        self.assertIn("live", result["reason"])
         self.assertEqual(before, self.tree_snapshot())
 
     def test_upgrade_write_fault_restores_contract_and_created_paths(self):
@@ -1494,7 +1562,7 @@ class ProjectLifecycleTest(unittest.TestCase):
 
     def test_real_pip_wheel_init_and_doctor_work_from_an_unrelated_directory(self):
         repository = os.path.dirname(os.path.dirname(__file__))
-        wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b4-py3-none-any.whl")
+        wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b5-py3-none-any.whl")
         self.assertTrue(os.path.isfile(wheel), "final candidate wheel must be present for this lifecycle test")
         with tempfile.TemporaryDirectory() as temporary:
             environment = dict(os.environ)
@@ -1514,7 +1582,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                 os.unlink(direct_url)
             subprocess.check_call([awb, "init", "--project", project], cwd=unrelated, env=environment)
             subprocess.check_call([awb, "doctor", "--project", project], cwd=unrelated, env=environment)
-            artifact = os.path.join(project, ".awb", "artifacts", "agent_workboard-0.3.1b4-py3-none-any.whl")
+            artifact = os.path.join(project, ".awb", "artifacts", "agent_workboard-0.3.1b5-py3-none-any.whl")
             requirements = os.path.join(project, ".awb", "requirements-awb.txt")
             self.assertTrue(os.path.isfile(artifact))
             with open(requirements, encoding="utf-8") as handle:
@@ -1541,17 +1609,17 @@ class ProjectLifecycleTest(unittest.TestCase):
     def test_installed_wheel_rebuild_accepts_only_owned_nested_empty_cache_rows(self):
         installation = os.path.join(self.temporary.name, "installed")
         package = os.path.join(installation, "agent_workboard")
-        metadata = os.path.join(installation, "agent_workboard-0.3.1b4.dist-info")
+        metadata = os.path.join(installation, "agent_workboard-0.3.1b5.dist-info")
         os.makedirs(os.path.join(package, "usage_adapters", "nested", "__pycache__"))
         os.makedirs(metadata)
-        identity = {"packageVersion": "0.3.1b4", "sourceCommit": "3" * 40,
-                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b4"}
+        identity = {"packageVersion": "0.3.1b5", "sourceCommit": "3" * 40,
+                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b5"}
         files = {
             "agent_workboard/__init__.py": b"",
             "agent_workboard/_build.py": ("BUILD_IDENTITY = " + repr(identity) + "\n").encode("utf-8"),
-            "agent_workboard-0.3.1b4.dist-info/METADATA":
-                b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b4\n\n",
-            "agent_workboard-0.3.1b4.dist-info/WHEEL":
+            "agent_workboard-0.3.1b5.dist-info/METADATA":
+                b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b5\n\n",
+            "agent_workboard-0.3.1b5.dist-info/WHEEL":
                 b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         }
         for relative, raw in files.items():
@@ -1577,7 +1645,7 @@ class ProjectLifecycleTest(unittest.TestCase):
         record = os.path.join(metadata, "RECORD")
         base_rows = [hashed_row(relative) for relative in sorted(files)]
         base_rows.extend([[relative, "", ""] for relative in caches])
-        base_rows.append(["agent_workboard-0.3.1b4.dist-info/RECORD", "", ""])
+        base_rows.append(["agent_workboard-0.3.1b5.dist-info/RECORD", "", ""])
 
         def write_rows(rows):
             import csv

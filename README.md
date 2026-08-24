@@ -5,15 +5,15 @@ planner → reviewer → policy gate → implementer → reviewer workflow. It h
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install the 0.3.1b4 Preview
+## Install the 0.3.1b5 Preview
 
 This release is an opt-in, local-only, observation-only Preview. Download the
-wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b4` prerelease, verify both
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b5` prerelease, verify both
 artifacts, then initialize a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b4-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b5-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -36,23 +36,27 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an exact 0.3.1b3 project
+## Upgrade an exact 0.3.1b3 or 0.3.1b4 project
 
-Retain the exact old 0.3.1b3 wheel and install the verified 0.3.1b4 wheel. If the
+Retain the exact old 0.3.1b3 wheel and install the verified 0.3.1b5 wheel. If the
 project uses an official GitHub URL lock, place its verified 0.3.1b3 wheel beside
 the Preview wheel; a local file lock continues to use its recorded path. Always
 run the read-only preflight first, then execute only its one structured
 `nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b4-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b4-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b5-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b5-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
 
-Upgrade accepts only the exact released 0.3.1b3→0.3.1b4 identity pair. It refuses
-an invalid database, active claim/writer/Orchestrator lease, identity drift,
+Upgrade accepts only the exact released b3→b5 and b4→b5 identity pairs. Its
+zero-write check reports LIVE and STALE activity separately. Stale-only state
+returns one `EXECUTE_UPGRADE_WITH_RECONCILIATION` action whose fingerprint and
+request ID are passed unchanged to execute; backup and snapshot revalidation
+occur before audited reconciliation. LIVE or mixed state refuses until its
+owner releases normally. It also refuses an invalid database, identity drift,
 missing or partial source extensions, and customized package-owned Codex files.
 Execution first makes an online backup, then validates existing `AWB-USAGE-v1`,
 `AWB-ORCHESTRATOR-v1` and `AWB-AUTO-GATE-v1` in one transaction without schema
@@ -60,6 +64,11 @@ DDL. Existing WorkItems preserve their policies. The bound rollback manifest inc
 any post-upgrade workflow or usage write makes rollback fail closed rather than discard data.
 Use `awb upgrade --check --rollback <manifest>` before the exact rollback
 command. Do not restore files or database tables by hand.
+
+Use `awb activity list --project .` to inspect all effective activity, or
+`awb activity show --kind orchestrator-lease --resource-id <id> --project .`.
+The exact `reconcile-expired` command is a recovery primitive; normal consumers
+do not need it for upgrade because b5 performs stale-only recovery internally.
 
 The shipped Orchestrator Skill routes Agents to
 `references/upgrade-and-rollback.md` (`AWB-UPGRADE-RUNBOOK-v1`) before upgrade,

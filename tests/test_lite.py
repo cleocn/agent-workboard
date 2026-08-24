@@ -1058,6 +1058,40 @@ class LiteWorkboardTest(unittest.TestCase):
             local_tests_passed=True, quality_baseline=self.quality(),
         )
         self.claim("TI-030", 3, "final-reviewer", "REVIEWER")
+        connection = open_database(self.database)
+        now, expiry = datetime.datetime.now(datetime.timezone.utc).replace(
+            microsecond=0).isoformat(), self.expires()
+        connection.execute("INSERT INTO orchestrator_instances VALUES(?,?,?)",
+                           ("terminal-owner", now, now))
+        connection.execute(
+            "INSERT INTO orchestrator_leases VALUES(?,?,?,1,'ACTIVE',?,?,?,NULL)",
+            ("terminal-lease", "TI-030", "terminal-owner", now, now, expiry),
+        )
+        connection.execute(
+            "INSERT INTO repository_locks VALUES(?,?,?,?,1,'ACTIVE',?,?,NULL)",
+            ("terminal-writer", "terminal-repo", "TI-030", "implementer-auto",
+             now, expiry),
+        )
+        connection.commit()
+        connection.close()
+        with mock.patch("agent_workboard.orchestrator._activity_event",
+                        side_effect=RuntimeError("terminal event fault")):
+            with self.assertRaisesRegex(RuntimeError, "terminal event fault"):
+                record_agent_review(
+                    self.database, "TI-030", "FINAL", "final-reviewer", "APPROVED",
+                    self.structured_review("IMPLEMENTATION", "PASS"),
+                    request_id="final-terminal-fault",
+                )
+        connection = open_database(self.database)
+        self.assertEqual("IMPLEMENTATION_COMPLETED", connection.execute(
+            "SELECT state FROM work_items WHERE work_item_id='TI-030'"
+        ).fetchone()[0])
+        self.assertEqual(3, connection.execute(
+            "SELECT (SELECT count(*) FROM claims WHERE work_item_id='TI-030' AND status='ACTIVE') + "
+            "(SELECT count(*) FROM repository_locks WHERE work_item_id='TI-030' AND status='ACTIVE') + "
+            "(SELECT count(*) FROM orchestrator_leases WHERE work_item_id='TI-030' AND status='ACTIVE')"
+        ).fetchone()[0])
+        connection.close()
         done = record_agent_review(
             self.database, "TI-030", "FINAL", "final-reviewer", "APPROVED",
             self.structured_review("IMPLEMENTATION", "PASS"),
@@ -1069,6 +1103,21 @@ class LiteWorkboardTest(unittest.TestCase):
             row["event_type"] == "AUTO_GATE_APPROVED"
             for row in timeline(self.database, "TI-030")
         ))
+        connection = open_database(self.database)
+        self.assertEqual(0, connection.execute(
+            "SELECT count(*) FROM claims WHERE work_item_id='TI-030' AND status='ACTIVE'"
+        ).fetchone()[0])
+        self.assertEqual("RELEASED", connection.execute(
+            "SELECT status FROM repository_locks WHERE lock_id='terminal-writer'"
+        ).fetchone()[0])
+        self.assertEqual("RELEASED", connection.execute(
+            "SELECT status FROM orchestrator_leases WHERE lease_id='terminal-lease'"
+        ).fetchone()[0])
+        connection.close()
+        terminal = [row for row in timeline(self.database, "TI-030")
+                    if row["event_type"] == "TERMINAL_ACTIVITY_RECONCILED"]
+        self.assertEqual(1, len(terminal))
+        self.assertEqual(3, len(json.loads(terminal[0]["payload_json"])["resources"]))
 
     def test_auto_final_quality_drift_fails_closed_without_auto_event(self):
         create_work_item(
