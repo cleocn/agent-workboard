@@ -108,8 +108,11 @@ claim、repository writer、Orchestrator lease 的持久状态与有效状态正
 
 只有 `FINAL_ACCEPTANCE_APPROVED` 在原 gate transaction 内关闭三类活动并写
 `TERMINAL_ACTIVITY_RECONCILED`。BLOCKED、WAITING_HUMAN、task CANCELLED 与非终态
-HELD 不触发清理。exact b3/b4 consumer 升 b5 时先运行零写 check：stale-only 的唯一
-nextStep 在完整备份后指纹重验并审计收口，LIVE 或 mixed 状态先停止于真实 owner。
+HELD 不触发清理。FINAL review event 绑定刚释放的精确 Reviewer claim；MANUAL gate
+只接受该绑定，legacy b5 event 仅在 actor、task、release 时刻唯一匹配时兼容。exact
+b3/b4/b5 consumer 升 b6 时先运行零写 check：冻结的 `AWB-MIGRATION-GRAPH-v1`
+选择唯一完整 identity route，stale-only 的唯一 nextStep 在完整备份后指纹重验并审计收口，
+LIVE 或 mixed 状态先停止于真实 owner。
 用户不需要手工清理或修改 SQLite。
 
 ## 主 Agent 活动期保障

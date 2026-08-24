@@ -1,6 +1,6 @@
 # Local multi-Orchestrator quickstart
 
-In b5, persisted `ACTIVE` and effective activity are separate. An unexpired row
+In b6, persisted `ACTIVE` and effective activity are separate. An unexpired row
 is `LIVE`; an expired persisted row is visible as `STALE` until an audited
 reconciliation or a true terminal transition closes it. `doctor`, `activity`
 and Orchestrator list/show use the same transaction clock.
@@ -78,6 +78,8 @@ Agent task claim.
 Only `FINAL_ACCEPTANCE_APPROVED` is a true terminal state and atomically closes
 its claim, writer, and lease. `BLOCKED`, `WAITING_HUMAN`, task `CANCELLED`, and
 nonterminal `HELD` remain resumable and do not trigger cleanup.
+The terminal audit also binds the exact released FINAL Reviewer claim; legacy
+b5 manual approvals proceed only when that binding is unique and exact.
 
 ## Recover an expired owner
 

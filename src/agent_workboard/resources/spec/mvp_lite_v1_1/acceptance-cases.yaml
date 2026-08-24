@@ -1,4 +1,4 @@
-version: AWB-020-v1
+version: AWB-022-v2
 owner: AWB-020
 managementContract: AWB-WORKITEM-MGMT-v1
 templateContract: AWB-MANAGEMENT-v1
@@ -75,3 +75,6 @@ cases:
   - {id: AWB-022-AC-008, priority: P0, title: Preview 三资产 immutable release 与远程 ref 精确}
   - {id: AWB-022-AC-009, priority: P0, title: 当前 workspace 经 public b5 唯一 nextStep 友好升级}
   - {id: AWB-022-AC-010, priority: P0, title: 独立 review AUTO gate 与授权边界不回归}
+  - {id: AWB-022-AC-011, priority: P0, title: terminal nonclaimable claim 结构化拒绝零写且 claim-next 继续选择合法项}
+  - {id: AWB-022-AC-012, priority: P0, title: MANUAL AUTO FINAL 精确绑定已释放 Reviewer claim 且 legacy fault fail closed}
+  - {id: AWB-022-AC-013, priority: P0, title: exact b3 b4 b5 经冻结迁移图一次 check execute 到 b6 并整路 rollback}

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1b6 Preview
+
+- Fix terminal and non-claimable Orchestrator claims to return the stable
+  structured refusal envelope without changing the database.
+- Bind FINAL approval audit to the exact released Reviewer claim in both
+  automatic and manual flows, with fail-closed legacy validation.
+- Add a frozen `AWB-MIGRATION-GRAPH-v1` route so exact public b3, b4, and b5
+  projects can reach b6 through one preflight, one backup-first execution, and
+  one whole-route rollback.
+- Preserve the b5 activity model, no-DDL schema contract, Usage default OFF,
+  independent reviews, local-only scope, and streamlined Preview gates.
+
 ## 0.3.1b5 Preview
 
 - Project claims, repository writers, and Orchestrator leases now share one

@@ -251,6 +251,70 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             value["lease"]["work_item_id"] for value in results
         ))
 
+    def test_claim_ineligible_is_structured_zero_write_and_claim_next_skips_it(self):
+        self.create("AWB-206", "P0")
+        self.create("AWB-207", "P1")
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE work_items SET queue_state='WAITING_HUMAN',current_role=NULL "
+            "WHERE work_item_id='AWB-206'"
+        )
+        connection.commit()
+        before = "\n".join(connection.iterdump())
+        direct = orchestrator_module._eligible(
+            connection, "AWB-206", self.now()
+        )
+        self.assertEqual(3, len(direct))
+        self.assertEqual(("AWB-206", "NOT_ELIGIBLE", []),
+                         (direct[0]["work_item_id"], direct[1], direct[2]))
+        connection.close()
+
+        refused = claim(
+            self.database, "AWB-206", "ineligible-owner", 900,
+            "ineligible-direct",
+        )
+        self.assertEqual(("AWB-ORCHESTRATOR-v1", "REFUSED", "NOT_ELIGIBLE"), (
+            refused["protocolVersion"], refused["status"], refused["reasonCode"],
+        ))
+        self.assertEqual({"action", "arguments"}, set(refused["nextStep"]))
+        connection = open_database(self.database)
+        self.assertEqual(before, "\n".join(connection.iterdump()))
+        connection.close()
+
+        code, value = self.cli([
+            "claim", "AWB-206", "--orchestrator", "cli-ineligible",
+            "--ttl", "30", "--request-id", "cli-ineligible-claim",
+        ])
+        self.assertEqual(2, code)
+        self.assertEqual(("REFUSED", "NOT_ELIGIBLE"),
+                         (value["status"], value["reasonCode"]))
+        self.assertEqual({"action", "arguments"}, set(value["nextStep"]))
+        connection = open_database(self.database)
+        self.assertEqual(before, "\n".join(connection.iterdump()))
+        connection.close()
+
+        selected = claim_next(
+            self.database, "next-eligible", 900, "next-skips-ineligible"
+        )
+        self.assertEqual("AWB-207", selected["lease"]["work_item_id"])
+        release(
+            self.database, "AWB-207", "next-eligible",
+            selected["lease"]["generation"], "release-next-eligible",
+        )
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE work_items SET queue_state='WAITING_HUMAN',current_role=NULL "
+            "WHERE work_item_id='AWB-207'"
+        )
+        connection.commit()
+        connection.close()
+        no_candidate = claim_next(
+            self.database, "next-none", 900, "next-all-ineligible"
+        )
+        self.assertEqual(("NO_OP", "NO_CANDIDATE"),
+                         (no_candidate["status"], no_candidate["reasonCode"]))
+        self.assertEqual({"action", "arguments"}, set(no_candidate["nextStep"]))
+
     def test_renew_release_recover_fencing_and_inflight_agent_independence(self):
         self.create("AWB-301")
         current = self.now()

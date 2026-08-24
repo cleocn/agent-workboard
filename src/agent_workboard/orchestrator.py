@@ -525,7 +525,8 @@ def reconcile_expired(database, work_item_id, kind, resource_id, owner,
         connection.close()
 
 
-def reconcile_terminal_activity(connection, work_item_id, now, request_id):
+def reconcile_terminal_activity(connection, work_item_id, now, request_id,
+                                reviewer_claim=None):
     """Close all persisted ACTIVE activity in the caller's final-gate transaction."""
     snapshot = activity_snapshot(connection, now, work_item_id=work_item_id)
     changed = []
@@ -541,7 +542,29 @@ def reconcile_terminal_activity(connection, work_item_id, now, request_id):
         )
         record = dict(value)
         record["afterStatus"] = after
+        record["mutated"] = True
         changed.append(record)
+    if reviewer_claim is not None:
+        changed.append({
+            "kind": "AGENT_CLAIM",
+            "resourceId": reviewer_claim["claimId"],
+            "workItemId": reviewer_claim["workItemId"],
+            "taskId": reviewer_claim["taskId"],
+            "ownerKind": "AGENT",
+            "ownerId": reviewer_claim["agentId"],
+            "role": reviewer_claim["role"],
+            "generation": reviewer_claim["generation"],
+            "releasedAt": reviewer_claim["releasedAt"],
+            "persistedStatus": "RELEASED",
+            "beforeStatus": "RELEASED",
+            "effectiveStatus": "INACTIVE",
+            "afterStatus": "RELEASED",
+            "terminal": True,
+            "reasonCode": None,
+            "safeAction": "NONE",
+            "mutated": False,
+            "source": "FINAL_REVIEW_CLAIM",
+        })
     _activity_event(
         connection, work_item_id, request_id, "TERMINAL_ACTIVITY_RECONCILED",
         {"triggerRequestId": request_id, "resources": changed}, now,
@@ -718,7 +741,7 @@ def _eligible(connection, work_item_id, now):
         return item, "NOT_ELIGIBLE", []
     if (item["state"] == "FINAL_ACCEPTANCE_APPROVED" or
             item["queue_state"] != "CLAIMABLE" or not item["current_role"]):
-        return item, "NOT_ELIGIBLE"
+        return item, "NOT_ELIGIBLE", []
     if connection.execute(
         "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE' AND expires_at>?",
         (work_item_id, now),
@@ -762,7 +785,8 @@ def claim(database, work_item_id, orchestrator_id, ttl, request_id, now=None):
             status = "CONFLICT" if reason == "LEASE_HELD" else "REFUSED"
             result = _result("CLAIM", status, reason=reason,
                              next_step=_next("SELECT_ANOTHER_OR_RETRY"))
-            return result, "ORCHESTRATOR_CLAIM_REFUSED", work_item_id, None, False
+            event_type = None if reason == "NOT_ELIGIBLE" else "ORCHESTRATOR_CLAIM_REFUSED"
+            return result, event_type, work_item_id, None, False
         lease = _new_lease(connection, work_item_id, orchestrator_id, ttl, current)
         result = _result("CLAIM", "OK", lease=lease, reconciledActivity=reconciled,
                          next_step=_next("DISPATCH_AGENT", workItemId=work_item_id,

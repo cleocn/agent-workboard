@@ -5,15 +5,15 @@ planner → reviewer → policy gate → implementer → reviewer workflow. It h
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install the 0.3.1b5 Preview
+## Install the 0.3.1b6 Preview
 
 This release is an opt-in, local-only, observation-only Preview. Download the
-wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b5` prerelease, verify both
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b6` prerelease, verify both
 artifacts, then initialize a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b5-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b6-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -36,22 +36,23 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an exact 0.3.1b3 or 0.3.1b4 project
+## Upgrade an exact 0.3.1b3, 0.3.1b4, or 0.3.1b5 project
 
-Retain the exact old 0.3.1b3 wheel and install the verified 0.3.1b5 wheel. If the
-project uses an official GitHub URL lock, place its verified 0.3.1b3 wheel beside
+Retain the exact old release wheel and install the verified 0.3.1b6 wheel. If the
+project uses an official GitHub URL lock, place its verified source wheel beside
 the Preview wheel; a local file lock continues to use its recorded path. Always
 run the read-only preflight first, then execute only its one structured
 `nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b5-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b5-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b6-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b6-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
 
-Upgrade accepts only the exact released b3→b5 and b4→b5 identity pairs. Its
+Upgrade selects only the frozen exact b3→b4→b5→b6 migration graph. b3, b4,
+and b5 each reach b6 through one zero-write check and one execution. Its
 zero-write check reports LIVE and STALE activity separately. Stale-only state
 returns one `EXECUTE_UPGRADE_WITH_RECONCILIATION` action whose fingerprint and
 request ID are passed unchanged to execute; backup and snapshot revalidation
@@ -68,7 +69,7 @@ command. Do not restore files or database tables by hand.
 Use `awb activity list --project .` to inspect all effective activity, or
 `awb activity show --kind orchestrator-lease --resource-id <id> --project .`.
 The exact `reconcile-expired` command is a recovery primitive; normal consumers
-do not need it for upgrade because b5 performs stale-only recovery internally.
+do not need it for upgrade because b6 performs stale-only recovery internally.
 
 The shipped Orchestrator Skill routes Agents to
 `references/upgrade-and-rollback.md` (`AWB-UPGRADE-RUNBOOK-v1`) before upgrade,

@@ -42,6 +42,7 @@ ORCHESTRATOR_TABLES = ("orchestrator_instances", "orchestrator_leases",
                        "orchestrator_events")
 UPGRADE_PROTOCOL = "AWB-UPGRADE-v1"
 ROLLBACK_PROTOCOL = "AWB-ROLLBACK-v1"
+MIGRATION_GRAPH_PROTOCOL = "AWB-MIGRATION-GRAPH-v1"
 RELEASE_0_3_1B3_IDENTITY = {
     "packageVersion": "0.3.1b3",
     "sourceCommit": "237a069e3339933b90afbad171c2400547c23f2f",
@@ -54,8 +55,128 @@ RELEASE_0_3_1B4_IDENTITY = {
     "sourceTree": "7de811338c01aa47a047f08b2b036379a39fac53",
     "sourceTag": "v0.3.1b4",
 }
-SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_1B3_IDENTITY, RELEASE_0_3_1B4_IDENTITY)
+RELEASE_0_3_1B5_IDENTITY = {
+    "packageVersion": "0.3.1b5",
+    "sourceCommit": "c1e09f520716ab7734ebb331049cb4c24e2673e4",
+    "sourceTree": "305624083162b6c553b05b29ac13ac4cfac0f892",
+    "sourceTag": "v0.3.1b5",
+}
+SUPPORTED_UPGRADE_SOURCES = (
+    RELEASE_0_3_1B3_IDENTITY, RELEASE_0_3_1B4_IDENTITY,
+    RELEASE_0_3_1B5_IDENTITY,
+)
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
+
+
+def _identity_key(identity):
+    if not isinstance(identity, dict) or set(identity) != set(IDENTITY_KEYS):
+        raise LiteError("MIGRATION_IDENTITY_INVALID")
+    return tuple(identity[key] for key in IDENTITY_KEYS)
+
+
+def _migration_graph():
+    nodes = [dict(identity) for identity in SUPPORTED_UPGRADE_SOURCES]
+    nodes.append(dict(BUILD_IDENTITY))
+    return {
+        "protocolVersion": MIGRATION_GRAPH_PROTOCOL,
+        "nodes": nodes,
+        "edges": [
+            {
+                "edgeId": "B3_TO_B4_CONFIG_CANONICALIZATION",
+                "from": dict(RELEASE_0_3_1B3_IDENTITY),
+                "to": dict(RELEASE_0_3_1B4_IDENTITY),
+                "preconditionId": "EXACT_B3_PROJECT",
+                "transformId": "CONFIG_CANONICALIZATION",
+                "schemaAction": "NO_DDL",
+                "rollback": "BOUND_BACKUP_RESTORE",
+            },
+            {
+                "edgeId": "B4_TO_B5_ACTIVITY_RECOVERY",
+                "from": dict(RELEASE_0_3_1B4_IDENTITY),
+                "to": dict(RELEASE_0_3_1B5_IDENTITY),
+                "preconditionId": "EXACT_B4_PROJECT",
+                "transformId": "ACTIVITY_RECOVERY",
+                "schemaAction": "NO_DDL",
+                "rollback": "BOUND_BACKUP_RESTORE",
+            },
+            {
+                "edgeId": "B5_TO_B6_FINDING_CORRECTION",
+                "from": dict(RELEASE_0_3_1B5_IDENTITY),
+                "to": dict(BUILD_IDENTITY),
+                "preconditionId": "EXACT_B5_PROJECT",
+                "transformId": "FINDING_CORRECTION",
+                "schemaAction": "NO_DDL",
+                "rollback": "BOUND_BACKUP_RESTORE",
+            },
+        ],
+    }
+
+
+def _validate_migration_graph(graph=None):
+    graph = graph or _migration_graph()
+    if (not isinstance(graph, dict) or set(graph) != {"protocolVersion", "nodes", "edges"} or
+            graph.get("protocolVersion") != MIGRATION_GRAPH_PROTOCOL or
+            not isinstance(graph.get("nodes"), list) or
+            not isinstance(graph.get("edges"), list)):
+        raise LiteError("MIGRATION_GRAPH_INVALID")
+    node_keys = [_identity_key(node) for node in graph["nodes"]]
+    if len(node_keys) != len(set(node_keys)):
+        raise LiteError("MIGRATION_GRAPH_DUPLICATE_NODE")
+    node_set = set(node_keys)
+    edge_ids = set()
+    outgoing = {}
+    required = {
+        "edgeId", "from", "to", "preconditionId", "transformId",
+        "schemaAction", "rollback",
+    }
+    for edge in graph["edges"]:
+        if not isinstance(edge, dict) or set(edge) != required:
+            raise LiteError("MIGRATION_GRAPH_INVALID_EDGE")
+        source, target = _identity_key(edge["from"]), _identity_key(edge["to"])
+        if (source not in node_set or target not in node_set or source == target or
+                not isinstance(edge["edgeId"], str) or not edge["edgeId"] or
+                edge["edgeId"] in edge_ids or source in outgoing or
+                edge["schemaAction"] != "NO_DDL" or
+                edge["rollback"] != "BOUND_BACKUP_RESTORE"):
+            raise LiteError("MIGRATION_GRAPH_INVALID_EDGE")
+        edge_ids.add(edge["edgeId"])
+        outgoing[source] = edge
+    for origin in node_keys:
+        seen = set()
+        cursor = origin
+        while cursor in outgoing:
+            if cursor in seen:
+                raise LiteError("MIGRATION_GRAPH_CYCLE")
+            seen.add(cursor)
+            cursor = _identity_key(outgoing[cursor]["to"])
+    return graph
+
+
+def _migration_route(source, target, graph=None):
+    graph = _validate_migration_graph(graph)
+    source_key, target_key = _identity_key(source), _identity_key(target)
+    if source_key == target_key:
+        return [], _sha(_json({
+            "protocolVersion": MIGRATION_GRAPH_PROTOCOL,
+            "from": source, "to": target, "edges": [],
+        }))
+    outgoing = {_identity_key(edge["from"]): edge for edge in graph["edges"]}
+    route = []
+    cursor = source_key
+    while cursor != target_key:
+        edge = outgoing.get(cursor)
+        if edge is None:
+            raise LiteError("MIGRATION_ROUTE_MISSING")
+        route.append(edge)
+        cursor = _identity_key(edge["to"])
+        if len(route) > len(graph["nodes"]):
+            raise LiteError("MIGRATION_GRAPH_CYCLE")
+    fingerprint = _sha(_json({
+        "protocolVersion": MIGRATION_GRAPH_PROTOCOL,
+        "from": source, "to": target,
+        "edges": route,
+    }))
+    return route, fingerprint
 
 
 def _json(value):
@@ -401,7 +522,8 @@ def _validate_project_contract(root):
     elif (parsed.scheme != "https" or parsed.netloc != "github.com" or
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
                   for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1",
-                              "v0.3.1b2", "v0.3.1b3", "v0.3.1b4", "v0.3.1b5"))):
+                              "v0.3.1b2", "v0.3.1b3", "v0.3.1b4", "v0.3.1b5",
+                              "v0.3.1b6"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -821,7 +943,8 @@ def _forward_refusal_step(reason, root, wheel, with_codex):
         action = "RESTORE_SAFE_BACKUP_ROOT_AND_RECHECK"
     elif "customized or unowned Codex" in reason:
         action = "RESTORE_PACKAGE_OWNED_CODEX_AND_RECHECK"
-    elif ("outside the explicit" in reason or "outside the exact" in reason or
+    elif (reason in ("MIGRATION_ROUTE_MISSING", "MIGRATION_IDENTITY_INVALID") or
+          "outside the explicit" in reason or "outside the exact" in reason or
           "does not match the running" in reason):
         action = "STOP_UNSUPPORTED_UPGRADE_PAIR"
     else:
@@ -986,9 +1109,9 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.1b5" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b5"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.1b5 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b6" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b6"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b6 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
@@ -998,7 +1121,7 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
             if (database_status["usageSchemaState"] != "INSTALLED" or
                     database_status["orchestratorSchemaState"] != "INSTALLED" or
                     database_status["gatePolicySchemaState"] != "INSTALLED"):
-                raise LiteError("same-identity 0.3.1b5 project is missing a required schema extension")
+                raise LiteError("same-identity 0.3.1b6 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -1008,14 +1131,23 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
             )
             return {"result": result, "root": root, "config": config, "database": database}
 
-        if current_identity not in SUPPORTED_UPGRADE_SOURCES:
-            raise LiteError("upgrade source identity is outside the exact b3/b4 to b5 matrix")
+        route, route_fingerprint = _migration_route(
+            current_identity, target_identity
+        )
+        evidence.append({
+            "id": "MIGRATION_ROUTE", "status": "PASS",
+            "protocolVersion": MIGRATION_GRAPH_PROTOCOL,
+            "from": current_identity, "to": target_identity,
+            "edgeIds": [edge["edgeId"] for edge in route],
+            "edges": route,
+            "routeFingerprint": route_fingerprint,
+        })
         if database_status["usageSchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a b3/b4 database without the exact usage extension")
+            raise LiteError("upgrade refuses a b3/b4/b5 database without the exact usage extension")
         if database_status["orchestratorSchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a b3/b4 database without the exact orchestrator extension")
+            raise LiteError("upgrade refuses a b3/b4/b5 database without the exact orchestrator extension")
         if database_status["gatePolicySchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a b3/b4 database without the exact auto-gate extension")
+            raise LiteError("upgrade refuses a b3/b4/b5 database without the exact auto-gate extension")
         live_count = sum(database_status[key] for key in (
             "liveAgentClaims", "liveRepositoryWriters", "liveOrchestratorLeases"
         ))
@@ -1156,13 +1288,24 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
                 "staleFingerprint": stale_fingerprint if stale_count else None,
                 "reconciliationRequestId": (deterministic_request if stale_count else None),
                 "staleResources": [row for row in database_status["activity"]
-                                   if row["effectiveStatus"] == "STALE"]}
+                                   if row["effectiveStatus"] == "STALE"],
+                "migrationRoute": route,
+                "migrationRouteFingerprint": route_fingerprint}
     except LiteError as exc:
-        return {"result": _upgrade_refused(operation, root, str(exc),
+        result = _upgrade_refused(operation, root, str(exc),
                                             locals().get("current_identity"),
                                             locals().get("target_identity"), evidence=evidence,
                                             next_step=_forward_refusal_step(
-                                                str(exc), root, wheel_path, with_codex))}
+                                                str(exc), root, wheel_path, with_codex))
+        if str(exc) in ("MIGRATION_ROUTE_MISSING", "MIGRATION_IDENTITY_INVALID"):
+            result["reasonCode"] = str(exc)
+        elif str(exc).startswith("MIGRATION_GRAPH_"):
+            result["reasonCode"] = "MIGRATION_GRAPH_INVALID"
+        elif "target wheel does not match" in str(exc):
+            result["reasonCode"] = "TARGET_IDENTITY_DRIFT"
+        elif "old wheel identity" in str(exc):
+            result["reasonCode"] = "SOURCE_IDENTITY_DRIFT"
+        return {"result": result}
 
 
 def _database_backup(database, destination):
@@ -1286,7 +1429,7 @@ def _write_upgrade(plan):
                     human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("0.3.1b5 no-DDL extension validation failed")
+                raise LiteError("0.3.1b6 no-DDL extension validation failed")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1316,6 +1459,9 @@ def _write_upgrade(plan):
             "to": dict(BUILD_IDENTITY),
             "withCodex": plan["withCodex"],
             "activityReconciliation": reconciliation,
+            "migrationGraphVersion": MIGRATION_GRAPH_PROTOCOL,
+            "migrationRouteFingerprint": plan["migrationRouteFingerprint"],
+            "migrationEdgeIds": [edge["edgeId"] for edge in plan["migrationRoute"]],
             "actions": actions,
             "retained": [],
             "untouched": [dict({"action": "UNTOUCHED"}, **entry) for entry in plan["paths"]["untouched"]],
@@ -1382,7 +1528,12 @@ def _manifest_target(base, relative, label, allow_missing=False):
 
 
 def _expected_rollback_material(root, database, manifest, backup_root):
-    """Reconstruct the only mutations the bounded 0.3.1b4 upgrade can make."""
+    """Reconstruct the only mutations the bounded graph upgrade can make."""
+    route, route_fingerprint = _migration_route(manifest["from"], manifest["to"])
+    if (manifest["migrationGraphVersion"] != MIGRATION_GRAPH_PROTOCOL or
+            manifest["migrationRouteFingerprint"] != route_fingerprint or
+            manifest["migrationEdgeIds"] != [edge["edgeId"] for edge in route]):
+        raise LiteError("rollback migration route binding drift")
     if not isinstance(manifest.get("withCodex"), bool):
         raise LiteError("rollback manifest Codex selection is invalid")
     managed_backups = {}
@@ -1491,7 +1642,9 @@ def _load_rollback(path, manifest_path, operation):
             raise LiteError("rollback manifest structure is invalid")
         required = {"protocolVersion", "state", "upgradeId", "createdAt", "projectId",
                     "repositoryKey", "projectRoot", "database", "backupRoot", "from", "to",
-                    "withCodex", "activityReconciliation", "actions", "retained", "untouched"}
+                    "withCodex", "activityReconciliation", "migrationGraphVersion",
+                    "migrationRouteFingerprint", "migrationEdgeIds", "actions", "retained",
+                    "untouched"}
         allowed = required | ({"consumedAt"} if manifest.get("state") == "CONSUMED" else set())
         if set(manifest) != allowed or manifest["protocolVersion"] != ROLLBACK_PROTOCOL:
             raise LiteError("rollback manifest structure is invalid")
@@ -1763,7 +1916,7 @@ def _write_rollback(plan):
 def upgrade_project(path, wheel_path=None, with_codex=False, check=False,
                     rollback_manifest=None, expected_stale_activity=None,
                     reconciliation_request_id=None):
-    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b5."""
+    """Check, execute, or exactly roll back a bounded graph upgrade to 0.3.1b6."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",

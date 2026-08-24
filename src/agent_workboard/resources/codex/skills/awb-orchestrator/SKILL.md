@@ -88,8 +88,10 @@ projection. LIVE resources must be released by their exact owner. STALE rows
 remain visible history and may be reconciled only through the exact public
 request-id/owner/generation command. A true FINAL transition closes all activity
 atomically; BLOCKED, WAITING_HUMAN and nonterminal HELD never imply cleanup.
-For b3/b4 upgrades, consume the single recovery-aware b5 nextStep unchanged;
+For exact b3/b4/b5 upgrades, consume the single recovery-aware b6 nextStep unchanged;
 never ask the user to edit SQLite or perform a separate stale cleanup first.
+The b6 target owns the frozen `AWB-MIGRATION-GRAPH-v1`; never infer a route from
+version ordering or install intermediate releases.
 
 Runtime events are the process audit authority.  Do not require per-round
 submission JSON, per-round quality hashes, duplicate postflight files, or a

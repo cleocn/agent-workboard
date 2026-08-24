@@ -208,8 +208,14 @@ activityPolicy:
   exactReconciliation: [workItemId, kind, resourceId, ownerId, generation, requestId]
   trueTerminal: [FINAL_ACCEPTANCE_APPROVED]
   nonTerminal: [BLOCKED, WAITING_HUMAN, HELD, TASK_CANCELLED]
-  upgradeSources: [exact_0_3_1b3, exact_0_3_1b4]
-  upgradeTarget: exact_0_3_1b5
+  finalReviewerClaimBinding: {status: RELEASED, effective: INACTIVE,
+                              legacy: UNIQUE_ACTOR_TASK_RELEASE_TIME}
+  migrationGraph: AWB-MIGRATION-GRAPH-v1
+  upgradeSources: [exact_0_3_1b3, exact_0_3_1b4, exact_0_3_1b5]
+  upgradeTarget: exact_0_3_1b6
+  upgradeEdges: [B3_TO_B4_CONFIG_CANONICALIZATION,
+                 B4_TO_B5_ACTIVITY_RECOVERY,
+                 B5_TO_B6_FINDING_CORRECTION]
   staleOnlyNextStep: EXECUTE_UPGRADE_WITH_RECONCILIATION
   liveOrMixedNextStep: STOP_LIVE_ACTIVITY_OWNER_AND_RECHECK
 

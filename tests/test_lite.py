@@ -1118,6 +1118,130 @@ class LiteWorkboardTest(unittest.TestCase):
                     if row["event_type"] == "TERMINAL_ACTIVITY_RECONCILED"]
         self.assertEqual(1, len(terminal))
         self.assertEqual(3, len(json.loads(terminal[0]["payload_json"])["resources"]))
+        final_review = [row for row in timeline(self.database, "TI-030")
+                        if row["event_type"] == "AGENT_FINAL_REVIEW"][-1]
+        reviewer_claim = json.loads(final_review["payload_json"])["reviewerClaim"]
+        self.assertEqual(("final-reviewer", "REVIEWER", "RELEASED"), (
+            reviewer_claim["agentId"], reviewer_claim["role"],
+            reviewer_claim["status"],
+        ))
+        resources = json.loads(terminal[0]["payload_json"])["resources"]
+        bound = [value for value in resources
+                 if value.get("source") == "FINAL_REVIEW_CLAIM"]
+        self.assertEqual(1, len(bound))
+        self.assertEqual(("RELEASED", "INACTIVE", "RELEASED", False), (
+            bound[0]["beforeStatus"], bound[0]["effectiveStatus"],
+            bound[0]["afterStatus"], bound[0]["mutated"],
+        ))
+
+    def test_manual_final_binds_released_reviewer_and_gate_fault_is_atomic(self):
+        self._through_implementation_submission()
+        self.claim("TI-001", 3, "manual-reviewer", "REVIEWER")
+        record_agent_review(
+            self.database, "TI-001", "FINAL", "manual-reviewer", "APPROVED", "ok",
+            request_id="manual-final-review",
+        )
+        connection = open_database(self.database)
+        review_event = connection.execute(
+            "SELECT payload_json FROM events WHERE request_id='manual-final-review'"
+        ).fetchone()
+        binding = json.loads(review_event[0])["reviewerClaim"]
+        self.assertEqual("RELEASED", binding["status"])
+        before = "\n".join(connection.iterdump())
+        connection.close()
+        with mock.patch("agent_workboard.orchestrator._activity_event",
+                        side_effect=RuntimeError("manual terminal fault")):
+            with self.assertRaisesRegex(RuntimeError, "manual terminal fault"):
+                record_human_gate(
+                    self.database, "TI-001", "FINAL", "human", "APPROVED", "ok",
+                    request_id="manual-final-fault",
+                )
+        connection = open_database(self.database)
+        self.assertEqual(before, "\n".join(connection.iterdump()))
+        connection.close()
+        done = record_human_gate(
+            self.database, "TI-001", "FINAL", "human", "APPROVED", "ok",
+            request_id="manual-final-success",
+        )
+        self.assertEqual("FINAL_ACCEPTANCE_APPROVED", done["state"])
+        terminal = [row for row in timeline(self.database, "TI-001")
+                    if row["event_type"] == "TERMINAL_ACTIVITY_RECONCILED"][-1]
+        special = [value for value in json.loads(terminal["payload_json"])["resources"]
+                   if value.get("source") == "FINAL_REVIEW_CLAIM"]
+        self.assertEqual(binding["claimId"], special[0]["resourceId"])
+
+    def test_manual_final_legacy_binding_is_unique_and_fail_closed(self):
+        self._through_implementation_submission()
+        self.claim("TI-001", 3, "legacy-reviewer", "REVIEWER")
+        record_agent_review(
+            self.database, "TI-001", "FINAL", "legacy-reviewer", "APPROVED", "ok",
+            request_id="legacy-final-review",
+        )
+        connection = open_database(self.database)
+        row = connection.execute(
+            "SELECT event_id,payload_json,created_at FROM events "
+            "WHERE request_id='legacy-final-review'"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload.pop("reviewerClaim")
+        connection.execute(
+            "UPDATE events SET payload_json=? WHERE event_id=?",
+            (json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":")), row["event_id"]),
+        )
+        connection.commit()
+        connection.close()
+        done = record_human_gate(
+            self.database, "TI-001", "FINAL", "human", "APPROVED", "legacy ok",
+            request_id="legacy-final-success",
+        )
+        self.assertEqual("FINAL_ACCEPTANCE_APPROVED", done["state"])
+
+        self.temporary.cleanup()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database = os.path.join(self.temporary.name, "workboard.db")
+        initialize_database(self.database)
+        self._through_implementation_submission()
+        self.claim("TI-001", 3, "legacy-reviewer", "REVIEWER")
+        record_agent_review(
+            self.database, "TI-001", "FINAL", "legacy-reviewer", "APPROVED", "ok",
+            request_id="legacy-ambiguous-review",
+        )
+        connection = open_database(self.database)
+        row = connection.execute(
+            "SELECT event_id,payload_json,created_at FROM events "
+            "WHERE request_id='legacy-ambiguous-review'"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload.pop("reviewerClaim")
+        reviewer_task = connection.execute(
+            "SELECT task_id FROM tasks WHERE work_item_id='TI-001' AND owner_role='REVIEWER'"
+        ).fetchone()[0]
+        generation = connection.execute(
+            "SELECT max(generation)+1 FROM claims WHERE work_item_id='TI-001'"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE events SET payload_json=? WHERE event_id=?",
+            (json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":")), row["event_id"]),
+        )
+        connection.execute(
+            "INSERT INTO claims VALUES(?,?,?,?,?,?,'RELEASED',?,?,?)",
+            ("ambiguous-review-claim", "TI-001", reviewer_task, "legacy-reviewer",
+             "REVIEWER", generation, row["created_at"], self.expires(),
+             row["created_at"]),
+        )
+        connection.commit()
+        before = "\n".join(connection.iterdump())
+        connection.close()
+        with self.assertRaisesRegex(LiteError, "FINAL_REVIEW_CLAIM_BINDING_INVALID"):
+            record_human_gate(
+                self.database, "TI-001", "FINAL", "human", "APPROVED", "ambiguous",
+                request_id="legacy-final-refused",
+            )
+        connection = open_database(self.database)
+        self.assertEqual(before, "\n".join(connection.iterdump()))
+        connection.close()
 
     def test_auto_final_quality_drift_fails_closed_without_auto_event(self):
         create_work_item(

@@ -1,6 +1,6 @@
 # Quickstart
 
-Agent Workboard 0.3.1b5 is an opt-in, local-only, observation-only Preview. Use
+Agent Workboard 0.3.1b6 is an opt-in, local-only, observation-only Preview. Use
 a hash-verified GitHub prerelease wheel, then initialize and inspect a project:
 
 Usage is project-level and defaults to OFF, including when an older config
@@ -9,7 +9,7 @@ spans, mutation sync/show, periodic refresh, or Usage gates.
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b5-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b6-py3-none-any.whl
 awb init --project ./example
 awb doctor --project ./example
 awb lite --project ./example list
@@ -18,13 +18,13 @@ awb lite --project ./example list
 Use `awb bootstrap --project ./example` when a managed project has no database
 yet. Do not point a stable project at an arbitrary database path.
 
-For an exact verified 0.3.1b3 or 0.3.1b4 project, retain its old wheel and install the
-verified 0.3.1b5 Preview wheel. Run the zero-write check first and execute only
+For an exact verified 0.3.1b3, 0.3.1b4, or 0.3.1b5 project, retain its old wheel and install the
+verified 0.3.1b6 Preview wheel. Run the zero-write check first and execute only
 its single structured `nextStep`:
 
 ```bash
-awb upgrade --check --project ./example --wheel ./agent_workboard-0.3.1b5-py3-none-any.whl --with-codex
-awb upgrade --project ./example --wheel ./agent_workboard-0.3.1b5-py3-none-any.whl --with-codex
+awb upgrade --check --project ./example --wheel ./agent_workboard-0.3.1b6-py3-none-any.whl --with-codex
+awb upgrade --project ./example --wheel ./agent_workboard-0.3.1b6-py3-none-any.whl --with-codex
 awb doctor --project ./example
 awb codex check --project ./example
 ```

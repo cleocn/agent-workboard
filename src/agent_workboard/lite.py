@@ -1649,7 +1649,8 @@ def _approved_gate_preconditions(connection, item, stage):
     return review
 
 
-def _approve_gate(connection, item, stage, now, trigger_request_id):
+def _approve_gate(connection, item, stage, now, trigger_request_id,
+                  reviewer_claim=None):
     _approved_gate_preconditions(connection, item, stage)
     if stage == "PLAN":
         state, queue, role, held, closed = (
@@ -1670,7 +1671,66 @@ def _approve_gate(connection, item, stage, now, trigger_request_id):
         reconcile_terminal_activity(
             connection, item["work_item_id"], now,
             trigger_request_id + "-terminal-activity",
+            reviewer_claim=reviewer_claim,
         )
+
+
+def _reviewer_claim_identity(row):
+    if row is None:
+        raise LiteError("FINAL_REVIEW_CLAIM_BINDING_INVALID")
+    return {
+        "claimId": row["claim_id"], "workItemId": row["work_item_id"],
+        "taskId": row["task_id"], "agentId": row["agent_id"],
+        "role": row["role"], "generation": row["generation"],
+        "releasedAt": row["released_at"], "status": row["status"],
+    }
+
+
+def _validated_final_reviewer_claim(connection, work_item_id):
+    event = connection.execute(
+        "SELECT * FROM events WHERE work_item_id=? AND event_type='AGENT_FINAL_REVIEW' "
+        "ORDER BY event_id DESC LIMIT 1", (work_item_id,),
+    ).fetchone()
+    if event is None:
+        raise LiteError("FINAL_REVIEW_CLAIM_BINDING_INVALID")
+    payload = _event_payload(event)
+    review = payload.get("review", {})
+    if payload.get("decision") != "APPROVED" or review.get("result") != "PASS":
+        raise LiteError("FINAL_REVIEW_CLAIM_BINDING_INVALID")
+    binding = payload.get("reviewerClaim")
+    if binding is not None:
+        if not isinstance(binding, dict):
+            raise LiteError("FINAL_REVIEW_CLAIM_BINDING_INVALID")
+        required = {
+            "claimId", "workItemId", "taskId", "agentId", "role",
+            "generation", "releasedAt", "status",
+        }
+        if set(binding) != required:
+            raise LiteError("FINAL_REVIEW_CLAIM_BINDING_INVALID")
+        row = connection.execute(
+            "SELECT c.* FROM claims c JOIN tasks t ON t.task_id=c.task_id "
+            "AND t.work_item_id=c.work_item_id AND t.owner_role='REVIEWER' "
+            "WHERE c.claim_id=? AND c.work_item_id=? AND c.task_id=? "
+            "AND c.agent_id=? AND c.role='REVIEWER' AND c.generation=? "
+            "AND c.status='RELEASED' AND c.released_at=?",
+            (binding["claimId"], work_item_id, binding["taskId"],
+             event["actor_id"], binding["generation"], binding["releasedAt"]),
+        ).fetchone()
+        if (row is None or binding["workItemId"] != work_item_id or
+                binding["agentId"] != event["actor_id"] or
+                binding["role"] != "REVIEWER" or binding["status"] != "RELEASED"):
+            raise LiteError("FINAL_REVIEW_CLAIM_BINDING_INVALID")
+        return _reviewer_claim_identity(row)
+    rows = connection.execute(
+        "SELECT c.* FROM claims c JOIN tasks t ON t.task_id=c.task_id "
+        "AND t.work_item_id=c.work_item_id AND t.owner_role='REVIEWER' "
+        "WHERE c.work_item_id=? AND c.agent_id=? AND c.role='REVIEWER' "
+        "AND c.status='RELEASED' AND c.released_at=?",
+        (work_item_id, event["actor_id"], event["created_at"]),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LiteError("FINAL_REVIEW_CLAIM_BINDING_INVALID")
+    return _reviewer_claim_identity(rows[0])
 
 
 def _auto_gate_context(connection, work_item_id):
@@ -1722,7 +1782,9 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
             connection.rollback()
             return get_work_item(database, work_item_id)
         item = _item(connection, work_item_id)
-        _active_claim(connection, work_item_id, "REVIEWER", reviewer_agent_id)
+        reviewer_claim_row = _active_claim(
+            connection, work_item_id, "REVIEWER", reviewer_agent_id
+        )
         expected = "PLAN_REVIEW_PENDING" if stage == "PLAN" else "IMPLEMENTATION_COMPLETED"
         if item["state"] != expected or decision not in ("APPROVED", "REJECTED"):
             raise LiteError("review stage or decision is invalid")
@@ -1779,11 +1841,27 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
             )
         auto_approved = False
         auto_gate_failure = None
+        final_reviewer_claim = None
         if (result == "PASS" and item["mode"] == "STANDARD" and
                 policy == "AUTO_ON_PASS" and item["queue_state"] == "CLAIMED" and
                 item["held_reason"] is None and item["blocked_reason"] is None):
             try:
-                _approve_gate(connection, item, stage, now, request_id)
+                if stage == "FINAL":
+                    connection.execute(
+                        "UPDATE claims SET status='RELEASED',released_at=? "
+                        "WHERE claim_id=? AND status='ACTIVE'",
+                        (now, reviewer_claim_row["claim_id"]),
+                    )
+                    final_reviewer_claim = _reviewer_claim_identity(
+                        connection.execute(
+                            "SELECT * FROM claims WHERE claim_id=?",
+                            (reviewer_claim_row["claim_id"],),
+                        ).fetchone()
+                    )
+                _approve_gate(
+                    connection, item, stage, now, request_id,
+                    reviewer_claim=final_reviewer_claim,
+                )
                 auto_approved = True
             except LiteError as exc:
                 # The independent PASS remains recorded, but runtime drift or
@@ -1791,6 +1869,13 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
                 auto_gate_failure = str(exc)
         if not (auto_approved and stage == "FINAL"):
             _release_active(connection, work_item_id, now)
+        if result == "PASS" and stage == "FINAL" and final_reviewer_claim is None:
+            final_reviewer_claim = _reviewer_claim_identity(
+                connection.execute(
+                    "SELECT * FROM claims WHERE claim_id=?",
+                    (reviewer_claim_row["claim_id"],),
+                ).fetchone()
+            )
         if not auto_approved:
             connection.execute(
                 "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,"
@@ -1800,6 +1885,8 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
             )
         review_payload = {"decision": stored_decision, "review": review,
                           "requestFingerprint": fingerprint}
+        if final_reviewer_claim is not None:
+            review_payload["reviewerClaim"] = final_reviewer_claim
         if auto_gate_failure:
             review_payload["autoGate"] = {
                 "status": "FAIL_CLOSED", "reason": auto_gate_failure,
@@ -2164,13 +2251,21 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
             raise LiteError("management envelope is required before human gate")
         if decision == "APPROVED":
             _approved_gate_preconditions(connection, item, stage)
+        reviewer_claim = None
+        if decision == "APPROVED" and stage == "FINAL":
+            reviewer_claim = _validated_final_reviewer_claim(
+                connection, work_item_id
+            )
         now = _now()
         connection.execute(
             "INSERT INTO human_gates VALUES(?,?,?,?,?,?,?)",
             (_id("gate"), work_item_id, stage, human_id, decision, reason, now),
         )
         if decision == "APPROVED":
-            _approve_gate(connection, item, stage, now, request_id)
+            _approve_gate(
+                connection, item, stage, now, request_id,
+                reviewer_claim=reviewer_claim,
+            )
             state = None
         elif stage == "PLAN":
             state = "PLAN_REVIEW_APPROVED" if decision == "APPROVED" else "DRAFT"
