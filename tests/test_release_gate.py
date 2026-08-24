@@ -1,105 +1,126 @@
+import io
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+import zipfile
+
+
+SCRIPT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools", "release_gate.py")
 
 
 class ReleaseGateTest(unittest.TestCase):
     def _git(self, repository, *args):
         return subprocess.check_output(["git"] + list(args), cwd=repository).decode("ascii").strip()
 
-    def test_release_gate_requires_allowlisted_direct_public_successor(self):
-        with tempfile.TemporaryDirectory() as repository:
-            subprocess.check_call(["git", "init"], cwd=repository, stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "config", "user.name", "test"], cwd=repository)
-            subprocess.check_call(["git", "config", "user.email", "test@example.invalid"], cwd=repository)
-            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
-                handle.write("0.1.0\n")
-            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.1.0"], cwd=repository, stdout=subprocess.DEVNULL)
-            v01 = self._git(repository, "rev-parse", "HEAD")
-            subprocess.check_call(["git", "tag", "-a", "v0.1.0", "-m", "v0.1.0"], cwd=repository)
-            with open(os.path.join(repository, "stable.txt"), "w", encoding="utf-8") as handle:
-                handle.write("stable self-hosting\n")
-            subprocess.check_call(["git", "add", "--", "stable.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.2.0"], cwd=repository,
-                                  stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "-a", "v0.2.0", "-m", "v0.2.0"], cwd=repository)
-            v02 = self._git(repository, "rev-parse", "HEAD")
-            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
-                handle.write("0.2.1\n")
-            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.2.1"], cwd=repository,
-                                  stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "-a", "v0.2.1", "-m", "v0.2.1"], cwd=repository)
-            v021 = self._git(repository, "rev-parse", "HEAD")
-            subprocess.check_call(["git", "switch", "-c", "release/awb-011-v0.3.0b1"],
-                                  cwd=repository, stdout=subprocess.DEVNULL)
-            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
-                handle.write("0.3.0b1\n")
-            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.3.0b1"], cwd=repository,
-                                  stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "-a", "v0.3.0b1", "-m", "v0.3.0b1"],
-                                  cwd=repository)
-            v030b1 = self._git(repository, "rev-parse", "HEAD")
-            subprocess.check_call(["git", "switch", "-c", "release/awb-015-v0.3.1b1"],
-                                  cwd=repository, stdout=subprocess.DEVNULL)
-            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
-                handle.write("0.3.1b1\n")
-            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.3.1b1"], cwd=repository,
-                                  stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "-a", "v0.3.1b1", "-m", "v0.3.1b1"],
-                                  cwd=repository)
-            v031b1 = self._git(repository, "rev-parse", "HEAD")
-            subprocess.check_call(["git", "switch", "-c", "release/awb-018-v0.3.1b2"],
-                                  cwd=repository, stdout=subprocess.DEVNULL)
-            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
-                handle.write("0.3.1b2\n")
-            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.3.1b2"], cwd=repository,
-                                  stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "-a", "v0.3.1b2", "-m", "v0.3.1b2"],
-                                  cwd=repository)
-            base = self._git(repository, "rev-parse", "HEAD")
-            subprocess.check_call(["git", "switch", "-c", "release/awb-019-v0.3.1b3"],
-                                  cwd=repository, stdout=subprocess.DEVNULL)
-            with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
-                handle.write("0.3.1b3\n")
-            subprocess.check_call(["git", "add", "--", "release.txt"], cwd=repository)
-            subprocess.check_call(["git", "commit", "-m", "v0.3.1b3"], cwd=repository,
-                                  stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "-a", "v0.3.1b3", "-m", "v0.3.1b3"],
-                                  cwd=repository)
-            script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools", "release_gate.py")
-            subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
-                                   "--base", base, "--v0.1-commit", v01, "--v0.2-commit", v02,
-                                   "--v0.2.1-commit", v021, "--v0.3.0b1-commit", v030b1,
-                                   "--v0.3.1b1-commit", v031b1,
-                                   "--v0.3.1b2-commit", base,
-                                   "--path", "release.txt"],
-                                  stdout=subprocess.DEVNULL)
-            with self.assertRaises(subprocess.CalledProcessError):
-                subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
-                                       "--base", base, "--v0.1-commit", v01, "--v0.2-commit", v02,
-                                       "--v0.2.1-commit", v021, "--v0.3.0b1-commit", v030b1,
-                                       "--v0.3.1b1-commit", v031b1,
-                                       "--v0.3.1b2-commit", base,
-                                       "--path", "stable.txt"],
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def _repository(self, repository):
+        subprocess.check_call(["git", "init"], cwd=repository, stdout=subprocess.DEVNULL)
+        subprocess.check_call(["git", "config", "user.name", "test"], cwd=repository)
+        subprocess.check_call(["git", "config", "user.email", "test@example.invalid"], cwd=repository)
+        with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
+            handle.write("base\n")
+        subprocess.check_call(["git", "add", "release.txt"], cwd=repository)
+        subprocess.check_call(["git", "commit", "-m", "base"], cwd=repository,
+                              stdout=subprocess.DEVNULL)
+        base = self._git(repository, "rev-parse", "HEAD")
+        subprocess.check_call(["git", "tag", "-a", "v-old", "-m", "old"], cwd=repository)
+        subprocess.check_call(["git", "switch", "-c", "release/next"], cwd=repository,
+                              stdout=subprocess.DEVNULL)
+        with open(os.path.join(repository, "release.txt"), "w", encoding="utf-8") as handle:
+            handle.write("candidate\n")
+        subprocess.check_call(["git", "add", "release.txt"], cwd=repository)
+        subprocess.check_call(["git", "commit", "-m", "candidate"], cwd=repository,
+                              stdout=subprocess.DEVNULL)
+        subprocess.check_call(["git", "tag", "-a", "v-next", "-m", "next"], cwd=repository)
+        return base
 
-            subprocess.check_call(["git", "tag", "-d", "v0.3.1b3"], cwd=repository,
-                                  stdout=subprocess.DEVNULL)
-            subprocess.check_call(["git", "tag", "v0.3.1b3"], cwd=repository)
+    def test_dynamic_successor_gate_keeps_exact_path_and_preserved_tag(self):
+        with tempfile.TemporaryDirectory() as repository:
+            base = self._repository(repository)
+            command = [sys.executable, SCRIPT, "check-successor", "--repository", repository,
+                       "--base", base, "--tag", "v-next", "--branch", "release/next",
+                       "--preserve", "v-old=" + base, "--path", "release.txt"]
+            subprocess.check_call(command, stdout=subprocess.DEVNULL)
             with self.assertRaises(subprocess.CalledProcessError):
-                subprocess.check_call([sys.executable, script, "check-successor", "--repository", repository,
-                                       "--base", base, "--v0.1-commit", v01, "--v0.2-commit", v02,
-                                       "--v0.2.1-commit", v021, "--v0.3.0b1-commit", v030b1,
-                                       "--v0.3.1b1-commit", v031b1,
-                                       "--v0.3.1b2-commit", base,
-                                       "--path", "release.txt"],
+                subprocess.check_call(command[:-1] + ["other.txt"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.check_call(["git", "tag", "-d", "v-next"], cwd=repository,
+                                  stdout=subprocess.DEVNULL)
+            subprocess.check_call(["git", "tag", "v-next"], cwd=repository)
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.check_call(command, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+
+    def test_artifact_scan_accepts_regular_members_and_rejects_secret_traversal_and_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            wheel = os.path.join(temporary, "safe.whl")
+            safe_raw = (b"value = 1\n"
+                        b"docs=https://example.invalid/home/guide\n"
+                        b"route=/api/private/resource\n")
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("agent_workboard/module.py", safe_raw)
+            subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", wheel],
+                                  stdout=subprocess.DEVNULL)
+            safe_sdist = os.path.join(temporary, "safe.tar.gz")
+            with tarfile.open(safe_sdist, "w:gz") as archive:
+                info = tarfile.TarInfo("package/module.py")
+                info.size = len(safe_raw)
+                info.mtime = 0
+                archive.addfile(info, io.BytesIO(safe_raw))
+            subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", safe_sdist],
+                                  stdout=subprocess.DEVNULL)
+            secret = os.path.join(temporary, "secret.whl")
+            with zipfile.ZipFile(secret, "w") as archive:
+                archive.writestr("agent_workboard/module.py", "api_key=abcdefghijk\n")
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", secret],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            forbidden_payloads = {
+                "generic-pkcs8": b"-----BEGIN PRIVATE KEY-----\nencoded\n",
+                "ec-private-key": b"-----BEGIN EC PRIVATE KEY-----\nencoded\n",
+                "dsa-private-key": b"-----BEGIN DSA PRIVATE KEY-----\nencoded\n",
+                "macos-private-path": b"build_path=/private/tmp/private/worktree\n",
+                "linux-home-path": b"build_path=/home/release/worktree\n",
+                "windows-users-path": b"build_path=C:\\Users\\release\\worktree\n",
+            }
+            for label, raw in forbidden_payloads.items():
+                with self.subTest(label=label, artifact="wheel"):
+                    unsafe_wheel = os.path.join(temporary, label + ".whl")
+                    with zipfile.ZipFile(unsafe_wheel, "w") as archive:
+                        archive.writestr("agent_workboard/payload.txt", raw)
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        subprocess.check_call(
+                            [sys.executable, SCRIPT, "scan-artifact", "--artifact", unsafe_wheel],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                with self.subTest(label=label, artifact="sdist"):
+                    unsafe_sdist = os.path.join(temporary, label + ".tar.gz")
+                    with tarfile.open(unsafe_sdist, "w:gz") as archive:
+                        info = tarfile.TarInfo("package/payload.txt")
+                        info.size = len(raw)
+                        info.mtime = 0
+                        archive.addfile(info, io.BytesIO(raw))
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        subprocess.check_call(
+                            [sys.executable, SCRIPT, "scan-artifact", "--artifact", unsafe_sdist],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+            traversal = os.path.join(temporary, "traversal.whl")
+            with zipfile.ZipFile(traversal, "w") as archive:
+                archive.writestr("../escape", "x")
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", traversal],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sdist = os.path.join(temporary, "unsafe.tar.gz")
+            with tarfile.open(sdist, "w:gz") as archive:
+                info = tarfile.TarInfo("package/link")
+                info.type = tarfile.SYMTYPE
+                info.linkname = "target"
+                archive.addfile(info, io.BytesIO())
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", sdist],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

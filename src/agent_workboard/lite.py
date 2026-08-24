@@ -28,6 +28,13 @@ CREATION_RISK_PROTOCOL = "AWB-CREATION-RISK-v1"
 REVIEW_TASK_RECOVERY_PROTOCOL = "AWB-REVIEW-TASK-RECOVERY-v1"
 HUMAN_GATE_POLICIES = ("AUTO_ON_PASS", "MANUAL")
 CREATION_RISK_KINDS = ("REMOTE", "DESTRUCTIVE", "ANOMALOUS_STATE")
+USAGE_POLICIES = ("OFF", "BEST_EFFORT")
+PLAN_ARTIFACT_PROTOCOL = "AWB-PLAN-ARTIFACT-v1"
+REVIEW_V2_PROTOCOL = "AWB-REVIEW-v2"
+PLAN_AMEND_CATEGORIES = (
+    "INTERNAL_CONTRADICTION", "COMMAND_OR_PATH", "TEST_OMISSION",
+    "ACCEPTANCE_EXPRESSION", "IMPLEMENTATION_ORDER", "DUPLICATE_EVIDENCE",
+)
 BUSY_TIMEOUT_MS = 5000
 DEFAULT_SCHEMA = None
 # Compatibility-only default.  Installed projects should use `awb ... --project`
@@ -566,6 +573,7 @@ def get_work_item(database, work_item_id):
         item["progress"] = _progress(item["tasks"], management)
         review_state = _review_projection(connection, work_item_id)
         item["reviewConvergence"] = review_state
+        item["planArtifact"] = _plan_artifact_head(connection, work_item_id)
         current, next_step = _current_and_next(
             item, item["tasks"], item["activeClaim"], review_state
         )
@@ -819,12 +827,14 @@ def _validate_orchestrator_fence(connection, work_item_id, orchestrator_id,
 def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
                   request_id=None, session_id=None, usage_provider=None, model=None,
                   sessions_root=None, orchestrator_id=None,
-                  orchestrator_generation=None):
+                  orchestrator_generation=None, usage_policy="BEST_EFFORT"):
+    if usage_policy not in USAGE_POLICIES:
+        raise LiteError("usage policy is invalid")
     usage_values = (session_id, usage_provider, model)
     if any(value is not None for value in usage_values) and not all(usage_values):
         raise LiteError("session-id, usage-provider, and model must be supplied together")
     baseline = identity = None
-    if all(usage_values):
+    if all(usage_values) and usage_policy == "BEST_EFFORT":
         try:
             from .usage import prepare_interval_boundary
             baseline, identity, adapter = prepare_interval_boundary(
@@ -855,6 +865,17 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         ).fetchone()
         if task is None or task["owner_role"] != role:
             raise LiteError("task role does not match")
+        if role == "REVIEWER" and item["state"] == "PLAN_REVIEW_PENDING":
+            artifact_head = _plan_artifact_head(connection, work_item_id)
+            if artifact_head is not None:
+                if artifact_head.get("editorAgentId") == agent_id:
+                    raise LiteError("latest plan artifact editor cannot review own revision")
+                used = connection.execute(
+                    "SELECT 1 FROM reviews WHERE work_item_id=? AND stage='PLAN' "
+                    "AND reviewer_agent_id=? LIMIT 1", (work_item_id, agent_id),
+                ).fetchone()
+                if used is not None:
+                    raise LiteError("opt-in PLAN requires a fresh Reviewer for every round")
         generation = connection.execute(
             "SELECT coalesce(max(generation),0)+1 FROM claims WHERE work_item_id=?", (work_item_id,)
         ).fetchone()[0]
@@ -869,7 +890,7 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         )
         _event(connection, work_item_id, request_id, "CLAIM_ACQUIRED", "AGENT", agent_id,
                {"claimId": claim_id, "taskId": task_id, "role": role, "generation": generation})
-        if all(usage_values):
+        if all(usage_values) and usage_policy == "BEST_EFFORT":
             try:
                 from .usage import record_binding
                 claim = connection.execute("SELECT * FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
@@ -881,7 +902,10 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
             except Exception as exc:
                 raise LiteError("usage binding failed: {0}".format(exc))
         connection.commit()
-        return {"claimId": claim_id, "generation": generation}
+        result = {"claimId": claim_id, "generation": generation}
+        if usage_policy == "OFF":
+            result["usageStatus"] = "DISABLED"
+        return result
     except Exception:
         connection.rollback()
         raise
@@ -889,7 +913,11 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         connection.close()
 
 
-def _usage_sync_boundary(database, work_item_id):
+def _usage_sync_boundary(database, work_item_id, usage_policy="BEST_EFFORT"):
+    if usage_policy == "OFF":
+        return {"status": "DISABLED", "policy": "OFF", "writes": 0}
+    if usage_policy not in USAGE_POLICIES:
+        raise LiteError("usage policy is invalid")
     try:
         from .usage import best_effort_sync
         return best_effort_sync(database, work_item_id)
@@ -897,8 +925,9 @@ def _usage_sync_boundary(database, work_item_id):
         return {"status": "coverage-gap", "reasonCode": "SYNC_IMPORT_FAILED"}
 
 
-def release_claim(database, work_item_id, agent_id, request_id=None):
-    _usage_sync_boundary(database, work_item_id)
+def release_claim(database, work_item_id, agent_id, request_id=None,
+                  usage_policy="BEST_EFFORT"):
+    _usage_sync_boundary(database, work_item_id, usage_policy)
     request_id = request_id or _id("release")
     connection = open_database(database)
     try:
@@ -1003,8 +1032,8 @@ def release_repository_lock(database, work_item_id, repository_key, agent_id,
 
 
 def set_task_status(database, work_item_id, task_id, agent_id, status, evidence=None,
-                    request_id=None):
-    _usage_sync_boundary(database, work_item_id)
+                    request_id=None, usage_policy="BEST_EFFORT"):
+    _usage_sync_boundary(database, work_item_id, usage_policy)
     if status not in ("IN_PROGRESS", "BLOCKED", "WAITING_ACCEPTANCE", "COMPLETED", "CANCELLED"):
         raise LiteError("unsupported task status")
     request_id = request_id or _id("task")
@@ -1183,9 +1212,78 @@ def _validate_revision_submission(connection, work_item_id, stage, submission):
             raise LiteError("revision complexity must trace to an open Finding")
 
 
+def _plan_artifact_head(connection, work_item_id):
+    rows = connection.execute(
+        "SELECT payload_json FROM events WHERE work_item_id=? "
+        "AND event_type='PLAN_ARTIFACT_HEAD' ORDER BY event_id DESC",
+        (work_item_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            value = json.loads(row[0])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict) and value.get("protocolVersion") == PLAN_ARTIFACT_PROTOCOL:
+            return value
+    return None
+
+
+def _regular_plan_path(project_root, relative_path):
+    if (not isinstance(project_root, str) or not project_root or
+            not isinstance(relative_path, str) or not relative_path or
+            os.path.isabs(relative_path) or "\\" in relative_path):
+        raise LiteError("plan artifact requires a project-relative path")
+    normalized = os.path.normpath(relative_path)
+    if normalized in ("", ".", "..") or normalized.startswith(".." + os.sep):
+        raise LiteError("plan artifact escapes project root")
+    root = os.path.realpath(os.path.abspath(project_root))
+    absolute = os.path.abspath(os.path.join(root, normalized))
+    try:
+        if os.path.commonpath((root, absolute)) != root:
+            raise LiteError("plan artifact escapes project root")
+    except ValueError:
+        raise LiteError("plan artifact escapes project root")
+    cursor = root
+    for component in normalized.split(os.sep):
+        cursor = os.path.join(cursor, component)
+        if os.path.islink(cursor):
+            raise LiteError("plan artifact contains a symbolic link")
+    if not os.path.isfile(absolute):
+        raise LiteError("plan artifact is not a regular file")
+    return root, normalized.replace(os.sep, "/"), absolute
+
+
+def _artifact_sha(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _next_plan_artifact(connection, work_item_id, agent_id, artifact):
+    if not isinstance(artifact, dict) or set(artifact) != {"projectRoot", "path"}:
+        raise LiteError("plan artifact input is invalid")
+    unused_root, relative, absolute = _regular_plan_path(
+        artifact["projectRoot"], artifact["path"]
+    )
+    head = _plan_artifact_head(connection, work_item_id)
+    if head and head.get("path") != relative:
+        raise LiteError("plan artifact path cannot change across revisions")
+    digest = _artifact_sha(absolute)
+    if head and head.get("sha256") == digest:
+        raise LiteError("plan artifact revision must change bytes")
+    return {
+        "protocolVersion": PLAN_ARTIFACT_PROTOCOL, "policy": "REVIEWER_AMEND",
+        "path": relative, "revision": (head.get("revision", 0) + 1 if head else 1),
+        "sha256": digest, "editorAgentId": agent_id,
+    }
+
+
 def transition(database, work_item_id, action, agent_id, request_id=None,
-               local_tests_passed=False, submission=None, quality_baseline=None):
-    _usage_sync_boundary(database, work_item_id)
+               local_tests_passed=False, submission=None, quality_baseline=None,
+               usage_policy="BEST_EFFORT", plan_artifact=None):
+    _usage_sync_boundary(database, work_item_id, usage_policy)
     request_id = request_id or _id(action)
     connection = open_database(database)
     try:
@@ -1194,6 +1292,7 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
         if _management_from_events(connection, work_item_id) is None:
             raise LiteError("management envelope must be backfilled before transition")
         now = _now()
+        artifact_event = None
         if action == "submit_plan":
             _active_claim(connection, work_item_id, "PLANNER", agent_id)
             if item["state"] != "DRAFT":
@@ -1205,6 +1304,12 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
             if pending:
                 raise LiteError("planning tasks are incomplete")
             _validate_revision_submission(connection, work_item_id, "PLAN", submission)
+            artifact_head = _plan_artifact_head(connection, work_item_id)
+            if artifact_head is not None and plan_artifact is None:
+                raise LiteError("opt-in plan revisions require --plan-artifact")
+            artifact_event = (_next_plan_artifact(
+                connection, work_item_id, agent_id, plan_artifact
+            ) if plan_artifact is not None else None)
             new_state, queue, role = "PLAN_REVIEW_PENDING", "CLAIMABLE", "REVIEWER"
             release_after = True
         elif action == "start_implementation":
@@ -1246,7 +1351,12 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
             payload["submission"] = submission
         if quality_baseline is not None:
             payload["qualityBaseline"] = quality_baseline
+        if artifact_event is not None:
+            payload["planArtifact"] = artifact_event
         _event(connection, work_item_id, request_id, action.upper(), "AGENT", agent_id, payload)
+        if artifact_event is not None:
+            _event(connection, work_item_id, request_id + "-artifact", "PLAN_ARTIFACT_HEAD",
+                   "AGENT", agent_id, artifact_event)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -1261,7 +1371,8 @@ def _decoded_review(row):
         value = json.loads(row["summary"])
     except (TypeError, ValueError):
         value = None
-    if isinstance(value, dict) and value.get("protocolVersion") == "AWB-REVIEW-v1":
+    if (isinstance(value, dict) and
+            value.get("protocolVersion") in ("AWB-REVIEW-v1", REVIEW_V2_PROTOCOL)):
         return value
     return {
         "protocolVersion": "LEGACY", "stage": "IMPLEMENTATION" if row["stage"] == "FINAL" else "PLAN",
@@ -1296,10 +1407,13 @@ def _review_stage_projection(history):
                 open_findings[finding["id"]] = finding
     latest = history[-1][1] if history else None
     next_step = None
-    if latest and latest.get("round") == 3 and latest.get("result") == "REVISE":
+    if (latest and latest.get("round") == 3 and
+            latest.get("result") in ("REVISE", "REVISE_TO_PLANNER", "AMENDED")):
         next_step = "run the single convergence review"
-    elif latest and latest.get("round") == 4 and latest.get("result") == "CONVERGENCE_REVISE":
-        next_step = "perform the single minimal convergence revision"
+    elif (latest and latest.get("round") == 4 and
+          latest.get("result") in ("CONVERGENCE_REVISE", "AMENDED")):
+        next_step = ("run the final ordinary review" if latest.get("result") == "AMENDED" else
+                     "perform the single minimal convergence revision")
     return {
         "ordinaryRoundsUsed": ordinary, "convergenceUsed": bool(convergence),
         "totalRoundsUsed": len(history), "latestResult": latest.get("result") if latest else None,
@@ -1335,6 +1449,8 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
         raise LiteError("review round limit exhausted; human decision required")
     expected_stage = "PLAN" if stage == "PLAN" else "IMPLEMENTATION"
     expected_mode = "CONVERGENCE" if round_number == 4 else "ORDINARY"
+    artifact_head = _plan_artifact_head(connection, work_item_id) if stage == "PLAN" else None
+    opt_in = artifact_head is not None
     if isinstance(summary, dict):
         incoming = dict(summary)
     else:
@@ -1356,8 +1472,16 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
     mode = incoming.get("reviewerMode", expected_mode)
     if mode != expected_mode:
         raise LiteError("reviewerMode does not match the persisted review round")
-    allowed = ({"PASS", "CONVERGENCE_REVISE", "WAITING_HUMAN", "BLOCKED"}
-               if mode == "CONVERGENCE" else {"PASS", "REVISE", "BLOCKED"})
+    if opt_in:
+        if round_number <= 3:
+            allowed = {"PASS", "REVISE_TO_PLANNER", "BLOCKED"}
+        elif round_number == 4:
+            allowed = {"PASS", "WAITING_HUMAN", "BLOCKED"}
+        else:
+            allowed = {"PASS", "WAITING_HUMAN"}
+    else:
+        allowed = ({"PASS", "CONVERGENCE_REVISE", "WAITING_HUMAN", "BLOCKED"}
+                   if mode == "CONVERGENCE" else {"PASS", "REVISE", "BLOCKED"})
     if result not in allowed:
         raise LiteError("review result is invalid for this round")
     previous = _review_stage_projection(history)
@@ -1406,7 +1530,9 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
     post_review_open = (set(prior_open) - set(resolved_ids)) | {
         finding["id"] for finding in valid
     }
-    blocking_result = result in ("REVISE", "CONVERGENCE_REVISE", "BLOCKED")
+    blocking_result = result in (
+        "REVISE", "REVISE_TO_PLANNER", "CONVERGENCE_REVISE", "BLOCKED"
+    )
     if blocking_result and not post_review_open:
         result = "PASS" if result != "BLOCKED" else "WAITING_HUMAN"
     if result == "PASS" and post_review_open:
@@ -1414,13 +1540,25 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
     if round_number == 5 and result == "REVISE":
         # The result is retained for audit, but runtime routes to a human instead of round 6.
         pass
-    return {
-        "protocolVersion": "AWB-REVIEW-v1", "stage": expected_stage,
+    if opt_in:
+        reviewed = incoming.get("reviewedArtifact")
+        expected_artifact = {key: artifact_head[key] for key in (
+            "path", "revision", "sha256", "editorAgentId"
+        )}
+        if reviewed != expected_artifact:
+            raise LiteError("PLAN review must identify the exact current artifact")
+    normalized = {
+        "protocolVersion": (REVIEW_V2_PROTOCOL if opt_in else "AWB-REVIEW-v1"),
+        "stage": expected_stage,
         "round": round_number, "reviewerMode": mode, "result": result,
         "findings": valid, "resolvedFindingIds": resolved_ids,
         "nonBlockingSuggestions": suggestions,
         "summary": incoming.get("summary", ""),
     }
+    if opt_in:
+        normalized["reviewedArtifact"] = expected_artifact
+        normalized["amendments"] = []
+    return normalized
 
 
 def _review_request_fingerprint(work_item_id, stage, reviewer_agent_id, decision, summary):
@@ -1529,8 +1667,8 @@ def _auto_gate_context(connection, work_item_id):
 
 
 def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decision, summary,
-                        request_id=None):
-    _usage_sync_boundary(database, work_item_id)
+                        request_id=None, usage_policy="BEST_EFFORT"):
+    _usage_sync_boundary(database, work_item_id, usage_policy)
     request_id = request_id or _id("review")
     connection = open_database(database)
     try:
@@ -1588,7 +1726,8 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
             state, queue, role = item["state"], "BLOCKED", None
         elif result == "WAITING_HUMAN" or (round_number == 5 and result == "REVISE"):
             state, queue, role = item["state"], "WAITING_HUMAN", None
-        elif round_number == 3 and result == "REVISE":
+        elif (round_number == 3 and
+              result in ("REVISE", "REVISE_TO_PLANNER")):
             state, queue, role = item["state"], "CLAIMABLE", "REVIEWER"
         else:
             state = "DRAFT" if stage == "PLAN" else "IMPLEMENTING"
@@ -1661,9 +1800,314 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
         connection.close()
 
 
+def _atomic_plan_bytes(path, raw):
+    temporary = path + ".plan-amend-" + uuid.uuid4().hex
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(raw)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _release_plan_amend_lock(database, lock_id, work_item_id, agent_id, request_id):
+    connection = open_database(database)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        lock = connection.execute(
+            "SELECT * FROM repository_locks WHERE lock_id=? AND work_item_id=? "
+            "AND agent_id=? AND status='ACTIVE'", (lock_id, work_item_id, agent_id),
+        ).fetchone()
+        if lock is not None:
+            now = _now()
+            connection.execute(
+                "UPDATE repository_locks SET status='RELEASED',released_at=? WHERE lock_id=?",
+                (now, lock_id),
+            )
+            _event(connection, work_item_id, request_id, "REPOSITORY_LOCK_RELEASED",
+                   "SYSTEM", "plan-amend", {
+                       "repositoryKey": lock["repository_key"],
+                       "generation": lock["generation"], "purpose": "PLAN_AMEND",
+                       "reviewerAgentId": agent_id,
+                   })
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_file,
+                      project_root, repository_key, review_input, request_id,
+                      usage_policy="BEST_EFFORT"):
+    """Apply one bounded PLAN amendment under a package-owned exact writer lock."""
+    _usage_sync_boundary(database, work_item_id, usage_policy)
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise LiteError("PLAN_AMEND requires request-id")
+    if not isinstance(repository_key, str) or not repository_key.strip():
+        raise LiteError("PLAN_AMEND requires repository identity")
+    if not isinstance(review_input, dict):
+        raise LiteError("PLAN_AMEND requires a structured review")
+    _, unused_relative, replacement_file = _regular_plan_path(
+        os.path.dirname(os.path.abspath(replacement_file)),
+        os.path.basename(replacement_file),
+    )
+    with open(replacement_file, "rb") as handle:
+        replacement = handle.read()
+    replacement_sha = _sha(replacement)
+    fingerprint = _sha(_json({
+        "workItemId": work_item_id, "reviewer": reviewer_agent_id,
+        "replacementSha256": replacement_sha, "review": review_input,
+        "repositoryKey": repository_key,
+    }))
+
+    # Replay is checked before acquiring a new lock or touching the file.
+    connection = open_database(database)
+    try:
+        replay = connection.execute(
+            "SELECT * FROM events WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if replay is not None:
+            payload = _event_payload(replay)
+            head = _plan_artifact_head(connection, work_item_id)
+            if (replay["event_type"] != "AGENT_PLAN_REVIEW" or
+                    replay["actor_id"] != reviewer_agent_id or
+                    payload.get("requestFingerprint") != fingerprint or
+                    payload.get("review", {}).get("result") != "AMENDED" or
+                    not head or head.get("sha256") != replacement_sha):
+                raise LiteError("request_id was already used with different content")
+            _, unused, official = _regular_plan_path(project_root, head["path"])
+            if _artifact_sha(official) != replacement_sha:
+                raise LiteError("exact PLAN_AMEND replay conflicts with artifact bytes")
+            return get_work_item(database, work_item_id)
+    finally:
+        connection.close()
+
+    # Validate the immutable base and acquire the visible exact lock first.
+    connection = open_database(database)
+    lock_id = None
+    old_bytes = None
+    official = None
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        item = _item(connection, work_item_id)
+        claim = _active_claim(connection, work_item_id, "REVIEWER", reviewer_agent_id)
+        if item["state"] != "PLAN_REVIEW_PENDING":
+            raise LiteError("PLAN_AMEND requires pending PLAN review")
+        head = _plan_artifact_head(connection, work_item_id)
+        if head is None or head.get("policy") != "REVIEWER_AMEND":
+            raise LiteError("PLAN_AMEND requires an opt-in plan artifact")
+        _, relative, official = _regular_plan_path(project_root, head["path"])
+        with open(official, "rb") as handle:
+            old_bytes = handle.read()
+        if _sha(old_bytes) != head.get("sha256"):
+            raise LiteError("plan artifact bytes drifted from runtime head")
+        if replacement_sha == head.get("sha256"):
+            raise LiteError("PLAN_AMEND replacement must change bytes")
+        if head.get("editorAgentId") == reviewer_agent_id:
+            raise LiteError("latest plan artifact editor cannot review own revision")
+        if connection.execute(
+            "SELECT 1 FROM reviews WHERE work_item_id=? AND stage='PLAN' "
+            "AND reviewer_agent_id=?", (work_item_id, reviewer_agent_id),
+        ).fetchone():
+            raise LiteError("opt-in PLAN requires a fresh Reviewer for every round")
+        history = _review_history(connection, work_item_id, "PLAN")
+        round_number = len(history) + 1
+        if round_number > 4:
+            raise LiteError("round 5 cannot amend or create round 6")
+        expected_mode = "CONVERGENCE" if round_number == 4 else "ORDINARY"
+        if (review_input.get("protocolVersion") != REVIEW_V2_PROTOCOL or
+                review_input.get("stage") != "PLAN" or
+                review_input.get("result") != "AMENDED" or
+                review_input.get("reviewerMode") != expected_mode):
+            raise LiteError("PLAN_AMEND review envelope is invalid")
+        reviewed = {key: head[key] for key in (
+            "path", "revision", "sha256", "editorAgentId"
+        )}
+        if review_input.get("reviewedArtifact") != reviewed:
+            raise LiteError("PLAN_AMEND base artifact identity is stale")
+        amendments = review_input.get("amendments")
+        if not isinstance(amendments, list) or not amendments:
+            raise LiteError("PLAN_AMEND requires amendment summaries")
+        management = _management_from_events(connection, work_item_id) or {}
+        acceptance_ids = {entry.get("id") for entry in management.get("acceptance", [])}
+        open_ids = {entry["id"] for entry in _review_stage_projection(history)["openFindings"]}
+        allowed_trace = acceptance_ids | open_ids
+        for amendment in amendments:
+            if (not isinstance(amendment, dict) or
+                    set(amendment) != {"category", "summary", "traceTo"} or
+                    amendment.get("category") not in PLAN_AMEND_CATEGORIES or
+                    not isinstance(amendment.get("summary"), str) or
+                    not amendment["summary"].strip() or
+                    not isinstance(amendment.get("traceTo"), list) or
+                    not amendment["traceTo"] or
+                    not set(amendment["traceTo"]).intersection(allowed_trace)):
+                raise LiteError("PLAN_AMEND amendment is unapproved or untraceable")
+        if review_input.get("findings") not in (None, []):
+            raise LiteError("AMENDED cannot introduce a blocking Finding")
+        resolved = review_input.get("resolvedFindingIds", [])
+        if (not isinstance(resolved, list) or len(resolved) != len(set(resolved)) or
+                not set(resolved).issubset(open_ids) or open_ids - set(resolved)):
+            raise LiteError("AMENDED must close every open Finding it changes")
+        now = _now()
+        connection.execute(
+            "UPDATE repository_locks SET status='EXPIRED',released_at=? "
+            "WHERE repository_key=? AND status='ACTIVE' AND expires_at<=?",
+            (now, repository_key, now),
+        )
+        if connection.execute(
+            "SELECT 1 FROM repository_locks WHERE repository_key=? AND status='ACTIVE'",
+            (repository_key,),
+        ).fetchone():
+            raise LiteError("repository already has an active writer")
+        generation = connection.execute(
+            "SELECT coalesce(max(generation),0)+1 FROM repository_locks WHERE repository_key=?",
+            (repository_key,),
+        ).fetchone()[0]
+        lock_id = _id("repo")
+        expires_at = (datetime.datetime.now(datetime.timezone.utc) +
+                      datetime.timedelta(minutes=5)).replace(microsecond=0).isoformat()
+        connection.execute(
+            "INSERT INTO repository_locks VALUES(?,?,?,?,?,'ACTIVE',?,?,NULL)",
+            (lock_id, repository_key, work_item_id, reviewer_agent_id, generation,
+             now, expires_at),
+        )
+        _event(connection, work_item_id, "plan-amend-lock-" + _sha(request_id),
+               "REPOSITORY_LOCK_ACQUIRED", "SYSTEM", "plan-amend", {
+                   "repositoryKey": repository_key, "generation": generation,
+                   "purpose": "PLAN_AMEND", "reviewerAgentId": reviewer_agent_id,
+                   "path": relative, "baseRevision": head["revision"],
+                   "baseSha256": head["sha256"], "requestId": request_id,
+               })
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    try:
+        _atomic_plan_bytes(official, replacement)
+        connection = open_database(database)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            item = _item(connection, work_item_id)
+            _active_claim(connection, work_item_id, "REVIEWER", reviewer_agent_id)
+            lock = connection.execute(
+                "SELECT * FROM repository_locks WHERE lock_id=? AND repository_key=? "
+                "AND work_item_id=? AND agent_id=? AND status='ACTIVE'",
+                (lock_id, repository_key, work_item_id, reviewer_agent_id),
+            ).fetchone()
+            if lock is None:
+                raise LiteError("exact PLAN_AMEND lock is missing")
+            current_head = _plan_artifact_head(connection, work_item_id)
+            if current_head != head or _artifact_sha(official) != replacement_sha:
+                raise LiteError("PLAN_AMEND artifact or runtime head changed")
+            now = _now()
+            new_head = dict(head)
+            new_head.update({"revision": head["revision"] + 1,
+                             "sha256": replacement_sha,
+                             "editorAgentId": reviewer_agent_id})
+            review = {
+                "protocolVersion": REVIEW_V2_PROTOCOL, "stage": "PLAN",
+                "round": round_number, "reviewerMode": expected_mode,
+                "result": "AMENDED", "findings": [],
+                "resolvedFindingIds": list(resolved),
+                "nonBlockingSuggestions": review_input.get("nonBlockingSuggestions", []),
+                "summary": review_input.get("summary", ""),
+                "reviewedArtifact": reviewed, "amendments": amendments,
+            }
+            connection.execute(
+                "INSERT INTO reviews VALUES(?,?,?,?,?,?,?)",
+                (_id("review"), work_item_id, "PLAN", reviewer_agent_id,
+                 "REJECTED", _json(review), now),
+            )
+            _release_active(connection, work_item_id, now)
+            connection.execute(
+                "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? "
+                "AND owner_role='REVIEWER' AND status='IN_PROGRESS'", (now, work_item_id),
+            )
+            connection.execute(
+                "UPDATE work_items SET state='PLAN_REVIEW_PENDING',queue_state='CLAIMABLE',"
+                "current_role='REVIEWER',held_reason=NULL,blocked_reason=NULL,"
+                "row_version=row_version+1,updated_at=? WHERE work_item_id=?",
+                (now, work_item_id),
+            )
+            _event(connection, work_item_id, request_id, "AGENT_PLAN_REVIEW", "AGENT",
+                   reviewer_agent_id, {"decision": "REJECTED", "review": review,
+                                       "requestFingerprint": fingerprint})
+            _event(connection, work_item_id, request_id + "-artifact", "PLAN_ARTIFACT_HEAD",
+                   "AGENT", reviewer_agent_id, new_head)
+            connection.execute(
+                "UPDATE repository_locks SET status='RELEASED',released_at=? WHERE lock_id=?",
+                (now, lock_id),
+            )
+            _event(connection, work_item_id, request_id + "-release",
+                   "REPOSITORY_LOCK_RELEASED", "SYSTEM", "plan-amend", {
+                       "repositoryKey": repository_key, "generation": lock["generation"],
+                       "purpose": "PLAN_AMEND", "reviewerAgentId": reviewer_agent_id,
+                   })
+            try:
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                check = open_database(database)
+                try:
+                    event = check.execute(
+                        "SELECT payload_json FROM events WHERE request_id=?", (request_id,)
+                    ).fetchone()
+                    committed = bool(event and _event_payload(event).get(
+                        "requestFingerprint") == fingerprint)
+                finally:
+                    check.close()
+                if committed:
+                    return get_work_item(database, work_item_id)
+                raise
+        finally:
+            connection.close()
+        return get_work_item(database, work_item_id)
+    except Exception:
+        check = open_database(database)
+        try:
+            committed_event = check.execute(
+                "SELECT payload_json FROM events WHERE request_id=?", (request_id,)
+            ).fetchone()
+            already_committed = bool(
+                committed_event and _event_payload(committed_event).get(
+                    "requestFingerprint") == fingerprint
+            )
+        finally:
+            check.close()
+        if already_committed:
+            # The runtime head/review/release transaction is authoritative.
+            # Never compensate committed bytes merely because projection failed.
+            raise
+        # Do not overwrite a third party's conflicting content.  Exact new bytes
+        # are ours and can be compensated to the exact old head.
+        if official is not None and os.path.isfile(official):
+            current = _artifact_sha(official)
+            if current == replacement_sha:
+                _atomic_plan_bytes(official, old_bytes)
+            elif current != _sha(old_bytes):
+                try:
+                    _release_plan_amend_lock(
+                        database, lock_id, work_item_id, reviewer_agent_id,
+                        "plan-amend-conflict-release-" + _sha(request_id),
+                    )
+                finally:
+                    raise LiteError("PLAN_AMEND compensation found conflicting artifact bytes")
+        _release_plan_amend_lock(
+            database, lock_id, work_item_id, reviewer_agent_id,
+            "plan-amend-failure-release-" + _sha(request_id),
+        )
+        raise
+
+
 def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
-                      request_id=None):
-    _usage_sync_boundary(database, work_item_id)
+                      request_id=None, usage_policy="BEST_EFFORT"):
+    _usage_sync_boundary(database, work_item_id, usage_policy)
     request_id = request_id or _id("human")
     connection = open_database(database)
     try:
@@ -2308,6 +2752,9 @@ def _load_json_file(path, label):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="agent-workboard-lite")
     parser.add_argument("--database", default=DEFAULT_DATABASE)
+    parser.add_argument("--project-root")
+    parser.add_argument("--repository-key")
+    parser.add_argument("--usage-policy", choices=USAGE_POLICIES, default="BEST_EFFORT")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
     create = sub.add_parser("create")
@@ -2361,6 +2808,8 @@ def main(argv=None):
     transition_parser.add_argument("--local-tests-passed", action="store_true")
     transition_parser.add_argument("--submission-file")
     transition_parser.add_argument("--quality-file")
+    transition_parser.add_argument("--plan-artifact")
+    transition_parser.add_argument("--request-id")
     review = sub.add_parser("review")
     review.add_argument("work_item_id")
     review.add_argument("--stage", required=True, choices=("PLAN", "FINAL"))
@@ -2368,6 +2817,8 @@ def main(argv=None):
     review.add_argument("--decision", required=True, choices=("APPROVED", "REJECTED"))
     review.add_argument("--summary")
     review.add_argument("--review-file")
+    review.add_argument("--replacement-file")
+    review.add_argument("--request-id")
     gate = sub.add_parser("gate")
     gate.add_argument("work_item_id")
     gate.add_argument("--stage", required=True, choices=("PLAN", "FINAL"))
@@ -2436,9 +2887,11 @@ def main(argv=None):
                                  args.role, expires, session_id=args.session_id,
                                  usage_provider=args.usage_provider, model=args.model,
                                  orchestrator_id=args.orchestrator_id,
-                                 orchestrator_generation=args.orchestrator_generation))
+                                 orchestrator_generation=args.orchestrator_generation,
+                                 usage_policy=args.usage_policy))
         elif args.command == "release":
-            release_claim(args.database, args.work_item_id, args.agent)
+            release_claim(args.database, args.work_item_id, args.agent,
+                          usage_policy=args.usage_policy)
             _print(get_work_item(args.database, args.work_item_id))
         elif args.command == "lock":
             if args.ttl < 1:
@@ -2449,7 +2902,8 @@ def main(argv=None):
             release_repository_lock(args.database, args.work_item_id, args.repository, args.agent)
             _print(get_work_item(args.database, args.work_item_id))
         elif args.command == "task":
-            set_task_status(args.database, args.work_item_id, args.task_id, args.agent, args.status, args.evidence)
+            set_task_status(args.database, args.work_item_id, args.task_id, args.agent,
+                            args.status, args.evidence, usage_policy=args.usage_policy)
             _print(get_work_item(args.database, args.work_item_id))
         elif args.command == "transition":
             _print(transition(
@@ -2457,14 +2911,37 @@ def main(argv=None):
                 local_tests_passed=args.local_tests_passed,
                 submission=_load_json_file(args.submission_file, "submission file"),
                 quality_baseline=_load_json_file(args.quality_file, "quality file"),
+                usage_policy=args.usage_policy,
+                request_id=args.request_id,
+                plan_artifact=({"projectRoot": args.project_root,
+                                "path": args.plan_artifact}
+                               if args.plan_artifact else None),
             ))
         elif args.command == "review":
             review_summary = _load_json_file(args.review_file, "review file") if args.review_file else args.summary
             if review_summary is None:
                 raise LiteError("review requires --summary or --review-file")
-            _print(record_agent_review(args.database, args.work_item_id, args.stage, args.agent, args.decision, review_summary))
+            if args.replacement_file:
+                if args.stage != "PLAN" or args.decision != "REJECTED" or not args.review_file:
+                    raise LiteError("replacement-file requires a structured rejected PLAN review")
+                if not args.project_root or not args.repository_key:
+                    raise LiteError("replacement-file requires configured project identity")
+                _print(amend_plan_review(
+                    args.database, args.work_item_id, args.agent, args.replacement_file,
+                    args.project_root, args.repository_key, review_summary,
+                    args.request_id, usage_policy=args.usage_policy,
+                ))
+            else:
+                _print(record_agent_review(
+                    args.database, args.work_item_id, args.stage, args.agent,
+                    args.decision, review_summary, request_id=args.request_id,
+                    usage_policy=args.usage_policy,
+                ))
         elif args.command == "gate":
-            _print(record_human_gate(args.database, args.work_item_id, args.stage, args.human, args.decision, args.reason))
+            _print(record_human_gate(
+                args.database, args.work_item_id, args.stage, args.human,
+                args.decision, args.reason, usage_policy=args.usage_policy,
+            ))
         elif args.command in ("hold", "resume"):
             _print(set_hold(args.database, args.work_item_id, args.human, args.command == "hold", args.reason))
         elif args.command == "unblock":

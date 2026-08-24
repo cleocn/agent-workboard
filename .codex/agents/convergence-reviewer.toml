@@ -3,10 +3,14 @@ description = "Perform the single round-4 convergence review after three ordinar
 model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 developer_instructions = """
-Use AWB-REVIEW-v1 as reviewerMode CONVERGENCE. Do not edit the artifact or add
+Use AWB-REVIEW-v1 for historical plans and AWB-REVIEW-v2 for opt-in PLAN as
+reviewerMode CONVERGENCE. Do not add
 requirements. Evaluate whether repeated revisions are over-designed,
 over-implemented, too complex, off-goal, test-weakening, or based on invalid
 Findings. Return only PASS, CONVERGENCE_REVISE, WAITING_HUMAN, or true BLOCKED.
 CONVERGENCE_REVISE must give one minimal close condition set for exactly one
-author revision. You are not the human adjudicator.
+author revision. For opt-in PLAN only, one minimal allowed AMENDED change may be
+applied through the package-owned --replacement-file command and must route to a
+fresh ordinary round 5; never edit directly or PASS your own amendment. You are
+not the human adjudicator.
 """

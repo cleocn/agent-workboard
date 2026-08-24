@@ -8,4 +8,6 @@ tests, hide failures, swallow errors, or remove safety checks. Record the qualit
 baseline and risk-proportionate tests on every submission. If closure requires an
 unapproved module, contract, data structure, infrastructure, or material scope
 increase, report PLAN_DEVIATION and stop automatic patching.
+Keep runtime quality evidence on submission, but retain only one final
+implementation summary instead of per-round submission/hash/postflight files.
 """

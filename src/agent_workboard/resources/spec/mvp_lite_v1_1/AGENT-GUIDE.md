@@ -11,7 +11,7 @@
 - `ORCHESTRATOR`：创建 WorkItem、选择下一角色、维护优先级和搁置；只能按持久化策略消费 SYSTEM 自动门，不能冒充 HUMAN。
 - `PLANNER`：读取范围、形成复现/根因/方案或实施计划，完成后执行 `submit_plan`。
 - `IMPLEMENTER`：只在“规划复审通过”后实施；完成全部实施任务和本地测试后执行 `submit_implementation`。
-- `REVIEWER`：独立复审整份规划或整批实施结果；不对每个子任务逐一复审，不修改被审内容。
+- `REVIEWER`：独立复审整份规划或整批实施结果；不对每个子任务逐一复审。Implementation Reviewer 始终只读；opt-in PLAN Reviewer 只能通过 package-owned amendment 命令修正获批的非实质问题。
 
 ## Agent 每次运行的固定顺序
 
@@ -20,7 +20,7 @@
 3. 写仓库前取得仓库单写锁；只读操作不取得写锁。
 4. 执行任务并记录简短证据引用。不得写入密码、Token 或隐藏思维链。
 5. 持有 WorkItem claim 完成当前任务；先释放仓库 writer lock，再提交规划或实施结果。提交 transition 成功时原子释放 claim，提前 release claim 的提交必须被拒绝。
-6. 达到用户指定停止点、人工门禁、`HELD` 或 `BLOCKED` 时停止；状态变化后同步并显示脱敏 usage。
+6. 达到用户指定停止点、人工门禁、`HELD` 或 `BLOCKED` 时停止。只有项目 `usagePolicy=BEST_EFFORT` 才在状态变化后同步脱敏 usage；缺失或 `OFF` 时完全跳过。
 
 ## 创建风险与 gate 策略
 
@@ -48,7 +48,7 @@ bundle 迁移为 `MANUAL`。
 
 每个阻断 Finding 必须有唯一 ID、PLAN/IMPLEMENTATION stage、被违反的明确契约、可核验证据、具体影响和最小关闭条件。缺项意见只能是建议；只有建议的复审必须 PASS。第 2 轮起只检查开放 Finding、本轮直接回归或此前客观不可得的新证据；新 Finding 必须说明来源和此前不可得原因。
 
-PLAN 与 IMPLEMENTATION 独立使用严格串行 `3+1+1`。第 1～3 轮使用普通 Reviewer；第 3 轮仍 REVISE 时冻结 artifact，不返回作者，直接调用唯一一次第 4 轮高级 convergence reviewer。其结果只允许 PASS、CONVERGENCE_REVISE、WAITING_HUMAN 或真实 BLOCKED；只有 CONVERGENCE_REVISE 允许一次最小返工。第 5 轮由普通 Reviewer 仅核验高级关闭条件和直接回归，仍 REVISE 就进入 WAITING_HUMAN，禁止第 6 轮。Reviewer、claim generation、重复提交、人工退回或 PLAN_DEVIATION 都不重置累计轮次。
+PLAN 与 IMPLEMENTATION 独立使用严格串行 `3+1+1`。新 PLAN 以 `--plan-artifact` 显式 opt in；每轮使用未参加过该 PLAN 的 Reviewer，latest editor 不得自审。R1～R3 可 PASS、以 package-owned `--replacement-file` 原子 AMENDED，或把实质变更 REVISE_TO_PLANNER；R3 两种修改结果都直接进唯一 R4 convergence。R4 只允许一次最小 AMENDED 后进入 fresh ordinary R5；R5 只允许 PASS/WAITING_HUMAN，禁止修改和第 6 轮。Reviewer 不直接写文件，PASS 不取得 writer；旧 PLAN 保持 AWB-REVIEW-v1 只读语义。IMPLEMENTATION 的 REVISE/CONVERGENCE_REVISE、Reviewer 禁止编辑产品和全部质量门保持不变。Reviewer、claim generation、人工退回或 PLAN_DEVIATION 都不重置累计轮次。
 
 ## 孤立 Reviewer 任务恢复
 
@@ -100,9 +100,10 @@ HUMAN gate、hold/block 和同 repositoryKey 单 writer 规则保持不变。AWB
 
 ## 主 Agent 活动期保障
 
-成功状态变更后，主 Agent 执行 `usage sync` 与按 role 的 `usage show`，只展示聚合
-token、estimated credits、quota、coverage 和 gap reason。活动等待时以 300 秒为目标
-best effort 刷新；错过不补跑，会话暂停/关闭后不工作，也不承诺 daemon 或定时 SLA。
+`.awb/config.json` 的 `usagePolicy` 缺失时按 `OFF`。OFF 时不绑定 session、不创建 span、
+不执行 mutation sync/show、不定期刷新、不以 coverage/credits/quota 作为 gate；历史
+show/export/self-check 仍可显式调用。只有 BEST_EFFORT 延续既有脱敏采集，失败不阻断
+主工作流；两种模式都不承诺 daemon 或定时 SLA。
 
 macOS 上主 Agent 可用一个前台工具会话持有 `caffeinate -di`，并以工具 session/cell
 句柄作为唯一所有权。多个活动 WorkItem 共享一个 inhibitor；只有最后一个活动项停止后
@@ -115,6 +116,13 @@ macOS 上主 Agent 可用一个前台工具会话持有 `caffeinate -di`，并�
 `submit_plan` 和 `submit_implementation` 都要求提交者持有活动 claim；二者在成功 transition 内原子释放该 claim。若存在活动 repository writer lock，必须先释放该 lock。不得先 release WorkItem claim 再提交。
 
 每次实施提交还必须记录已通过 acceptance、测试命令/结果、实际修改范围、已知非阻断问题、关闭 Finding、复杂度变化和回归。删测、跳测、放宽断言、已有验收倒退或新同级缺陷会停止自动提交。修复需要未批准模块、契约、数据结构、基础设施或显著扩项时使用 `plan-deviation`，实现 task 进入 BLOCKED、回到 Planner，既有复审轮次不重置。
+
+过程审计以 runtime events 为权威；不强制每轮 submission JSON、quality hash、重复
+postflight 或 Release body hash。普通 WorkItem 只保留一份最终 implementation summary；
+发布 WorkItem 只保留一份 release postflight。Preview 仅执行一次 clean build/full test/
+fresh install、exact path allowlist、artifact member/secret scan、三资产 SHA、remote drift 和
+独立 Implementation review，不要求 per-file manifest SHA、double/no-Git reproducibility 或
+reachable-object/history closure。
 
 任务只能沿已定义边推进，同一 WorkItem 最多一个 IN_PROGRESS；BLOCKED、WAITING_ACCEPTANCE、COMPLETED 或 CANCELLED 必须有证据。`show` 与 HTTP detail 投影 management、任务板、进度、currentTask、唯一 nextStep 和两阶段 review counters；board/list 只显示进度与 nextStep 摘要。
 

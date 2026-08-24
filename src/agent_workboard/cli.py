@@ -11,7 +11,7 @@ from . import orchestrator
 from . import usage
 from .project import (backup, bootstrap, codex_check, codex_install, doctor,
                       init_project, migrate, transfer_export, transfer_import,
-                      upgrade_project)
+                      upgrade_project, usage_policy, set_usage_policy)
 
 
 def _print(value):
@@ -25,6 +25,12 @@ def _project_database(path, development=False):
         raise lite.LiteError("--development requires a development configuration")
     _validate_identity(config, database)
     return database
+
+
+def _project_usage_policy(path):
+    from .project import _load_config, _project_root
+    config, unused_database = _load_config(_project_root(path))
+    return config["usagePolicy"]
 
 
 def _lite_args(args):
@@ -43,14 +49,37 @@ def _lite_args(args):
         else:
             if os.path.realpath(database) != os.path.realpath(configured):
                 raise lite.LiteError("--database must match the configured project database")
-    return ["--database", database] + getattr(args, "remainder", [])
+    from .project import _load_config, _project_root
+    config, unused = _load_config(_project_root(args.project))
+    return ["--database", database, "--project-root", os.path.realpath(args.project),
+            "--repository-key", config["repositoryKey"],
+            "--usage-policy", config["usagePolicy"]] + getattr(args, "remainder", [])
+
+
+def _usage_disabled(operation):
+    return {"protocolVersion": "AWB-USAGE-POLICY-v1", "operation": operation,
+            "status": "DISABLED", "policy": "OFF", "writes": 0}
 
 
 def _usage_command(args):
     database = _project_database(args.project)
-    if args.usage_command == "sync":
-        result = usage.sync(database, args.work_item, args.all_bound, args.dry_run)
-        _print(result) if args.format == "json" else print(usage.render_sync_table(result))
+    policy = _project_usage_policy(args.project)
+    if args.usage_command == "policy":
+        if args.policy_command == "show":
+            _print(usage_policy(args.project))
+        else:
+            _print(set_usage_policy(
+                args.project, "BEST_EFFORT" if args.policy_command == "enable" else "OFF"
+            ))
+    elif args.usage_command == "sync":
+        result = (_usage_disabled("SYNC") if policy == "OFF" else
+                  usage.sync(database, args.work_item, args.all_bound, args.dry_run))
+        if args.format == "json":
+            _print(result)
+        elif policy == "OFF":
+            print("usagePolicy=OFF status=DISABLED writes=0")
+        else:
+            print(usage.render_sync_table(result))
     elif args.usage_command == "show":
         simulated = None
         if args.simulate_rate_card:
@@ -68,7 +97,8 @@ def _usage_command(args):
         _print(usage.correct(database, args.event, args.human, args.reason, replacement))
     elif args.usage_command == "span":
         if args.span_command == "begin":
-            _print(usage.begin_span(database, args.work_item, args.task, args.agent,
+            _print(_usage_disabled("SPAN_BEGIN") if policy == "OFF" else
+                   usage.begin_span(database, args.work_item, args.task, args.agent,
                                     args.session_id, args.model))
         else:
             _print(usage.end_span(database, args.span, args.agent))
@@ -159,6 +189,11 @@ def main(argv=None):
     imported.add_argument("--check", action="store_true")
     usage_parser = sub.add_parser("usage")
     usage_sub = usage_parser.add_subparsers(dest="usage_command", required=True)
+    usage_policy_parser = usage_sub.add_parser("policy")
+    usage_policy_sub = usage_policy_parser.add_subparsers(dest="policy_command", required=True)
+    for policy_name in ("show", "enable", "disable"):
+        policy_command = usage_policy_sub.add_parser(policy_name)
+        policy_command.add_argument("--project", default=".")
     usage_sync = usage_sub.add_parser("sync")
     usage_sync.add_argument("--project", default=".")
     usage_sync_scope = usage_sync.add_mutually_exclusive_group(required=True)

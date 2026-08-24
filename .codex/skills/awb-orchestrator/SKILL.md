@@ -53,14 +53,21 @@ lock remains authoritative across WorkItems. A recovered coordinator observes
 an already-running Agent and never releases or impersonates it. AWB does not
 spawn, supervise, kill, steer, or migrate host processes.
 
-For PLAN and IMPLEMENTATION separately, route a strict serial 3+1+1 review:
-rounds 1–3 use the ordinary reviewer.  After round 3 REVISE, freeze the artifact
-and route exactly one round-4 `convergence-reviewer`; do not return it to the
-author first.  Only CONVERGENCE_REVISE permits one minimal author revision, then
-round 5 returns to the ordinary reviewer for the convergence close conditions and
-direct regressions only.  A round-5 REVISE, convergence WAITING_HUMAN, or true
-BLOCKED stops automation.  Never reset counts, switch reviewers, resubmit the
-same artifact, alter the ID, or create a replacement WorkItem to evade the cap.
+For PLAN and IMPLEMENTATION separately, route a strict serial 3+1+1 review.
+New plans opt in with `submit_plan --plan-artifact <project-relative-path>`.
+For an opt-in PLAN, each round uses a fresh Reviewer and the latest artifact
+editor cannot review that revision.  Rounds 1-3 may PASS, use the package-owned
+`review --replacement-file` path to AMEND only an allowed non-material defect,
+or return a material change to the Planner as REVISE_TO_PLANNER.  Either R3
+AMENDED or R3 REVISE_TO_PLANNER routes directly to the single round-4
+`convergence-reviewer`.  Round 4 may make one minimal AMENDED change and then
+routes to a fresh ordinary round 5.  Round 5 permits only PASS or WAITING_HUMAN
+and never creates round 6.  A Reviewer never edits files directly or acquires a
+generic writer; PASS is read-only.  Historical plans without the artifact
+envelope retain the read-only AWB-REVIEW-v1 behavior.  IMPLEMENTATION review is
+unchanged: its Reviewer never edits the product and the existing 3+1+1
+REVISE/CONVERGENCE_REVISE route remains authoritative.  Never reset counts,
+alter the ID, or create a replacement WorkItem to evade the cap.
 
 Reviewer feedback is evidence, not authority to expand scope.  Route only valid
 blocking Findings to authors.  On exhaustion, project the Finding disagreement
@@ -68,14 +75,23 @@ table, passed acceptance/tests, open Findings, consumed rounds, risks of changin
 or keeping the result, planning impact, and one next step; neither orchestrator
 nor reviewer decides for the human.
 
-After every successful WorkItem state mutation, run `awb usage sync --project
-<project> --work-item <WI>` and `awb usage show <WI> --project <project>
---group-by role --format table`.  Display only aggregate tokens, estimated
-credits, quota, coverage, and sync-gap reasons.  Never display prompt, response,
-tool output, credential, session content, or local session paths.  While this
-main Agent remains active in a tool/Agent wait, refresh at a 300-second target on
-a best-effort basis; missed intervals are not replayed and no offline timer,
-daemon, runner, or heartbeat SLA is implied.
+Read `.awb/config.json` `usagePolicy` before Usage orchestration; a missing field
+means `OFF`.  Under `OFF`, do not bind sessions, create spans, run mutation
+`usage sync/show`, refresh periodically, or use Usage coverage/credits/quota as
+a gate.  Explicit historical `usage show/export/self-check` remains available.
+Under `BEST_EFFORT`, preserve the existing binding/span/sync privacy behavior;
+failures remain diagnostic and do not authorize displaying prompt, response,
+tool output, credentials, session content, or local session paths.
+
+Runtime events are the process audit authority.  Do not require per-round
+submission JSON, per-round quality hashes, duplicate postflight files, or a
+Release body hash.  A normal WorkItem retains one final implementation summary;
+a release WorkItem retains one final release postflight.  A Preview gate runs
+one clean build, one full test, one fresh wheel install, exact changed-path
+allowlist, wheel/sdist secret and member scan, three-asset SHA-256, remote drift
+check, and independent Implementation review.  Preview does not require a
+second reproducibility build, a no-Git rebuild, per-file manifest hashes, or Git
+reachable-object/history closure.  Remote/destructive authority is unchanged.
 
 On Darwin, while actively managing one or more WorkItems, best-effort start the
 foreground command `caffeinate -di` only through a long-running Agent tool

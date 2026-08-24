@@ -165,6 +165,40 @@ reviewPolicy:
     afterConvergenceRevise: one_minimal_author_revision
     afterFifthRevise: WAITING_HUMAN
   convergenceResults: [PASS, CONVERGENCE_REVISE, WAITING_HUMAN, BLOCKED]
+  optInPlanArtifact:
+    protocol: AWB-PLAN-ARTIFACT-v1
+    reviewProtocol: AWB-REVIEW-v2
+    submitFlag: --plan-artifact
+    amendmentCommand: --replacement-file
+    allowedCategories: [INTERNAL_CONTRADICTION, COMMAND_OR_PATH, TEST_OMISSION,
+                        ACCEPTANCE_EXPRESSION, IMPLEMENTATION_ORDER, DUPLICATE_EVIDENCE]
+    freshReviewerEveryRound: true
+    lastEditorCannotReview: true
+    packageOwnedExactWriterLock: PLAN_AMEND
+    rounds1to3: [PASS, AMENDED, REVISE_TO_PLANNER, BLOCKED]
+    round4: [PASS, AMENDED, WAITING_HUMAN, BLOCKED]
+    round5: [PASS, WAITING_HUMAN]
+    round6: forbidden
+  implementationReviewUnchanged: true
+
+usagePolicy:
+  values: [OFF, BEST_EFFORT]
+  missingAndInitDefault: OFF
+  OFF: [no_binding, no_new_span, no_mutation_sync_show, no_periodic_refresh,
+        no_usage_gate, preserve_history_and_explicit_reports]
+  BEST_EFFORT: preserve_existing_privacy_parser_and_collection
+
+evidencePolicy:
+  runtimeEventsAuthoritative: true
+  normalFinalArtifact: implementation_summary
+  releaseFinalArtifact: release_postflight
+  previewRequired: [one_clean_build, one_full_test, one_fresh_install,
+                    exact_path_allowlist, artifact_secret_scan,
+                    three_asset_sha256, remote_drift, independent_review]
+  previewNotRequired: [per_round_submission_json, per_round_quality_hash,
+                       duplicate_postflight, release_body_hash,
+                       per_file_manifest_sha, double_clean_reproducibility,
+                       no_git_rebuild, reachable_object_closure]
 
 managementPolicy:
   runtimeAuthority: sqlite_projection

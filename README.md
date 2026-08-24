@@ -5,15 +5,15 @@ planner → reviewer → policy gate → implementer → reviewer workflow. It h
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install the 0.3.1b3 Preview
+## Install the 0.3.1b4 Preview
 
 This release is an opt-in, local-only, observation-only Preview. Download the
-wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b3` prerelease, verify both
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b4` prerelease, verify both
 artifacts, then initialize a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b3-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b4-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -36,22 +36,22 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an exact 0.3.1b2 project
+## Upgrade an exact 0.3.1b3 project
 
-Retain the exact old 0.3.1b2 wheel and install the verified 0.3.1b3 wheel. If the
-project uses an official GitHub URL lock, place its verified 0.3.1b2 wheel beside
+Retain the exact old 0.3.1b3 wheel and install the verified 0.3.1b4 wheel. If the
+project uses an official GitHub URL lock, place its verified 0.3.1b3 wheel beside
 the Preview wheel; a local file lock continues to use its recorded path. Always
 run the read-only preflight first, then execute only its one structured
 `nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b4-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b4-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
 
-Upgrade accepts only the exact released 0.3.1b2→0.3.1b3 identity pair. It refuses
+Upgrade accepts only the exact released 0.3.1b3→0.3.1b4 identity pair. It refuses
 an invalid database, active claim/writer/Orchestrator lease, identity drift,
 missing or partial source extensions, and customized package-owned Codex files.
 Execution first makes an online backup, then validates existing `AWB-USAGE-v1`,
@@ -80,6 +80,13 @@ PASS with zero open Findings and valid state/quality evidence can produce a
 `SYSTEM/AUTO_GATE_APPROVED` event. Failures and drift fall back to human
 handling; no HUMAN record is fabricated.
 
+New PLAN artifacts may opt in with `submit_plan --plan-artifact`. An opt-in PLAN
+Reviewer can apply a bounded non-material correction only through the
+package-owned `review --replacement-file` path. The amendment consumes its
+round, its editor cannot approve the revision, and the next round requires a
+fresh Reviewer. PLAN remains strict 3+1+1 with no round 6. Implementation
+review remains read-only and unchanged.
+
 ## HUMAN-only orphan Reviewer recovery
 
 `awb lite --project <project> recover-review-task <WorkItem> <Task> --human
@@ -91,8 +98,11 @@ drift fail closed with zero writes.
 
 ## Usage observation Preview
 
-Usage collection is off until sessions are explicitly bound and `awb usage
-sync` is invoked. The `codex-local` adapter observes a local, non-public schema
+New and legacy projects normalize `usagePolicy` to `OFF`; normal workflow then
+creates no bindings/spans and performs no mutation sync or periodic refresh.
+Use `awb usage policy enable --project <project>` to opt into `BEST_EFFORT`, and
+`awb usage policy disable` to return to OFF. Explicit historical show/export/
+self-check stays available. When enabled, the `codex-local` adapter observes a local, non-public schema
 and fails closed on drift. It accepts a single requested-head metadata record as
 parser v2 or a strict requested-head-to-ancestor chain as parser v3, then reads only allowlisted metadata and usage
 counters; it does not upload prompts, responses, tool output, source, sessions

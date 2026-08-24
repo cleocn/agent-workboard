@@ -9,6 +9,7 @@ import base64
 import csv
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import pkgutil
@@ -31,6 +32,7 @@ from .usage import USAGE_SCHEMA_VERSION, schema_installed, usage_schema_sql
 
 
 CONFIG_VERSION = 1
+USAGE_POLICIES = ("OFF", "BEST_EFFORT")
 MANAGED = ("config.json", "project.md", ".gitignore", "requirements-awb.txt")
 TABLES = ("work_items", "tasks", "claims", "repository_locks", "reviews",
           "human_gates", "events")
@@ -39,13 +41,13 @@ ORCHESTRATOR_TABLES = ("orchestrator_instances", "orchestrator_leases",
                        "orchestrator_events")
 UPGRADE_PROTOCOL = "AWB-UPGRADE-v1"
 ROLLBACK_PROTOCOL = "AWB-ROLLBACK-v1"
-RELEASE_0_3_1B2_IDENTITY = {
-    "packageVersion": "0.3.1b2",
-    "sourceCommit": "92504b9a7bd39316529d9e438d89e9730059e71b",
-    "sourceTree": "9ff2f8c9be822da56016f23d877767b5827533d0",
-    "sourceTag": "v0.3.1b2",
+RELEASE_0_3_1B3_IDENTITY = {
+    "packageVersion": "0.3.1b3",
+    "sourceCommit": "237a069e3339933b90afbad171c2400547c23f2f",
+    "sourceTree": "096631605e45d3bfa8df00a4f05546d7aedbf582",
+    "sourceTag": "v0.3.1b3",
 }
-SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_1B2_IDENTITY,)
+SUPPORTED_UPGRADE_SOURCES = (RELEASE_0_3_1B3_IDENTITY,)
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
 
 
@@ -143,6 +145,36 @@ def _empty_package_cache_record(parts, encoded_hash, size):
             parts[-1].endswith((".pyc", ".pyo")))
 
 
+def _external_package_cache_record(installation, package, name, encoded_hash, size):
+    """Recognize only interpreter-derived package bytecode outside site-packages.
+
+    Apple's system Python sets a global pycache prefix.  pip consequently adds
+    empty RECORD rows whose relative names contain ``..`` even though each row
+    is the exact cache path for a package-owned source file.  Derive the
+    permitted destinations from those sources instead of accepting a general
+    path traversal shape.
+    """
+    if encoded_hash or size or not name or "\\" in name or os.path.isabs(name):
+        return False
+    target = os.path.realpath(os.path.join(installation, *name.split("/")))
+    if os.path.islink(target) or not os.path.isfile(target):
+        return False
+    for base, directories, names in os.walk(package):
+        directories[:] = [entry for entry in directories
+                          if not os.path.islink(os.path.join(base, entry))]
+        for entry in names:
+            source = os.path.join(base, entry)
+            if not entry.endswith(".py") or os.path.islink(source):
+                continue
+            try:
+                expected = os.path.realpath(importlib.util.cache_from_source(source))
+            except (NotImplementedError, ValueError):
+                continue
+            if target == expected:
+                return True
+    return False
+
+
 def _installed_wheel_rebuild():
     """Build a deterministic wheel from a verified non-editable installation.
 
@@ -186,6 +218,9 @@ def _installed_wheel_rebuild():
         # pip records the generated console script outside site-packages.
         # It is not package input and is never copied into a rebuilt wheel.
         if name == "../../../bin/awb":
+            continue
+        if _external_package_cache_record(
+                installation, package, name, encoded_hash, size):
             continue
         parts = name.split("/")
         if not name or "\\" in name or os.path.isabs(name) or any(part in ("", ".", "..") for part in parts):
@@ -320,6 +355,13 @@ def _load_config(root):
         raise LiteError("AWB configuration is incomplete or unsupported")
     if data["runtimeMode"] not in ("stable", "development"):
         raise LiteError("AWB runtimeMode is invalid")
+    policy = data.get("usagePolicy", "OFF")
+    if policy not in USAGE_POLICIES:
+        raise LiteError("AWB usagePolicy is invalid")
+    # Missing means OFF for old projects.  Normalization is deliberately
+    # in-memory only: merely opening a project never rewrites its contract.
+    data = dict(data)
+    data["usagePolicy"] = policy
     database = os.path.realpath(os.path.join(root, data["database"]))
     if os.path.commonpath((root, database)) != root:
         raise LiteError("AWB database escapes project root")
@@ -352,7 +394,7 @@ def _validate_project_contract(root):
     elif (parsed.scheme != "https" or parsed.netloc != "github.com" or
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
                   for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1",
-                              "v0.3.1b2", "v0.3.1b3"))):
+                              "v0.3.1b2", "v0.3.1b3", "v0.3.1b4"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -441,6 +483,7 @@ def config_for(root, development=False):
         "repositoryKey": os.path.basename(root) or "project",
         "database": db,
         "runtimeMode": mode,
+        "usagePolicy": "OFF",
         "requiredPackageVersion": __version__,
         "requiredSourceCommit": BUILD_IDENTITY["sourceCommit"],
         "requiredSourceTree": BUILD_IDENTITY["sourceTree"],
@@ -579,6 +622,7 @@ def doctor(path):
             orchestrator_state == "INVALID" or gate_policy_state == "INVALID"):
         raise LiteError("database integrity or foreign key check failed")
     return {"status": "ok", "database": database, "schemaVersion": SCHEMA_VERSION,
+            "usagePolicy": config["usagePolicy"],
             "usageSchemaVersion": usage_version, "buildIdentity": BUILD_IDENTITY,
             "orchestratorSchemaVersion": orchestrator_version,
             "orchestratorSchemaState": orchestrator_state,
@@ -591,6 +635,70 @@ def doctor(path):
                          if (orchestrator_state == "ABSENT" or
                              gate_policy_state == "ABSENT") else
                          {"action": "NONE", "arguments": {}})}
+
+
+def usage_policy(path):
+    """Return the normalized project collection policy without mutating it."""
+    root = _project_root(path)
+    config, database = _load_config(root)
+    _validate_project_contract(root)
+    _validate_identity(config, database)
+    return {"protocolVersion": "AWB-USAGE-POLICY-v1", "status": "OK",
+            "policy": config["usagePolicy"], "project": root}
+
+
+def set_usage_policy(path, policy):
+    """Atomically change collection policy while no attribution interval is active."""
+    if policy not in USAGE_POLICIES:
+        raise LiteError("AWB usagePolicy is invalid")
+    root = _project_root(path)
+    config_path = _regular_project_path(root, _config_path(root), "project config")
+    if os.path.islink(config_path):
+        raise LiteError("project config contains a symbolic link")
+    config, database = _load_config(root)
+    _validate_project_contract(root)
+    _validate_identity(config, database)
+    connection = open_database(database)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        claims = connection.execute(
+            "SELECT count(*) FROM claims WHERE status='ACTIVE'"
+        ).fetchone()[0]
+        spans = connection.execute(
+            "SELECT count(*) FROM usage_events b WHERE b.event_type='USAGE_SPAN_BEGAN' "
+            "AND NOT EXISTS (SELECT 1 FROM usage_events e WHERE e.event_type='USAGE_SPAN_ENDED' "
+            "AND json_extract(e.payload_json,'$.spanId')=json_extract(b.payload_json,'$.spanId'))"
+        ).fetchone()[0]
+        if claims or spans:
+            raise LiteError("usage policy change requires no active Agent claim or Usage span")
+        with open(config_path, "rb") as handle:
+            before = handle.read()
+        current = json.loads(before.decode("utf-8"))
+        normalized = current.get("usagePolicy", "OFF")
+        if normalized not in USAGE_POLICIES:
+            raise LiteError("AWB usagePolicy is invalid")
+        if normalized == policy:
+            connection.rollback()
+            return {"protocolVersion": "AWB-USAGE-POLICY-v1", "status": "NO_OP",
+                    "policy": policy, "project": root}
+        updated = dict(current)
+        updated["usagePolicy"] = policy
+        replacement = (json.dumps(updated, ensure_ascii=False, sort_keys=True, indent=2) +
+                       "\n").encode("utf-8")
+        # Recheck exact bytes immediately before replacement so a concurrent
+        # package-owned update cannot be silently overwritten.
+        with open(config_path, "rb") as handle:
+            if handle.read() != before:
+                raise LiteError("project config changed during usage policy update")
+        _atomic_bytes(config_path, replacement)
+        connection.commit()
+        return {"protocolVersion": "AWB-USAGE-POLICY-v1", "status": "OK",
+                "policy": policy, "project": root}
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def backup(path):
@@ -872,9 +980,9 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.1b3" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b3"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.1b3 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b4" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b4"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b4 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
@@ -884,7 +992,7 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
             if (database_status["usageSchemaState"] != "INSTALLED" or
                     database_status["orchestratorSchemaState"] != "INSTALLED" or
                     database_status["gatePolicySchemaState"] != "INSTALLED"):
-                raise LiteError("same-identity 0.3.1b3 project is missing a required schema extension")
+                raise LiteError("same-identity 0.3.1b4 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -895,13 +1003,13 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation):
             return {"result": result, "root": root, "config": config, "database": database}
 
         if current_identity not in SUPPORTED_UPGRADE_SOURCES:
-            raise LiteError("upgrade source identity is outside the exact 0.3.1b2 to 0.3.1b3 matrix")
+            raise LiteError("upgrade source identity is outside the exact 0.3.1b3 to 0.3.1b4 matrix")
         if database_status["usageSchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a 0.3.1b2 database without the exact usage extension")
+            raise LiteError("upgrade refuses a 0.3.1b3 database without the exact usage extension")
         if database_status["orchestratorSchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a 0.3.1b2 database without the exact orchestrator extension")
+            raise LiteError("upgrade refuses a 0.3.1b3 database without the exact orchestrator extension")
         if database_status["gatePolicySchemaState"] != "INSTALLED":
-            raise LiteError("upgrade refuses a 0.3.1b2 database without the exact auto-gate extension")
+            raise LiteError("upgrade refuses a 0.3.1b3 database without the exact auto-gate extension")
         old_wheel, old_digest = _locked_wheel(root, os.path.dirname(target_wheel))
         old_identity = _wheel_identity(old_wheel)
         if old_identity != current_identity:
@@ -1061,7 +1169,7 @@ def _write_upgrade(plan):
                     human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("0.3.1b3 no-DDL extension validation failed")
+                raise LiteError("0.3.1b4 no-DDL extension validation failed")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1156,7 +1264,7 @@ def _manifest_target(base, relative, label, allow_missing=False):
 
 
 def _expected_rollback_material(root, database, manifest, backup_root):
-    """Reconstruct the only mutations the bounded 0.3.1b3 upgrade can make."""
+    """Reconstruct the only mutations the bounded 0.3.1b4 upgrade can make."""
     if not isinstance(manifest.get("withCodex"), bool):
         raise LiteError("rollback manifest Codex selection is invalid")
     managed_backups = {}
@@ -1179,6 +1287,7 @@ def _expected_rollback_material(root, database, manifest, backup_root):
     except (IOError, ValueError, TypeError):
         raise LiteError("rollback backup hash drift or config backup is invalid")
     updated = dict(old_config)
+    updated["usagePolicy"] = old_config.get("usagePolicy", "OFF")
     updated["requiredPackageVersion"] = manifest["to"]["packageVersion"]
     updated["requiredSourceCommit"] = manifest["to"]["sourceCommit"]
     updated["requiredSourceTree"] = manifest["to"]["sourceTree"]
@@ -1522,7 +1631,7 @@ def _write_rollback(plan):
 
 
 def upgrade_project(path, wheel_path=None, with_codex=False, check=False, rollback_manifest=None):
-    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b3."""
+    """Check, execute, or exactly roll back a bounded upgrade to 0.3.1b4."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",
@@ -1659,7 +1768,8 @@ def codex_check(path):
             "convergence-reviewer" not in skill or "human" not in skill.lower() or
             "references/upgrade-and-rollback.md" not in skill or "PREFLIGHT_FIRST" not in skill or
             "AWB-CREATION-RISK-v1" not in skill or "AUTO_ON_PASS" not in skill or
-            "AUTO_GATE_APPROVED" not in skill or "300-second" not in skill or
+            "AUTO_GATE_APPROVED" not in skill or "usagePolicy" not in skill or
+            "--replacement-file" not in skill or
             "caffeinate -di" not in skill or "last active WorkItem" not in skill):
         raise LiteError("Codex Skill contract is incomplete")
     with open(os.path.join(root, ".codex", "skills", "awb-orchestrator", "references",

@@ -16,6 +16,7 @@ from agent_workboard.lite import (
     LiteError,
     acquire_claim,
     acquire_repository_lock,
+    amend_plan_review,
     amend_management,
     backfill_management,
     create_work_item,
@@ -262,6 +263,259 @@ class LiteWorkboardTest(unittest.TestCase):
         connection.close()
         with self.assertRaises(LiteError):
             initialize_database(self.database)
+
+    def _opt_in_plan(self, work_item_id):
+        self.create(work_item_id)
+        path = os.path.join(self.temporary.name, work_item_id + "-plan.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("# revision 1\n")
+        planner = work_item_id + "-planner"
+        self.claim(work_item_id, 1, planner, "PLANNER")
+        self.complete(work_item_id, 1, planner)
+        transition(
+            self.database, work_item_id, "submit_plan", planner,
+            plan_artifact={"projectRoot": self.temporary.name,
+                           "path": os.path.basename(path)},
+        )
+        return path
+
+    def _amend_review(self, work_item_id, reviewer, path, revision, mode="ORDINARY"):
+        head = get_work_item(self.database, work_item_id)["planArtifact"]
+        replacement = os.path.join(
+            self.temporary.name, "replacement-{0}-{1}.md".format(work_item_id, revision)
+        )
+        with open(replacement, "w", encoding="utf-8") as handle:
+            handle.write("# revision {0}\n".format(revision))
+        review = {
+            "protocolVersion": "AWB-REVIEW-v2", "stage": "PLAN",
+            "result": "AMENDED", "reviewerMode": mode,
+            "reviewedArtifact": {key: head[key] for key in (
+                "path", "revision", "sha256", "editorAgentId"
+            )},
+            "amendments": [{"category": "TEST_OMISSION", "summary": "add test",
+                             "traceTo": ["AC-001"]}],
+            "findings": [], "resolvedFindingIds": [],
+            "nonBlockingSuggestions": [], "summary": "amended",
+        }
+        return amend_plan_review(
+            self.database, work_item_id, reviewer, replacement,
+            self.temporary.name, "test-repository", review,
+            "amend-{0}-{1}".format(work_item_id, revision),
+        )
+
+    def test_opt_in_plan_amendment_is_atomic_and_requires_fresh_reviewer(self):
+        work_item_id = "TI-AMEND"
+        path = self._opt_in_plan(work_item_id)
+        self.claim(work_item_id, 3, "reviewer-a", "REVIEWER")
+        self._amend_review(work_item_id, "reviewer-a", path, 2)
+        item = get_work_item(self.database, work_item_id)
+        self.assertEqual(2, item["planArtifact"]["revision"])
+        self.assertEqual("reviewer-a", item["planArtifact"]["editorAgentId"])
+        self.assertEqual("CLAIMABLE", item["queue_state"])
+        with self.assertRaises(LiteError):
+            self.claim(work_item_id, 3, "reviewer-a", "REVIEWER")
+        self.claim(work_item_id, 3, "reviewer-b", "REVIEWER")
+        head = get_work_item(self.database, work_item_id)["planArtifact"]
+        record_agent_review(
+            self.database, work_item_id, "PLAN", "reviewer-b", "APPROVED", {
+                "protocolVersion": "AWB-REVIEW-v2", "stage": "PLAN",
+                "result": "PASS", "reviewerMode": "ORDINARY",
+                "reviewedArtifact": {key: head[key] for key in (
+                    "path", "revision", "sha256", "editorAgentId"
+                )},
+                "amendments": [], "findings": [], "resolvedFindingIds": [],
+                "nonBlockingSuggestions": [], "summary": "pass",
+            },
+        )
+        self.assertEqual("WAITING_HUMAN", get_work_item(
+            self.database, work_item_id
+        )["queue_state"])
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertEqual("# revision 2\n", handle.read())
+
+    def test_opt_in_plan_rounds_stop_at_five_and_round_five_cannot_amend(self):
+        work_item_id = "TI-ROUNDS"
+        path = self._opt_in_plan(work_item_id)
+        for round_number in (1, 2, 3, 4):
+            reviewer = "round-reviewer-" + str(round_number)
+            self.claim(work_item_id, 3, reviewer, "REVIEWER")
+            self._amend_review(
+                work_item_id, reviewer, path, round_number + 1,
+                mode="CONVERGENCE" if round_number == 4 else "ORDINARY",
+            )
+        self.claim(work_item_id, 3, "round-reviewer-5", "REVIEWER")
+        with self.assertRaises(LiteError):
+            self._amend_review(work_item_id, "round-reviewer-5", path, 6)
+        release_claim(self.database, work_item_id, "round-reviewer-5")
+        self.claim(work_item_id, 3, "round-reviewer-final", "REVIEWER")
+        head = get_work_item(self.database, work_item_id)["planArtifact"]
+        record_agent_review(
+            self.database, work_item_id, "PLAN", "round-reviewer-final", "APPROVED", {
+                "protocolVersion": "AWB-REVIEW-v2", "stage": "PLAN",
+                "result": "PASS", "reviewerMode": "ORDINARY",
+                "reviewedArtifact": {key: head[key] for key in (
+                    "path", "revision", "sha256", "editorAgentId"
+                )},
+                "amendments": [], "findings": [], "resolvedFindingIds": [],
+                "nonBlockingSuggestions": [], "summary": "round five pass",
+            },
+        )
+        projection = get_work_item(self.database, work_item_id)["reviewConvergence"]["PLAN"]
+        self.assertEqual(5, projection["totalRoundsUsed"])
+
+    def test_plan_amend_replace_failure_restores_bytes_and_releases_exact_lock(self):
+        work_item_id = "TI-AMEND-FAULT"
+        path = self._opt_in_plan(work_item_id)
+        self.claim(work_item_id, 3, "reviewer-fault", "REVIEWER")
+        with open(path, "rb") as handle:
+            original = handle.read()
+        real_replace = __import__("agent_workboard.lite", fromlist=["_atomic_plan_bytes"])._atomic_plan_bytes
+        calls = {"count": 0}
+
+        def fail_once(target, raw):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise IOError("injected replace failure")
+            return real_replace(target, raw)
+
+        with mock.patch("agent_workboard.lite._atomic_plan_bytes", side_effect=fail_once):
+            with self.assertRaises(IOError):
+                self._amend_review(work_item_id, "reviewer-fault", path, 2)
+        with open(path, "rb") as handle:
+            self.assertEqual(original, handle.read())
+        connection = open_database(self.database)
+        try:
+            self.assertEqual(0, connection.execute(
+                "SELECT count(*) FROM repository_locks WHERE status='ACTIVE'"
+            ).fetchone()[0])
+            self.assertEqual(0, connection.execute(
+                "SELECT count(*) FROM reviews WHERE work_item_id=?", (work_item_id,)
+            ).fetchone()[0])
+        finally:
+            connection.close()
+
+    def test_usage_off_skips_binding_and_mutation_boundaries(self):
+        work_item_id = "TI-USAGE-OFF"
+        self.create(work_item_id)
+        with mock.patch("agent_workboard.usage.prepare_interval_boundary",
+                        side_effect=AssertionError("must not parse")), mock.patch(
+                            "agent_workboard.usage.best_effort_sync",
+                            side_effect=AssertionError("must not sync")):
+            result = acquire_claim(
+                self.database, work_item_id, work_item_id + "-T01", "planner-off",
+                "PLANNER", self.expires(), session_id="missing-session",
+                usage_provider="codex-local", model="test", usage_policy="OFF",
+            )
+            self.assertEqual("DISABLED", result["usageStatus"])
+            set_task_status(
+                self.database, work_item_id, work_item_id + "-T01", "planner-off",
+                "IN_PROGRESS", usage_policy="OFF",
+            )
+            set_task_status(
+                self.database, work_item_id, work_item_id + "-T01", "planner-off",
+                "COMPLETED", ["done"], usage_policy="OFF",
+            )
+            transition(
+                self.database, work_item_id, "submit_plan", "planner-off",
+                usage_policy="OFF",
+            )
+        connection = open_database(self.database)
+        try:
+            self.assertEqual(0, connection.execute(
+                "SELECT count(*) FROM usage_events WHERE event_type='USAGE_BINDING_CREATED'"
+            ).fetchone()[0])
+        finally:
+            connection.close()
+
+    def test_plan_amend_exact_replay_is_noop_and_conflicting_replay_is_zero_write(self):
+        work_item_id = "TI-AMEND-REPLAY"
+        path = self._opt_in_plan(work_item_id)
+        reviewer = "reviewer-replay"
+        self.claim(work_item_id, 3, reviewer, "REVIEWER")
+        head = get_work_item(self.database, work_item_id)["planArtifact"]
+        replacement = os.path.join(self.temporary.name, "replay-replacement.md")
+        with open(replacement, "w", encoding="utf-8") as handle:
+            handle.write("# replacement\n")
+        review = {
+            "protocolVersion": "AWB-REVIEW-v2", "stage": "PLAN",
+            "result": "AMENDED", "reviewerMode": "ORDINARY",
+            "reviewedArtifact": {key: head[key] for key in (
+                "path", "revision", "sha256", "editorAgentId"
+            )},
+            "amendments": [{"category": "COMMAND_OR_PATH", "summary": "fix command",
+                             "traceTo": ["AC-001"]}],
+            "findings": [], "resolvedFindingIds": [],
+            "nonBlockingSuggestions": [], "summary": "amended",
+        }
+        arguments = (self.database, work_item_id, reviewer, replacement,
+                     self.temporary.name, "test-repository", review, "exact-replay")
+        amend_plan_review(*arguments)
+        snapshot = self.database_snapshot()
+        amend_plan_review(*arguments)
+        self.assertEqual(snapshot, self.database_snapshot())
+        changed = dict(review)
+        changed["summary"] = "conflict"
+        with self.assertRaises(LiteError):
+            amend_plan_review(
+                self.database, work_item_id, reviewer, replacement,
+                self.temporary.name, "test-repository", changed, "exact-replay",
+            )
+        self.assertEqual(snapshot, self.database_snapshot())
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertEqual("# replacement\n", handle.read())
+
+    def test_plan_amend_refuses_competing_writer_without_file_or_review_change(self):
+        path = self._opt_in_plan("TI-AMEND-BUSY")
+        self.create("TI-OTHER")
+        self.claim("TI-OTHER", 1, "other-planner", "PLANNER")
+        acquire_repository_lock(
+            self.database, "TI-OTHER", "test-repository", "other-planner", self.expires()
+        )
+        self.claim("TI-AMEND-BUSY", 3, "reviewer-busy", "REVIEWER")
+        before = self.database_snapshot()
+        with self.assertRaises(LiteError):
+            self._amend_review("TI-AMEND-BUSY", "reviewer-busy", path, 2)
+        after = self.database_snapshot()
+        self.assertEqual(before["reviews"], after["reviews"])
+        self.assertEqual(before["events"], after["events"])
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertEqual("# revision 1\n", handle.read())
+
+    def test_opt_in_material_review_returns_to_planner_and_rejects_symlink_artifact(self):
+        work_item_id = "TI-MATERIAL"
+        self._opt_in_plan(work_item_id)
+        self.claim(work_item_id, 3, "material-reviewer", "REVIEWER")
+        head = get_work_item(self.database, work_item_id)["planArtifact"]
+        record_agent_review(
+            self.database, work_item_id, "PLAN", "material-reviewer", "REJECTED", {
+                "protocolVersion": "AWB-REVIEW-v2", "stage": "PLAN",
+                "result": "REVISE_TO_PLANNER", "reviewerMode": "ORDINARY",
+                "reviewedArtifact": {key: head[key] for key in (
+                    "path", "revision", "sha256", "editorAgentId"
+                )},
+                "amendments": [], "findings": [self.finding("PLAN", "MATERIAL-F001")],
+                "resolvedFindingIds": [], "nonBlockingSuggestions": [],
+                "summary": "material scope decision required",
+            },
+        )
+        item = get_work_item(self.database, work_item_id)
+        self.assertEqual("DRAFT", item["state"])
+        self.assertEqual("PLANNER", item["current_role"])
+
+        self.create("TI-SYMLINK")
+        target = os.path.join(self.temporary.name, "target-plan.md")
+        link = os.path.join(self.temporary.name, "linked-plan.md")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("plan\n")
+        os.symlink(target, link)
+        self.claim("TI-SYMLINK", 1, "symlink-planner", "PLANNER")
+        self.complete("TI-SYMLINK", 1, "symlink-planner")
+        with self.assertRaises(LiteError):
+            transition(
+                self.database, "TI-SYMLINK", "submit_plan", "symlink-planner",
+                plan_artifact={"projectRoot": self.temporary.name,
+                               "path": os.path.basename(link)},
+            )
 
     def test_all_work_item_types_create_same_id_top_level(self):
         for index, item_type in enumerate(("TI", "FE", "R", "WA", "AWB")):

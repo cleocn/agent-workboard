@@ -1,11 +1,15 @@
 # Quickstart
 
-Agent Workboard 0.3.1b3 is an opt-in, local-only, observation-only Preview. Use
+Agent Workboard 0.3.1b4 is an opt-in, local-only, observation-only Preview. Use
 a hash-verified GitHub prerelease wheel, then initialize and inspect a project:
+
+Usage is project-level and defaults to OFF, including when an older config
+omits the field. OFF is healthy: claims and reviews continue without binding,
+spans, mutation sync/show, periodic refresh, or Usage gates.
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b3-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b4-py3-none-any.whl
 awb init --project ./example
 awb doctor --project ./example
 awb lite --project ./example list
@@ -14,13 +18,13 @@ awb lite --project ./example list
 Use `awb bootstrap --project ./example` when a managed project has no database
 yet. Do not point a stable project at an arbitrary database path.
 
-For an exact verified 0.3.1b2 project, retain its old wheel and install the
-verified 0.3.1b3 Preview wheel. Run the zero-write check first and execute only
+For an exact verified 0.3.1b3 project, retain its old wheel and install the
+verified 0.3.1b4 Preview wheel. Run the zero-write check first and execute only
 its single structured `nextStep`:
 
 ```bash
-awb upgrade --check --project ./example --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
-awb upgrade --project ./example --wheel ./agent_workboard-0.3.1b3-py3-none-any.whl --with-codex
+awb upgrade --check --project ./example --wheel ./agent_workboard-0.3.1b4-py3-none-any.whl --with-codex
+awb upgrade --project ./example --wheel ./agent_workboard-0.3.1b4-py3-none-any.whl --with-codex
 awb doctor --project ./example
 awb codex check --project ./example
 ```
@@ -40,11 +44,14 @@ Bind each Agent claim to its own local Codex session, or create an explicit
 ORCHESTRATOR span, before syncing. Start with a dry run:
 
 ```bash
+awb usage policy show --project ./example
+awb usage policy enable --project ./example
 awb usage sync --project ./example --work-item AWB-123 --dry-run
 awb usage sync --project ./example --work-item AWB-123
 awb usage self-check --project ./example
 awb usage show AWB-123 --project ./example --group-by role
 awb usage export --project ./example --work-item AWB-123 --group-by role --format json --output usage-redacted.json
+awb usage policy disable --project ./example
 ```
 
 The `codex-local` adapter accepts a single requested-head metadata record as
@@ -62,11 +69,9 @@ automatic model routing, budget cap or Agent stop.
 
 ## Main-Agent display cadence
 
-The Orchestrator Skill runs `usage sync` and a role-grouped `usage show` after
-each successful WorkItem state change. During a tool or Agent wait, while the
-main Agent itself remains active, it targets another refresh every 300 seconds
-on a best-effort basis. Missed intervals are not replayed, and the behavior does
-not create a daemon, offline timer, runner, or heartbeat SLA. Commentary is
-limited to aggregate tokens, estimated credits, quota, coverage, and gap
-reasons; prompt, response, tool output, credentials, raw session content, and
-local paths remain excluded.
+Only BEST_EFFORT performs collection. OFF never asks the Orchestrator Skill to
+sync after mutations or refresh on a timer. Neither mode creates a daemon,
+offline timer, runner, or heartbeat SLA. Explicit reports remain limited to
+aggregate tokens, estimated credits, quota, coverage, and gap reasons; prompt,
+response, tool output, credentials, raw session content, and local paths remain
+excluded.

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.1b4 Preview
+
+- Make Usage collection project-level and default it to `OFF`; explicit
+  `BEST_EFFORT` opt-in preserves local observation while OFF avoids automatic
+  binding, spans, mutation sync and periodic refresh.
+- Let a PLAN Reviewer apply one bounded non-material amendment through the
+  package-owned atomic writer path; the editor cannot self-review and the next
+  round requires a fresh Reviewer within strict 3+1+1/no-round-6 limits.
+- Treat runtime events as workflow evidence authority, retain one final
+  implementation summary and one release postflight, and remove duplicate
+  per-round evidence plus expensive Preview reproducibility/object-closure gates.
+- Support only exact 0.3.1b3→0.3.1b4 backup-first upgrades with no schema DDL,
+  database-bound rollback, and same-identity no-op validation.
+- Preserve independent Implementation review, AUTO_ON_PASS authorization
+  boundaries, test-failure stops and local-only operation; no PyPI, stable/GA,
+  runner, daemon, remote control or consumer migration is included.
+
 ## 0.3.1b3 Preview
 
 - Accept Codex 0.148 multi-`session_meta` records only as a strict, unique

@@ -7,4 +7,7 @@ Review feedback is not a new requirement. Revise only valid open PLAN Findings,
 trace every added complexity to a Finding ID, and make the smallest incremental
 change. Do not absorb suggestions or redesign an already sufficient plan. Report
 scope/authorization/acceptance expansion for human decision instead of complying.
+For new plans submit the project-relative Markdown artifact with --plan-artifact;
+runtime revision/SHA events are authoritative and no per-round submission JSON or
+quality hash file is required.
 """
