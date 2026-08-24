@@ -1,8 +1,11 @@
 import datetime
 import io
+import inspect
 import json
 import os
+import random
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -37,8 +40,17 @@ from agent_workboard.lite import (
     timeline,
     transition,
     unblock_task,
+    workflow_advance,
+    workflow_check,
+    workflow_repair,
+    workflow_status,
 )
+from agent_workboard.orchestrator import reconcile_expired
 from agent_workboard.project import transfer_export, transfer_import
+from agent_workboard import workflow as workflow_kernel
+from agent_workboard import candidate as candidate_module
+from agent_workboard import orchestrator as orchestrator_module
+import agent_workboard.lite as lite_module
 
 
 class LiteWorkboardTest(unittest.TestCase):
@@ -100,15 +112,9 @@ class LiteWorkboardTest(unittest.TestCase):
     def complete(self, work_item_id, seq, agent):
         item = get_work_item(self.database, work_item_id)
         task = item["tasks"][seq - 1]
-        if task["status"] == "NOT_STARTED":
-            set_task_status(
-                self.database, work_item_id, task["task_id"], agent, "IN_PROGRESS",
-                [{"started": True}],
-            )
-        set_task_status(
-            self.database, work_item_id, "{0}-T{1:02d}".format(work_item_id, seq),
-            agent, "COMPLETED", [{"result": "passed"}]
-        )
+        # b7 claims atomically enter IN_PROGRESS and submit transitions atomically
+        # complete the task.  There is no standalone COMPLETED window.
+        self.assertEqual("IN_PROGRESS", task["status"])
 
     def quality(self, modified_scope=None, addressed=None):
         return {
@@ -179,10 +185,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete(work_item_id, 1, planner)
         transition(self.database, work_item_id, "submit_plan", planner)
         self.claim(work_item_id, 3, reviewer, "REVIEWER")
-        set_task_status(
-            self.database, work_item_id, work_item_id + "-T03", reviewer,
-            "IN_PROGRESS", [{"phase": "PLAN"}],
-        )
         record_agent_review(
             self.database, work_item_id, "PLAN", reviewer, "APPROVED",
             self.structured_review("PLAN", "PASS"),
@@ -197,6 +199,46 @@ class LiteWorkboardTest(unittest.TestCase):
         elif not leave_claim:
             release_claim(self.database, work_item_id, implementer)
         return {"planner": planner, "reviewer": reviewer, "implementer": implementer}
+
+    def create_awb024_b6_orphan(self):
+        """Create the one frozen public-b6 projection split in a disposable DB."""
+        work_item_id = "AWB-024"
+        self.create(work_item_id)
+        relative = "docs/work-items/AWB-024-v0.3.1b7-preview-release.md"
+        absolute = os.path.join(self.temporary.name, relative)
+        os.makedirs(os.path.dirname(absolute))
+        with open(absolute, "w", encoding="utf-8") as handle:
+            handle.write("disposable exact-path fixture\n")
+        planner = work_item_id + "-planner"
+        reviewer = work_item_id + "-reviewer"
+        self.claim(work_item_id, 1, planner, "PLANNER")
+        transition(
+            self.database, work_item_id, "submit_plan", planner,
+            plan_artifact={"projectRoot": self.temporary.name,
+                           "path": relative},
+        )
+        self.claim(work_item_id, 3, reviewer, "REVIEWER")
+        head = get_work_item(self.database, work_item_id)["planArtifact"]
+        review = self.structured_review(
+            "PLAN", "REVISE_TO_PLANNER", findings=[self.finding("PLAN")]
+        )
+        review.update({
+            "protocolVersion": "AWB-REVIEW-v2",
+            "reviewedArtifact": {key: head[key] for key in (
+                "path", "revision", "sha256", "editorAgentId"
+            )},
+        })
+        record_agent_review(
+            self.database, work_item_id, "PLAN", reviewer, "REJECTED",
+            review,
+        )
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE tasks SET status='IN_PROGRESS' WHERE task_id='AWB-024-T03'"
+        )
+        connection.commit()
+        connection.close()
+        return absolute
 
     def database_snapshot(self, database=None):
         connection = open_database(database or self.database)
@@ -411,10 +453,6 @@ class LiteWorkboardTest(unittest.TestCase):
                 self.database, work_item_id, work_item_id + "-T01", "planner-off",
                 "IN_PROGRESS", usage_policy="OFF",
             )
-            set_task_status(
-                self.database, work_item_id, work_item_id + "-T01", "planner-off",
-                "COMPLETED", ["done"], usage_policy="OFF",
-            )
             transition(
                 self.database, work_item_id, "submit_plan", "planner-off",
                 usage_policy="OFF",
@@ -562,8 +600,13 @@ class LiteWorkboardTest(unittest.TestCase):
         set_task_status(self.database, "TI-901", "TI-901-T01", "planner-1", "IN_PROGRESS")
         release_claim(self.database, "TI-901", "planner-1")
         self.claim("TI-901", 2, "planner-2", "PLANNER")
-        with self.assertRaises(LiteError):
-            set_task_status(self.database, "TI-901", "TI-901-T02", "planner-2", "IN_PROGRESS")
+        duplicate = set_task_status(
+            self.database, "TI-901", "TI-901-T02", "planner-2", "IN_PROGRESS"
+        )
+        self.assertIsNone(duplicate)
+        self.assertEqual("IN_PROGRESS", get_work_item(
+            self.database, "TI-901"
+        )["tasks"][1]["status"])
         item = get_work_item(self.database, "TI-901")
         self.assertEqual("AWB-WORKITEM-MGMT-v1", item["management"]["contractVersion"])
         self.assertEqual((0, 4, 0), (
@@ -774,6 +817,19 @@ class LiteWorkboardTest(unittest.TestCase):
         connection.execute("UPDATE claims SET expires_at='2000-01-01T00:00:00+00:00' WHERE claim_id=?", (first["claimId"],))
         connection.commit()
         connection.close()
+        with self.assertRaisesRegex(LiteError, "IN_PROGRESS_WITHOUT_LIVE_CLAIM"):
+            self.claim("TI-001", 1, "planner-b", "PLANNER")
+        check = workflow_check(self.database, self.temporary.name, "TI-001")
+        arguments = check["nextStep"]["arguments"]
+        target = arguments["expectedActivity"][0]
+        reconciled = reconcile_expired(
+            self.database, "TI-001", "claim", target["resourceId"],
+            target["ownerId"], target["generation"], arguments["requestId"],
+            fingerprint=arguments["fingerprint"],
+            expected_activity=arguments["expectedActivity"],
+            not_after=arguments["notAfter"],
+        )
+        self.assertEqual("OK", reconciled["status"])
         second = self.claim("TI-001", 1, "planner-b", "PLANNER")
         self.assertGreater(second["generation"], first["generation"])
 
@@ -824,10 +880,14 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-001", 1, "planner")
         with self.assertRaises(LiteError):
             release_claim(self.database, "TI-001", "planner")
-        with self.assertRaises(LiteError):
-            transition(self.database, "TI-001", "submit_plan", "planner")
-        release_repository_lock(self.database, "TI-001", "repo", "planner")
-        transition(self.database, "TI-001", "submit_plan", "planner")
+        item = transition(self.database, "TI-001", "submit_plan", "planner")
+        self.assertEqual("PLAN_REVIEW_PENDING", item["state"])
+        connection = open_database(self.database)
+        self.assertEqual(0, connection.execute(
+            "SELECT count(*) FROM repository_locks WHERE work_item_id='TI-001' "
+            "AND status='ACTIVE'"
+        ).fetchone()[0])
+        connection.close()
 
     def test_hold_blocks_claim_and_resume_restores(self):
         self.create()
@@ -844,7 +904,6 @@ class LiteWorkboardTest(unittest.TestCase):
         set_task_status(
             self.database, "TI-001", "TI-001-T01", "planner", "BLOCKED", ["dependency missing"]
         )
-        release_claim(self.database, "TI-001", "planner")
         self.assertEqual("BLOCKED", get_work_item(self.database, "TI-001")["queue_state"])
         with self.assertRaises(LiteError):
             self.claim("TI-001", 1, "planner-2", "PLANNER")
@@ -896,14 +955,12 @@ class LiteWorkboardTest(unittest.TestCase):
         ))
         self.claim("TI-001", 3, "reviewer-2", "REVIEWER")
 
-    def test_plan_submit_requires_completed_planning_task(self):
+    def test_plan_submit_atomically_completes_planning_task(self):
         self.create()
         self.claim("TI-001", 1, "planner", "PLANNER")
-        with self.assertRaises(LiteError):
-            transition(self.database, "TI-001", "submit_plan", "planner")
-        self.complete("TI-001", 1, "planner")
         item = transition(self.database, "TI-001", "submit_plan", "planner")
         self.assertEqual("PLAN_REVIEW_PENDING", item["state"])
+        self.assertEqual("COMPLETED", item["tasks"][0]["status"])
 
     def test_plan_review_rejects_self_review(self):
         self.create()
@@ -1069,14 +1126,14 @@ class LiteWorkboardTest(unittest.TestCase):
         )
         connection.execute(
             "INSERT INTO repository_locks VALUES(?,?,?,?,1,'ACTIVE',?,?,NULL)",
-            ("terminal-writer", "terminal-repo", "TI-030", "implementer-auto",
+            ("terminal-writer", "terminal-repo", "TI-030", "final-reviewer",
              now, expiry),
         )
         connection.commit()
         connection.close()
-        with mock.patch("agent_workboard.orchestrator._activity_event",
-                        side_effect=RuntimeError("terminal event fault")):
-            with self.assertRaisesRegex(RuntimeError, "terminal event fault"):
+        with mock.patch("agent_workboard.lite._review_materialized",
+                        side_effect=RuntimeError("terminal post-apply fault")):
+            with self.assertRaisesRegex(RuntimeError, "terminal post-apply fault"):
                 record_agent_review(
                     self.database, "TI-030", "FINAL", "final-reviewer", "APPROVED",
                     self.structured_review("IMPLEMENTATION", "PASS"),
@@ -1149,7 +1206,7 @@ class LiteWorkboardTest(unittest.TestCase):
         self.assertEqual("RELEASED", binding["status"])
         before = "\n".join(connection.iterdump())
         connection.close()
-        with mock.patch("agent_workboard.orchestrator._activity_event",
+        with mock.patch("agent_workboard.lite._terminal_activity_materialized",
                         side_effect=RuntimeError("manual terminal fault")):
             with self.assertRaisesRegex(RuntimeError, "manual terminal fault"):
                 record_human_gate(
@@ -1308,12 +1365,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.through_plan_approval()
         self.claim("TI-001", 2, "implementer", "IMPLEMENTER")
         transition(self.database, "TI-001", "start_implementation", "implementer")
-        with self.assertRaises(LiteError):
-            transition(
-                self.database, "TI-001", "submit_implementation", "implementer",
-                local_tests_passed=True, quality_baseline=self.quality(),
-            )
-        self.complete("TI-001", 2, "implementer")
         with self.assertRaises(LiteError):
             transition(
                 self.database, "TI-001", "submit_implementation", "implementer",
@@ -1514,7 +1565,7 @@ class LiteWorkboardTest(unittest.TestCase):
             self.database, "TI-001", "TI-001-T02", "implementer",
             {"reason": "external contract must change", "impact": "approved plan cannot work"},
         )
-        self.assertEqual(("DRAFT", "BLOCKED", "PLANNER", "PLAN_DEVIATION"), (
+        self.assertEqual(("DRAFT", "BLOCKED", None, "PLAN_DEVIATION"), (
             item["state"], item["queue_state"], item["current_role"], item["blocked_reason"]
         ))
         self.assertIsNone(item["activeClaim"])
@@ -1602,238 +1653,676 @@ class LiteWorkboardTest(unittest.TestCase):
             with open(path, encoding="utf-8") as handle:
                 self.assertIn("AWB-WORKITEM-MGMT-v1", handle.read())
 
-    def test_human_recovery_is_exact_audited_and_final_review_can_reclaim_task(self):
-        work_item_id = "AWB-REC"
-        self.create_orphaned_review_task(work_item_id)
-        before = get_work_item(self.database, work_item_id)
-        result = recover_review_task(
-            self.database, work_item_id, work_item_id + "-T03", "human-a",
-            "released PLAN reviewer left reusable task active", "recover-001",
-        )
-        self.assertEqual(("OK", "RECOVERED"), (result["status"], result["reasonCode"]))
-        self.assertEqual("AWB-REVIEW-TASK-RECOVERY-v1", result["protocolVersion"])
-        binding = result["binding"]
-        self.assertEqual("AWB-REC-plan-reviewer", binding["reviewerAgentId"])
-        self.assertEqual(2, binding["claimGeneration"])
-        after = get_work_item(self.database, work_item_id)
-        self.assertEqual("NOT_STARTED", after["tasks"][2]["status"])
-        self.assertEqual(before["tasks"][2]["evidence_json"], after["tasks"][2]["evidence_json"])
-        for field in ("state", "queue_state", "current_role", "blocked_reason", "held_reason"):
-            self.assertEqual(before[field], after[field])
-        self.assertEqual(before["row_version"] + 1, after["row_version"])
-        event = timeline(self.database, work_item_id)[-1]
-        self.assertEqual(("HUMAN_REVIEW_TASK_RECOVERED", "HUMAN", "human-a"), (
-            event["event_type"], event["actor_kind"], event["actor_id"],
+    def test_transition_kernel_matrix_and_public_registration_are_closed(self):
+        self.assertEqual(len(workflow_kernel.TRANSITION_MATRIX), len(set(
+            workflow_kernel.TRANSITION_MATRIX
+        )))
+        self.assertTrue(workflow_kernel.PUBLIC_MUTATION_INTENTS)
+        self.assertTrue(set(workflow_kernel.PUBLIC_MUTATION_INTENTS.values()).issubset(
+            set(workflow_kernel.TRANSITION_MATRIX)
         ))
-        self.assertEqual(result["binding"], json.loads(event["payload_json"])["binding"])
+        snapshot = {
+            "projectionFingerprint": "a" * 64,
+        }
+        for operation in workflow_kernel.TRANSITION_MATRIX:
+            plan = workflow_kernel.build_transition_plan(
+                operation, snapshot, {"operation": operation, "requestId": "r"},
+                [{"table": "fixture", "compareAndSet": True}],
+                {"stateHash": "b" * 64}, {"type": operation},
+                {"status": "OK"}, {"action": "NONE", "arguments": {}},
+            )
+            self.assertEqual(operation, plan.as_dict()["operation"])
+            self.assertEqual(64, len(plan.intent_fingerprint))
+        with self.assertRaisesRegex(ValueError, "unregistered"):
+            workflow_kernel.build_transition_plan(
+                "UNKNOWN_EDGE", snapshot, {}, [], {}, {}, {},
+                {"action": "NONE", "arguments": {}},
+            )
 
-        implementer = work_item_id + "-implementer-2"
-        self.claim(work_item_id, 2, implementer, "IMPLEMENTER")
-        set_task_status(
-            self.database, work_item_id, work_item_id + "-T02", implementer,
-            "IN_PROGRESS",
+    def test_transition_materializer_is_unique_and_write_ops_are_immutable(self):
+        operation = workflow_kernel.WriteOp(
+            "UPDATE", "tasks", (("status", "IN_PROGRESS"),),
+            (("task_id", "AWB-900-T01"), ("status", "NOT_STARTED")),
         )
-        self.complete(work_item_id, 2, implementer)
-        transition(
-            self.database, work_item_id, "submit_implementation", implementer,
-            local_tests_passed=True, quality_baseline=self.quality(),
+        with self.assertRaises(AttributeError):
+            operation.table = "claims"
+        snapshot = {"projectionFingerprint": "a" * 64}
+        plan = workflow_kernel.build_transition_plan(
+            "HOLD", snapshot, {"operation": "HOLD"}, (), {}, {},
+            {"status": "OK", "nested": {"value": 1}},
+            {"action": "NONE", "arguments": {}},
         )
-        final_reviewer = work_item_id + "-final-reviewer"
-        self.claim(work_item_id, 3, final_reviewer, "REVIEWER")
-        done = record_agent_review(
-            self.database, work_item_id, "FINAL", final_reviewer, "APPROVED",
-            self.structured_review("IMPLEMENTATION", "PASS"),
+        with self.assertRaises(TypeError):
+            plan.receipt["nested"]["value"] = 2
+        for function in (
+                acquire_claim, release_claim, acquire_repository_lock,
+                release_repository_lock):
+            source = inspect.getsource(function)
+            self.assertIn("_kernel_apply", source, function.__name__)
+            self.assertIsNone(re.search(
+                r'\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+'
+                r'(?:work_items|tasks|claims|repository_locks|events)\b',
+                source, re.IGNORECASE,
+            ), function.__name__)
+        materializer = inspect.getsource(workflow_kernel.apply_transition_plan)
+        self.assertIn("connection.execute", materializer)
+        self.assertIn("TRANSITION_COMPARE_AND_SET_CONFLICT", materializer)
+
+    def test_public_adapters_cannot_bypass_managed_lifecycle_materializer(self):
+        managed = (
+            "work_items|tasks|claims|repository_locks|orchestrator_leases|"
+            "reviews|events|human_gates|human_gate_reviews"
         )
-        self.assertEqual("FINAL_ACCEPTANCE_APPROVED", done["state"])
-        self.assertEqual("COMPLETED", done["tasks"][2]["status"])
+        bypass = re.compile(
+            r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:" + managed + r")\b",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        for module in (lite_module, orchestrator_module, candidate_module):
+            source = inspect.getsource(module)
+            self.assertIsNone(
+                bypass.search(source),
+                "managed lifecycle SQL bypass in {0}".format(module.__name__),
+            )
+            self.assertNotIn(
+                "plan_lifecycle_bundle", source,
+                "raw lifecycle bundle bypass in {0}".format(module.__name__),
+            )
+            self.assertIsNone(
+                re.search(r'["\']writes["\']\s*:\s*[\(\[\{]', source),
+                "raw managed-write intent in {0}".format(module.__name__),
+            )
+
+    def test_public_lifecycle_sql_has_a_kernel_transaction_guard(self):
+        guarded = (
+            create_work_item, backfill_management, amend_management,
+            acquire_claim, release_claim, acquire_repository_lock,
+            release_repository_lock, set_task_status, transition,
+            record_agent_review, amend_plan_review, record_human_gate,
+            set_hold, unblock_task, report_plan_deviation, workflow_advance,
+            workflow_repair,
+            candidate_module.prepare, candidate_module.freeze,
+            candidate_module.build, candidate_module.quarantine,
+            candidate_module.finalize,
+            candidate_module.publication_authorize,
+            candidate_module.publication_postflight,
+            candidate_module.publication_retry,
+        )
+        for function in guarded:
+            source = inspect.getsource(function)
+            self.assertIn("BEGIN IMMEDIATE", source, function.__name__)
+            self.assertTrue(
+                "_kernel_assert" in source or
+                "_kernel_apply" in source,
+                function.__name__,
+            )
+        for function in (
+                orchestrator_module.claim, orchestrator_module.claim_next,
+                orchestrator_module.renew, orchestrator_module.release,
+                orchestrator_module.recover):
+            self.assertIn("_mutate", inspect.getsource(function), function.__name__)
+        source = inspect.getsource(orchestrator_module.reconcile_expired)
+        self.assertIn("BEGIN IMMEDIATE", source)
+        self.assertIn("_kernel_apply", source)
+
+    def test_review_route_table_rejects_every_undeclared_round_result(self):
+        results = {
+            "PASS", "REVISE", "REVISE_TO_PLANNER", "CONVERGENCE_REVISE",
+            "BLOCKED", "WAITING_HUMAN", "AMENDED",
+        }
+        allowed = {
+            1: {"PASS", "REVISE", "REVISE_TO_PLANNER", "BLOCKED"},
+            2: {"PASS", "REVISE", "REVISE_TO_PLANNER", "BLOCKED"},
+            3: {"PASS", "REVISE", "REVISE_TO_PLANNER", "BLOCKED"},
+            4: {"PASS", "CONVERGENCE_REVISE", "WAITING_HUMAN", "BLOCKED", "AMENDED"},
+            5: {"PASS", "REVISE", "BLOCKED", "WAITING_HUMAN"},
+        }
+        for stage in ("PLAN", "FINAL"):
+            for round_number in range(1, 6):
+                for result in results:
+                    if result in allowed[round_number]:
+                        route = workflow_kernel.review_route(
+                            stage, result, round_number, "STANDARD", "MANUAL"
+                        )
+                        self.assertEqual({
+                            "state", "queue", "role", "authorTask",
+                            "reviewerTask", "autoEligible",
+                        }.issubset(route), True)
+                    else:
+                        with self.assertRaises(ValueError):
+                            workflow_kernel.review_route(
+                                stage, result, round_number, "STANDARD", "MANUAL"
+                            )
+
+    def test_seeded_claim_review_model_matches_disposable_sqlite_projection(self):
+        generator = random.Random(250317)
+        for index in range(20):
+            work_item_id = "AWB-MODEL-{0:02d}".format(index)
+            self.create(work_item_id)
+            planner = work_item_id + "-planner"
+            self.claim(work_item_id, 1, planner, "PLANNER")
+            item = get_work_item(self.database, work_item_id)
+            self.assertEqual(("CLAIMED", "IN_PROGRESS"), (
+                item["queue_state"], item["tasks"][0]["status"],
+            ))
+            if generator.choice((False, True)):
+                release_claim(self.database, work_item_id, planner)
+                item = get_work_item(self.database, work_item_id)
+                self.assertEqual(("CLAIMABLE", "NOT_STARTED"), (
+                    item["queue_state"], item["tasks"][0]["status"],
+                ))
+                self.claim(work_item_id, 1, planner, "PLANNER")
+            transition(self.database, work_item_id, "submit_plan", planner)
+            reviewer = work_item_id + "-reviewer"
+            self.claim(work_item_id, 3, reviewer, "REVIEWER")
+            result = generator.choice(("PASS", "REVISE"))
+            review = self.structured_review(
+                "PLAN", result,
+                findings=([] if result == "PASS" else [self.finding("PLAN")]),
+            )
+            item = record_agent_review(
+                self.database, work_item_id, "PLAN", reviewer,
+                "APPROVED" if result == "PASS" else "REJECTED", review,
+            )
+            reference = workflow_kernel.review_route(
+                "PLAN", result, 1, "STANDARD", "MANUAL"
+            )
+            self.assertEqual((reference["queue"], reference["role"]),
+                             (item["queue_state"], item["current_role"]))
+            self.assertEqual(reference["reviewerTask"], item["tasks"][2]["status"])
+
+    def test_expiry_boundary_uses_one_clock_and_combined_bundle_is_atomic(self):
+        work_item_id = "AWB-EXPIRY-MODEL"
+        self.create(work_item_id)
+        claim = self.claim(work_item_id, 1, "planner", "PLANNER")
+        writer = acquire_repository_lock(
+            self.database, work_item_id, "repo-expiry", "planner", self.expires()
+        )
+        boundary = "2030-01-01T00:00:00+00:00"
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE claims SET expires_at=? WHERE claim_id=?",
+            (boundary, claim["claimId"]),
+        )
+        connection.execute(
+            "UPDATE repository_locks SET expires_at=? WHERE lock_id=?",
+            (boundary, writer["lockId"]),
+        )
+        connection.commit()
+        connection.execute("BEGIN")
+        before = lite_module._check_one(
+            connection, self.temporary.name, work_item_id,
+            evaluation_time="2029-12-31T23:59:59.999999+00:00",
+        )
+        at = lite_module._check_one(
+            connection, self.temporary.name, work_item_id,
+            evaluation_time=boundary,
+        )
+        connection.rollback(); connection.close()
+        self.assertEqual("PASS", before["status"])
+        self.assertEqual(("VIOLATION", 2), (
+            at["status"], len(at["nextStep"]["arguments"]["expectedActivity"]),
+        ))
+        # Move the exact boundary behind the trusted apply clock without
+        # changing any identity/generation or business projection.
+        connection = open_database(self.database)
+        past = "2000-01-01T00:00:00+00:00"
+        connection.execute("UPDATE claims SET expires_at=? WHERE claim_id=?",
+                           (past, claim["claimId"]))
+        connection.execute("UPDATE repository_locks SET expires_at=? WHERE lock_id=?",
+                           (past, writer["lockId"]))
+        connection.commit(); connection.close()
+        check = workflow_check(self.database, self.temporary.name, work_item_id)
+        proof = check["nextStep"]["arguments"]
+        result = reconcile_expired(
+            self.database, work_item_id, "claim", claim["claimId"], "planner",
+            claim["generation"], proof["requestId"],
+            fingerprint=proof["fingerprint"],
+            expected_activity=proof["expectedActivity"],
+            not_after=proof["notAfter"],
+        )
+        self.assertEqual("OK", result["status"])
+        item = get_work_item(self.database, work_item_id)
+        self.assertEqual(("CLAIMABLE", "NOT_STARTED"), (
+            item["queue_state"], item["tasks"][0]["status"],
+        ))
+        self.assertEqual("PASS", workflow_check(
+            self.database, self.temporary.name, work_item_id
+        )["status"])
+
+    def test_workflow_check_is_read_only_and_content_free(self):
+        work_item_id = "AWB-PRIVACY"
+        self.create(work_item_id)
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE work_items SET title=? WHERE work_item_id=?",
+            ("SECRET-PROMPT-NEVER-EMIT", work_item_id),
+        )
+        connection.commit(); before = "\n".join(connection.iterdump())
+        connection.close()
+        result = workflow_check(self.database, self.temporary.name, work_item_id)
+        encoded = json.dumps(result, sort_keys=True)
+        self.assertNotIn("SECRET-PROMPT-NEVER-EMIT", encoded)
+        self.assertNotIn(self.temporary.name, encoded)
+        connection = open_database(self.database)
+        self.assertEqual(before, "\n".join(connection.iterdump()))
+        connection.close()
+
+    def test_review_row_event_coherence_detects_disposable_tampering(self):
+        mutations = ("stage", "round", "result", "request", "findings", "actor")
+        for mutation in mutations:
+            work_item_id = "AWB-REVIEW-TAMPER-" + mutation.upper()
+            self.create(work_item_id)
+            planner = work_item_id + "-planner"
+            self.claim(work_item_id, 1, planner, "PLANNER")
+            transition(self.database, work_item_id, "submit_plan", planner)
+            reviewer = work_item_id + "-reviewer"
+            self.claim(work_item_id, 3, reviewer, "REVIEWER")
+            record_agent_review(
+                self.database, work_item_id, "PLAN", reviewer, "REJECTED",
+                self.structured_review("PLAN", "REVISE",
+                                       findings=[self.finding("PLAN")]),
+            )
+            connection = open_database(self.database)
+            row = connection.execute(
+                "SELECT * FROM reviews WHERE work_item_id=?", (work_item_id,)
+            ).fetchone()
+            event = connection.execute(
+                "SELECT * FROM events WHERE work_item_id=? "
+                "AND event_type='AGENT_PLAN_REVIEW'", (work_item_id,)
+            ).fetchone()
+            review = json.loads(row["summary"])
+            payload = json.loads(event["payload_json"])
+            if mutation == "stage":
+                connection.execute("UPDATE reviews SET stage='FINAL' WHERE review_id=?",
+                                   (row["review_id"],))
+            elif mutation == "round":
+                review["round"] = 2; payload["review"] = review
+                connection.execute("UPDATE reviews SET summary=? WHERE review_id=?",
+                                   (json.dumps(review), row["review_id"]))
+                connection.execute("UPDATE events SET payload_json=? WHERE event_id=?",
+                                   (json.dumps(payload), event["event_id"]))
+            elif mutation == "result":
+                review["result"] = "PASS"; payload["review"] = review
+                connection.execute("UPDATE reviews SET summary=? WHERE review_id=?",
+                                   (json.dumps(review), row["review_id"]))
+                connection.execute("UPDATE events SET payload_json=? WHERE event_id=?",
+                                   (json.dumps(payload), event["event_id"]))
+            elif mutation == "request":
+                connection.execute("UPDATE events SET request_id='' WHERE event_id=?",
+                                   (event["event_id"],))
+            elif mutation == "findings":
+                review["resolvedFindingIds"] = ["F-NEVER-OPEN"]
+                payload["review"] = review
+                connection.execute("UPDATE reviews SET summary=? WHERE review_id=?",
+                                   (json.dumps(review), row["review_id"]))
+                connection.execute("UPDATE events SET payload_json=? WHERE event_id=?",
+                                   (json.dumps(payload), event["event_id"]))
+            else:
+                connection.execute("UPDATE events SET actor_id='wrong-reviewer' "
+                                   "WHERE event_id=?", (event["event_id"],))
+            connection.commit(); connection.close()
+            checked = workflow_check(self.database, self.temporary.name, work_item_id)
+            self.assertEqual("VIOLATION", checked["status"], mutation)
+            with self.assertRaisesRegex(LiteError, "WORKFLOW_INVARIANT_VIOLATION"):
+                acquire_claim(
+                    self.database, work_item_id, work_item_id + "-T01",
+                    work_item_id + "-planner-2", "PLANNER", self.expires(),
+                )
+
+        valid_id = "AWB-REVIEW-VALID-GATE"
+        self.create(valid_id)
+        self.claim(valid_id, 1, valid_id + "-planner", "PLANNER")
+        transition(self.database, valid_id, "submit_plan", valid_id + "-planner")
+        self.claim(valid_id, 3, valid_id + "-reviewer", "REVIEWER")
+        record_agent_review(
+            self.database, valid_id, "PLAN", valid_id + "-reviewer", "APPROVED",
+            self.structured_review("PLAN", "PASS"),
+        )
+        if get_work_item(self.database, valid_id)["queue_state"] == "WAITING_HUMAN":
+            record_human_gate(self.database, valid_id, "PLAN", "human-a",
+                              "APPROVED", "valid ordered gate")
+        self.assertEqual("PASS", workflow_check(
+            self.database, self.temporary.name, valid_id
+        )["status"])
+
+    def test_released_review_formats_are_closed_and_unknown_near_shape_refuses(self):
+        for event_shape in ("structured", "summary"):
+            work_item_id = "AWB-LEGACY-" + event_shape.upper()
+            self.create(work_item_id)
+            planner = work_item_id + "-planner"
+            self.claim(work_item_id, 1, planner, "PLANNER")
+            transition(self.database, work_item_id, "submit_plan", planner)
+            reviewer = work_item_id + "-reviewer"
+            self.claim(work_item_id, 3, reviewer, "REVIEWER")
+            record_agent_review(
+                self.database, work_item_id, "PLAN", reviewer, "APPROVED",
+                self.structured_review("PLAN", "PASS"),
+            )
+            connection = open_database(self.database)
+            event = connection.execute(
+                "SELECT * FROM events WHERE work_item_id=? "
+                "AND event_type='AGENT_PLAN_REVIEW'", (work_item_id,)
+            ).fetchone()
+            payload = json.loads(event["payload_json"])
+            if event_shape == "structured":
+                released = {"decision": payload["decision"],
+                            "review": payload["review"]}
+            else:
+                released = {"decision": payload["decision"],
+                            "summary": json.dumps(payload["review"],
+                                                  sort_keys=True,
+                                                  separators=(",", ":"))}
+                connection.execute(
+                    "UPDATE reviews SET summary=? WHERE work_item_id=?",
+                    (released["summary"], work_item_id),
+                )
+            connection.execute(
+                "UPDATE events SET payload_json=? WHERE event_id=?",
+                (json.dumps(released, sort_keys=True, separators=(",", ":")),
+                 event["event_id"]),
+            )
+            connection.commit(); connection.close()
+            self.assertEqual("PASS", workflow_check(
+                self.database, self.temporary.name, work_item_id
+            )["status"])
+
+            connection = open_database(self.database)
+            released["unknownField"] = "must not resemble a released format"
+            connection.execute(
+                "UPDATE events SET payload_json=? WHERE event_id=?",
+                (json.dumps(released), event["event_id"]),
+            )
+            connection.commit(); connection.close()
+            self.assertEqual("VIOLATION", workflow_check(
+                self.database, self.temporary.name, work_item_id
+            )["status"])
+
+    def test_current_released_board_snapshot_has_only_registered_awb024_violation(self):
+        # Recreate the three closed public-b3-to-b6 event encodings without
+        # reading the mutable workspace board.  The first two releases stored
+        # the structured AWB-REVIEW-v1 value with and without a request
+        # fingerprint.  The earlier summary encoding stored the closed
+        # pre-protocol review JSON in both the review row and event.
+        released_shapes = (
+            ("AWB-004", "structured-with-request"),
+            ("AWB-009", "structured"),
+            ("AWB-015", "summary"),
+        )
+        expected_formats = {
+            "AWB-004": "AWB-REVIEW-EVENT-v6",
+            "AWB-009": "AWB-REVIEW-EVENT-v3-v6",
+            "AWB-015": "AWB-REVIEW-SUMMARY-EVENT-v3-v6",
+        }
+        for work_item_id, shape in released_shapes:
+            self.create(work_item_id)
+            planner = work_item_id + "-planner"
+            self.claim(work_item_id, 1, planner, "PLANNER")
+            transition(self.database, work_item_id, "submit_plan", planner)
+            reviewer = work_item_id + "-reviewer"
+            self.claim(work_item_id, 3, reviewer, "REVIEWER")
+            record_agent_review(
+                self.database, work_item_id, "PLAN", reviewer, "APPROVED",
+                self.structured_review("PLAN", "PASS"),
+            )
+            record_human_gate(
+                self.database, work_item_id, "PLAN", "human-a", "APPROVED",
+                "released ordered gate",
+            )
+            connection = open_database(self.database)
+            row = connection.execute(
+                "SELECT * FROM reviews WHERE work_item_id=?", (work_item_id,)
+            ).fetchone()
+            event = connection.execute(
+                "SELECT * FROM events WHERE work_item_id=? "
+                "AND event_type='AGENT_PLAN_REVIEW'", (work_item_id,)
+            ).fetchone()
+            review = json.loads(row["summary"])
+            if shape == "structured-with-request":
+                payload = {
+                    "decision": row["decision"], "review": review,
+                    "requestFingerprint": "released-b6-request-fingerprint",
+                }
+            elif shape == "structured":
+                payload = {"decision": row["decision"], "review": review}
+            else:
+                legacy_review = {key: review[key] for key in (
+                    "result", "round", "reviewerMode", "findings",
+                    "resolvedFindingIds", "nonBlockingSuggestions",
+                )}
+                released_summary = json.dumps(
+                    legacy_review, sort_keys=True, separators=(",", ":")
+                )
+                connection.execute(
+                    "UPDATE reviews SET summary=? WHERE review_id=?",
+                    (released_summary, row["review_id"]),
+                )
+                payload = {"decision": row["decision"],
+                           "summary": released_summary}
+            connection.execute(
+                "UPDATE events SET payload_json=? WHERE event_id=?",
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                 event["event_id"]),
+            )
+            connection.commit()
+            connection.close()
+
+        self.create_awb024_b6_orphan()
+        exact_artifact_sha = (
+            "c406cffab3dc3ec91853637f08f2d7d80f45632457bc59e9d9e40019af07c09a"
+        )
+        before = self.database_snapshot()
+        with mock.patch("agent_workboard.lite._artifact_sha",
+                        return_value=exact_artifact_sha):
+            result = workflow_check(self.database, self.temporary.name)
+            replay = workflow_check(self.database, self.temporary.name)
+            connection = open_database(self.database)
+            try:
+                snapshots = {
+                    work_item_id: lite_module._kernel_snapshot(
+                        connection, work_item_id, self.temporary.name,
+                    )
+                    for work_item_id, unused_shape in released_shapes
+                }
+            finally:
+                connection.close()
+        self.assertEqual(before, self.database_snapshot())
+        violations = [row for row in result["results"]
+                      if row["status"] != "PASS"]
+        self.assertEqual(["AWB-024"],
+                         [row["workItemId"] for row in violations])
+        self.assertEqual(result, replay)
+        self.assertEqual(
+            ("DETERMINISTIC", workflow_kernel.RESET_ORPHAN_REVIEWER_TASK),
+            (violations[0]["repairability"],
+             violations[0]["nextStep"]["action"]),
+        )
+        for work_item_id, unused_shape in released_shapes:
+            self.assertEqual("PASS", next(
+                row for row in result["results"]
+                if row["workItemId"] == work_item_id
+            )["status"])
+            self.assertEqual(
+                expected_formats[work_item_id],
+                snapshots[work_item_id]["reviewEvents"][0]["recordFormat"],
+            )
+
+        # This is an independent candidate-native corruption shape.  It must
+        # remain a strict b7 violation; the hermetic legacy fixture above is
+        # not a runtime exemption for a live claim whose task is not running.
+        strict_id = "AWB-B7-STRICT-LIVE-CLAIM"
+        self.create(strict_id)
+        self.claim(strict_id, 1, strict_id + "-planner", "PLANNER")
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE tasks SET status='NOT_STARTED' WHERE task_id=?",
+            (strict_id + "-T01",),
+        )
+        connection.commit()
+        connection.close()
+        strict = workflow_check(
+            self.database, self.temporary.name, strict_id
+        )
+        self.assertEqual("VIOLATION", strict["status"])
+        self.assertIn("LIVE_CLAIM_WITHOUT_IN_PROGRESS_TASK", {
+            row["code"] for row in strict["violations"]
+        })
+
+    def test_human_recovery_is_exact_audited_and_final_review_can_reclaim_task(self):
+        artifact = self.create_awb024_b6_orphan()
+        before = self.database_snapshot()
+        legacy = recover_review_task(
+            self.database, "AWB-024", "AWB-024-T03", "human-a",
+            "legacy reset must not write", "legacy-reset",
+        )
+        self.assertEqual(
+            ("REFUSED", "USE_WORKFLOW_CHECK_AND_EXACT_REPAIR"),
+            (legacy["status"], legacy["reasonCode"]),
+        )
+        self.assertEqual(before, self.database_snapshot())
+        exact_sha = "c406cffab3dc3ec91853637f08f2d7d80f45632457bc59e9d9e40019af07c09a"
+        with mock.patch("agent_workboard.lite._artifact_sha", return_value=exact_sha):
+            check = workflow_check(self.database, self.temporary.name, "AWB-024")
+            self.assertEqual(("VIOLATION", "DETERMINISTIC"), (
+                check["status"], check["repairability"],
+            ))
+            arguments = check["nextStep"]["arguments"]
+            with mock.patch("agent_workboard.lite._workflow_repair_materialized",
+                            side_effect=RuntimeError("repair fault")):
+                with self.assertRaisesRegex(LiteError, "repair fault"):
+                    workflow_repair(
+                        self.database, self.temporary.name, "AWB-024",
+                        arguments["action"], arguments["fingerprint"],
+                        arguments["requestId"], "human-a",
+                    )
+            self.assertEqual(before, self.database_snapshot())
+            repaired = workflow_repair(
+                self.database, self.temporary.name, "AWB-024",
+                arguments["action"], arguments["fingerprint"],
+                arguments["requestId"], "human-a",
+            )
+            replay = workflow_repair(
+                self.database, self.temporary.name, "AWB-024",
+                arguments["action"], arguments["fingerprint"],
+                arguments["requestId"], "human-a",
+            )
+            self.assertEqual(("OK", "OK"),
+                             (repaired["status"], replay["status"]))
+            self.assertEqual(repaired, replay)
+            repair_event = timeline(self.database, "AWB-024")[-1]
+            self.assertEqual(repaired,
+                             json.loads(repair_event["payload_json"])["receipt"])
+            self.assertEqual("PASS", workflow_check(
+                self.database, self.temporary.name, "AWB-024"
+            )["status"])
+            set_hold(self.database, "AWB-024", "human-a", True,
+                     reason="prove immutable repair replay",
+                     request_id="repair-replay-transition")
+            post_transition_replay = workflow_repair(
+                self.database, self.temporary.name, "AWB-024",
+                arguments["action"], arguments["fingerprint"],
+                arguments["requestId"], "human-a",
+            )
+            self.assertEqual(repaired, post_transition_replay)
+            with self.assertRaisesRegex(LiteError, "REQUEST_REPLAY_CONFLICT"):
+                workflow_repair(
+                    self.database, self.temporary.name, "AWB-024",
+                    arguments["action"], arguments["fingerprint"],
+                    arguments["requestId"], "human-b",
+                )
+        with open(artifact, encoding="utf-8") as handle:
+            self.assertEqual("disposable exact-path fixture\n", handle.read())
+
+    def test_exact_workflow_repair_concurrency_returns_one_immutable_receipt(self):
+        self.create_awb024_b6_orphan()
+        exact_sha = "c406cffab3dc3ec91853637f08f2d7d80f45632457bc59e9d9e40019af07c09a"
+        with mock.patch("agent_workboard.lite._artifact_sha", return_value=exact_sha):
+            proof = workflow_check(
+                self.database, self.temporary.name, "AWB-024"
+            )["nextStep"]["arguments"]
+            barrier = threading.Barrier(2)
+            receipts = []
+            errors = []
+            def compete():
+                try:
+                    barrier.wait()
+                    receipts.append(workflow_repair(
+                        self.database, self.temporary.name, "AWB-024",
+                        proof["action"], proof["fingerprint"],
+                        proof["requestId"], "human-a",
+                    ))
+                except Exception as exc:
+                    errors.append(exc)
+            threads = [threading.Thread(target=compete) for unused in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertEqual([], errors)
+            self.assertEqual(2, len(receipts))
+            self.assertEqual(receipts[0], receipts[1])
+            self.assertTrue(receipts[0]["toFingerprint"])
+            self.assertEqual(1, sum(
+                row["event_type"] == "WORKFLOW_REPAIRED"
+                for row in timeline(self.database, "AWB-024")
+            ))
 
     def test_plan_deviation_recovery_does_not_unblock_and_public_flow_resumes(self):
         work_item_id = "AWB-DEV"
         self.create_orphaned_review_task(work_item_id, deviation=True)
+        before = self.database_snapshot()
         recovered = recover_review_task(
             self.database, work_item_id, work_item_id + "-T03", "human-a",
-            "recover only reviewer availability", "recover-deviation",
+            "generic deviation reset is forbidden", "recover-deviation",
         )
-        self.assertEqual("OK", recovered["status"])
-        item = get_work_item(self.database, work_item_id)
-        self.assertEqual(("DRAFT", "BLOCKED", "PLANNER", "PLAN_DEVIATION"), (
-            item["state"], item["queue_state"], item["current_role"], item["blocked_reason"],
-        ))
-        self.assertEqual("BLOCKED", item["tasks"][1]["status"])
-        unblock_task(
-            self.database, work_item_id, work_item_id + "-T02", "human-a",
-            "approved plan may be resubmitted",
-        )
-        planner = work_item_id + "-planner-2"
-        self.claim(work_item_id, 1, planner, "PLANNER")
-        transition(self.database, work_item_id, "submit_plan", planner)
-        reviewer = work_item_id + "-plan-reviewer-2"
-        self.claim(work_item_id, 3, reviewer, "REVIEWER")
-        approved = record_agent_review(
-            self.database, work_item_id, "PLAN", reviewer, "APPROVED",
-            self.structured_review("PLAN", "PASS"),
-        )
-        self.assertEqual("NOT_STARTED", approved["tasks"][2]["status"])
-        implementer = work_item_id + "-implementer-2"
-        self.claim(work_item_id, 2, implementer, "IMPLEMENTER")
-        transition(self.database, work_item_id, "start_implementation", implementer)
-        set_task_status(
-            self.database, work_item_id, work_item_id + "-T02", implementer,
-            "IN_PROGRESS",
-        )
-        self.complete(work_item_id, 2, implementer)
-        transition(
-            self.database, work_item_id, "submit_implementation", implementer,
-            local_tests_passed=True, quality_baseline=self.quality(),
-        )
-        self.claim(work_item_id, 3, work_item_id + "-final", "REVIEWER")
+        self.assertEqual("USE_WORKFLOW_CHECK_AND_EXACT_REPAIR",
+                         recovered["reasonCode"])
+        self.assertEqual(before, self.database_snapshot())
 
     def test_recovery_replay_conflict_second_request_and_active_claim_are_zero_write(self):
         work_item_id = "AWB-IDEM"
         self.create_orphaned_review_task(work_item_id)
+        before = self.database_snapshot()
         arguments = (
             self.database, work_item_id, work_item_id + "-T03", "human-a",
-            "recover orphan", "recover-idempotent",
+            "legacy reset is closed", "recover-idempotent",
         )
         first = recover_review_task(*arguments)
-        self.assertEqual("OK", first["status"])
-        snapshot = self.database_snapshot()
         replay = recover_review_task(*arguments)
-        self.assertEqual(("NO_OP", "EXACT_REPLAY"), (replay["status"], replay["reasonCode"]))
-        self.assertEqual(snapshot, self.database_snapshot())
         conflict = recover_review_task(
-            self.database, work_item_id, work_item_id + "-T03", "human-a",
-            "different reason", "recover-idempotent",
+            self.database, work_item_id, work_item_id + "-T03", "human-b",
+            "different", "recover-idempotent",
         )
-        self.assertEqual("REQUEST_ID_CONFLICT", conflict["reasonCode"])
-        self.assertEqual(snapshot, self.database_snapshot())
-        second = recover_review_task(
-            self.database, work_item_id, work_item_id + "-T03", "human-a",
-            "recover again", "recover-second",
-        )
-        self.assertEqual("TASK_NOT_ORPHANED", second["reasonCode"])
-        self.assertEqual(snapshot, self.database_snapshot())
-
-        active_id = "AWB-ACTIVE"
-        self.create_orphaned_review_task(active_id, leave_claim=True)
-        active_snapshot = self.database_snapshot()
-        active = recover_review_task(
-            self.database, active_id, active_id + "-T03", "human-a",
-            "must refuse active claim", "recover-active",
-        )
-        self.assertEqual("ACTIVE_CLAIM", active["reasonCode"])
-        self.assertEqual(active_snapshot, self.database_snapshot())
+        self.assertEqual(["REFUSED", "REFUSED", "REFUSED"],
+                         [first["status"], replay["status"], conflict["status"]])
+        self.assertEqual(before, self.database_snapshot())
 
     def test_recovery_rejects_invalid_input_writer_ambiguity_and_evidence_drift_zero_write(self):
+        before = self.database_snapshot()
         invalid = recover_review_task(
             self.database, "AWB-X", "AWB-X-T03", " ", "reason", "request",
         )
-        self.assertEqual(("REFUSED", "INPUT_REQUIRED"), (
+        self.assertEqual(("REFUSED", "USE_WORKFLOW_CHECK_AND_EXACT_REPAIR"), (
             invalid["status"], invalid["reasonCode"],
         ))
-
-        writer_id = "AWB-WRITER"
-        self.create_orphaned_review_task(writer_id)
-        connection = open_database(self.database)
-        try:
-            now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
-            connection.execute(
-                "INSERT INTO repository_locks VALUES(?,?,?,?,?,'ACTIVE',?,?,NULL)",
-                ("writer-only", "repo-writer-only", writer_id, "stale-agent", 1,
-                 now, self.expires()),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        writer_snapshot = self.database_snapshot()
-        refused = recover_review_task(
-            self.database, writer_id, writer_id + "-T03", "human-a",
-            "writer is active", "recover-writer",
-        )
-        self.assertEqual("ACTIVE_REPOSITORY_WRITER", refused["reasonCode"])
-        self.assertEqual(writer_snapshot, self.database_snapshot())
-
-        ambiguous_id = "AWB-AMB"
-        self.create_orphaned_review_task(ambiguous_id)
-        connection = open_database(self.database)
-        try:
-            created = get_work_item(self.database, ambiguous_id)["created_at"]
-            connection.execute(
-                "INSERT INTO tasks VALUES(?,?,?,?,?,'NOT_STARTED',1,'[]',?,?)",
-                (ambiguous_id + "-T04", ambiguous_id, 4, "second reviewer", "REVIEWER",
-                 created, created),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        ambiguous_snapshot = self.database_snapshot()
-        refused = recover_review_task(
-            self.database, ambiguous_id, ambiguous_id + "-T03", "human-a",
-            "ambiguous target", "recover-ambiguous",
-        )
-        self.assertEqual("REVIEWER_TASK_NOT_UNIQUE", refused["reasonCode"])
-        self.assertEqual(ambiguous_snapshot, self.database_snapshot())
-
-        drift_id = "AWB-DRIFT"
-        self.create_orphaned_review_task(drift_id)
-        connection = open_database(self.database)
-        try:
-            connection.execute(
-                "UPDATE claims SET status='EXPIRED' WHERE work_item_id=? AND role='REVIEWER'",
-                (drift_id,),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        drift_snapshot = self.database_snapshot()
-        refused = recover_review_task(
-            self.database, drift_id, drift_id + "-T03", "human-a",
-            "claim drift", "recover-drift",
-        )
-        self.assertEqual("RELEASED_REVIEWER_CLAIM_NOT_UNIQUE", refused["reasonCode"])
-        self.assertEqual(drift_snapshot, self.database_snapshot())
+        self.assertEqual(before, self.database_snapshot())
 
     def test_recovery_fault_rolls_back_and_concurrent_requests_have_one_winner(self):
-        fault_id = "AWB-FAULT"
-        self.create_orphaned_review_task(fault_id)
-        snapshot = self.database_snapshot()
-        with mock.patch("agent_workboard.lite._event", side_effect=RuntimeError("fault")):
-            with self.assertRaisesRegex(RuntimeError, "fault"):
-                recover_review_task(
-                    self.database, fault_id, fault_id + "-T03", "human-a",
-                    "fault injection", "recover-fault",
-                )
-        self.assertEqual(snapshot, self.database_snapshot())
-
-        concurrent_id = "AWB-CONCURRENT"
-        self.create_orphaned_review_task(concurrent_id)
-        barrier = threading.Barrier(2)
-        results = []
-
-        def recover(number):
-            barrier.wait()
-            results.append(recover_review_task(
-                self.database, concurrent_id, concurrent_id + "-T03", "human-a",
-                "concurrent recovery", "recover-concurrent-{0}".format(number),
-            ))
-
-        threads = [threading.Thread(target=recover, args=(number,)) for number in (1, 2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10)
-        self.assertEqual(2, len(results))
-        self.assertEqual(["REFUSED", "OK"], sorted(
-            (result["status"] for result in results), reverse=True
-        ))
-        self.assertEqual(1, sum(
-            event["event_type"] == "HUMAN_REVIEW_TASK_RECOVERED"
-            for event in timeline(self.database, concurrent_id)
-        ))
+        work_item_id = "AWB-FAULT"
+        self.create_orphaned_review_task(work_item_id)
+        before = self.database_snapshot()
+        with mock.patch("agent_workboard.lite._workflow_repair_materialized",
+                        side_effect=RuntimeError("must remain unused")):
+            refused = recover_review_task(
+                self.database, work_item_id, work_item_id + "-T03", "human-a",
+                "closed legacy surface", "recover-fault",
+            )
+        self.assertEqual("REFUSED", refused["status"])
+        self.assertEqual(before, self.database_snapshot())
 
     def test_recovery_cli_exit_json_and_transfer_exact_replay(self):
         work_item_id = "AWB-CLI-REC"
         self.create_orphaned_review_task(work_item_id)
+        before = self.database_snapshot()
         output = io.StringIO()
         with redirect_stdout(output):
             code = main([
@@ -1842,30 +2331,9 @@ class LiteWorkboardTest(unittest.TestCase):
                 "public CLI", "--request-id", "recover-cli",
             ])
         payload = json.loads(output.getvalue())
-        self.assertEqual((0, "OK"), (code, payload["status"]))
-        output = io.StringIO()
-        with redirect_stdout(output):
-            code = main([
-                "--database", self.database, "recover-review-task", work_item_id,
-                work_item_id + "-T03", "--human", "human-a", "--reason",
-                "different", "--request-id", "recover-cli",
-            ])
-        self.assertEqual((2, "REQUEST_ID_CONFLICT"), (
-            code, json.loads(output.getvalue())["reasonCode"],
-        ))
-
-        bundle = os.path.join(self.temporary.name, "recovery-transfer.json")
-        transfer_export(self.database, [work_item_id], bundle)
-        target = os.path.join(self.temporary.name, "target.db")
-        initialize_database(target)
-        self.assertEqual("ok", transfer_import(target, bundle)["status"])
-        imported = recover_review_task(
-            target, work_item_id, work_item_id + "-T03", "human-a",
-            "public CLI", "recover-cli",
-        )
-        self.assertEqual(("NO_OP", "EXACT_REPLAY"), (
-            imported["status"], imported["reasonCode"],
-        ))
+        self.assertEqual((2, "REFUSED", "USE_WORKFLOW_CHECK_AND_EXACT_REPAIR"),
+                         (code, payload["status"], payload["reasonCode"]))
+        self.assertEqual(before, self.database_snapshot())
 
     def cli(self, *arguments):
         output = io.StringIO()
@@ -1887,7 +2355,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.cli("lock", "FE-99", "--repository", "repo", "--agent", "planner")
         self.cli("unlock", "FE-99", "--repository", "repo", "--agent", "planner")
         self.cli("task", "FE-99", "FE-99-T01", "--agent", "planner", "--status", "IN_PROGRESS")
-        self.cli("task", "FE-99", "FE-99-T01", "--agent", "planner", "--status", "COMPLETED", "--evidence", "plan ready")
         self.cli("transition", "FE-99", "submit_plan", "--agent", "planner")
         self.cli("claim", "FE-99", "FE-99-T03", "--agent", "reviewer", "--role", "REVIEWER")
         self.cli("review", "FE-99", "--stage", "PLAN", "--agent", "reviewer", "--decision", "APPROVED", "--summary", "ok")
@@ -1895,7 +2362,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.cli("claim", "FE-99", "FE-99-T02", "--agent", "implementer", "--role", "IMPLEMENTER")
         self.cli("transition", "FE-99", "start_implementation", "--agent", "implementer")
         self.cli("task", "FE-99", "FE-99-T02", "--agent", "implementer", "--status", "IN_PROGRESS")
-        self.cli("task", "FE-99", "FE-99-T02", "--agent", "implementer", "--status", "COMPLETED", "--evidence", "tests passed")
         self.cli("transition", "FE-99", "submit_implementation", "--agent", "implementer",
                  "--local-tests-passed", "--quality-file", quality_file)
         self.cli("claim", "FE-99", "FE-99-T03", "--agent", "reviewer", "--role", "REVIEWER")
@@ -1914,10 +2380,222 @@ class LiteWorkboardTest(unittest.TestCase):
         self.cli("claim", "TI-88", "TI-88-T01", "--agent", "planner", "--role", "PLANNER")
         self.cli("task", "TI-88", "TI-88-T01", "--agent", "planner", "--status", "IN_PROGRESS")
         self.cli("task", "TI-88", "TI-88-T01", "--agent", "planner", "--status", "BLOCKED", "--evidence", "waiting")
-        self.cli("release", "TI-88", "--agent", "planner")
         item = self.cli("unblock", "TI-88", "TI-88-T01", "--human", "human", "--reason", "ready")
-        self.assertEqual("CLAIMABLE", item["queue_state"])
+        self.assertEqual("AWB-MUTATION-RECEIPT-v1", item["protocolVersion"])
+        self.assertEqual("CLAIMABLE", item["queueState"])
         self.cli("claim", "TI-88", "TI-88-T01", "--agent", "planner-2", "--role", "PLANNER")
+
+    def test_workflow_advance_begin_implementation_is_atomic_and_replay_safe(self):
+        self.through_plan_approval("AWB-ADV")
+        before = workflow_status(
+            self.database, "AWB-ADV", "implementer", "IMPLEMENTER", "repo"
+        )
+        self.assertEqual("READY", before["status"])
+        self.assertEqual("BEGIN_IMPLEMENTATION", before["nextStep"]["action"])
+        result = workflow_advance(
+            self.database, self.temporary.name, "AWB-ADV", "implementer",
+            "IMPLEMENTER", "repo", before["nextStep"]["fingerprint"],
+            before["rowVersion"], "advance-begin-1",
+        )
+        self.assertEqual("AWB-MUTATION-RECEIPT-v1", result["protocolVersion"])
+        self.assertEqual("IMPLEMENTING", result["state"])
+        item = get_work_item(self.database, "AWB-ADV")
+        self.assertEqual("IN_PROGRESS", item["tasks"][1]["status"])
+        self.assertEqual("implementer", item["activeClaim"]["agent_id"])
+        snapshot = self.database_snapshot()
+        replay = workflow_advance(
+            self.database, self.temporary.name, "AWB-ADV", "implementer",
+            "IMPLEMENTER", "repo", before["nextStep"]["fingerprint"],
+            before["rowVersion"], "advance-begin-1",
+        )
+        self.assertEqual(result, replay)
+        self.assertEqual(snapshot, self.database_snapshot())
+        with self.assertRaisesRegex(LiteError, "REQUEST_REPLAY_CONFLICT"):
+            workflow_advance(
+                self.database, self.temporary.name, "AWB-ADV", "implementer",
+                "IMPLEMENTER", "repo", before["nextStep"]["fingerprint"],
+                before["rowVersion"], "advance-begin-1", ttl=901,
+            )
+
+    def test_workflow_advance_refuses_human_step_without_write(self):
+        self.create("AWB-HUMAN")
+        self.claim("AWB-HUMAN", 1, "planner", "PLANNER")
+        self.complete("AWB-HUMAN", 1, "planner")
+        transition(self.database, "AWB-HUMAN", "submit_plan", "planner")
+        self.claim("AWB-HUMAN", 3, "reviewer", "REVIEWER")
+        record_agent_review(self.database, "AWB-HUMAN", "PLAN", "reviewer",
+                            "APPROVED", "pass")
+        status = workflow_status(
+            self.database, "AWB-HUMAN", "implementer", "IMPLEMENTER", "repo"
+        )
+        self.assertEqual("WAITING_HUMAN", status["status"])
+        self.assertEqual("HUMAN", status["nextStep"]["riskClass"])
+        snapshot = self.database_snapshot()
+        refused = workflow_advance(
+            self.database, self.temporary.name, "AWB-HUMAN", "implementer",
+            "IMPLEMENTER", "repo", status["nextStep"]["fingerprint"],
+            status["rowVersion"], "advance-human-refused",
+        )
+        self.assertEqual("REFUSED", refused["status"])
+        self.assertEqual(snapshot, self.database_snapshot())
+
+    def test_workflow_advance_all_eight_local_bundles_preserve_manual_gates(self):
+        work_item_id = "AWB-EIGHT"
+        self.create(work_item_id)
+
+        def advance(agent, role, request_id, **inputs):
+            status = workflow_status(
+                self.database, work_item_id, agent, role, "repo",
+                project_root=self.temporary.name,
+            )
+            self.assertEqual("READY", status["status"])
+            return workflow_advance(
+                self.database, self.temporary.name, work_item_id, agent, role,
+                "repo", status["nextStep"]["fingerprint"],
+                status["rowVersion"], request_id, **inputs
+            )
+
+        self.assertEqual("BEGIN_PLANNING", advance(
+            "planner", "PLANNER", "eight-begin-plan"
+        )["operation"])
+        with open(os.path.join(self.temporary.name, "plan.md"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("# exact plan\n")
+        self.assertEqual("SUBMIT_PLAN", advance(
+            "planner", "PLANNER", "eight-submit-plan",
+            plan_artifact="plan.md",
+        )["operation"])
+        self.assertEqual("BEGIN_PLAN_REVIEW", advance(
+            "plan-reviewer", "REVIEWER", "eight-begin-plan-review"
+        )["operation"])
+        plan_head = json.loads(next(
+            row["payload_json"] for row in reversed(timeline(self.database, work_item_id))
+            if row["event_type"] == "PLAN_ARTIFACT_HEAD"
+        ))
+        plan_review_input = self.structured_review("PLAN", "PASS")
+        plan_review_input["reviewedArtifact"] = {
+            key: plan_head[key] for key in
+            ("path", "revision", "sha256", "editorAgentId")
+        }
+        with open(os.path.join(self.temporary.name, "plan-review.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(plan_review_input, handle)
+        plan_review = advance(
+            "plan-reviewer", "REVIEWER", "eight-submit-plan-review",
+            review_file="plan-review.json", decision="APPROVED",
+        )
+        self.assertEqual(("SUBMIT_PLAN_REVIEW", "WAITING_HUMAN"), (
+            plan_review["operation"], plan_review["queueState"],
+        ))
+        self.assertEqual("NOT_STARTED", get_work_item(
+            self.database, work_item_id
+        )["tasks"][2]["status"])
+        record_human_gate(
+            self.database, work_item_id, "PLAN", "human", "APPROVED", "approved"
+        )
+        self.assertEqual("BEGIN_IMPLEMENTATION", advance(
+            "implementer", "IMPLEMENTER", "eight-begin-implementation"
+        )["operation"])
+        with open(os.path.join(self.temporary.name, "quality.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(self.quality(), handle)
+        self.assertEqual("SUBMIT_IMPLEMENTATION", advance(
+            "implementer", "IMPLEMENTER", "eight-submit-implementation",
+            quality_file="quality.json", local_tests_passed=True,
+        )["operation"])
+        self.assertEqual("BEGIN_IMPLEMENTATION_REVIEW", advance(
+            "implementation-reviewer", "REVIEWER", "eight-begin-final-review"
+        )["operation"])
+        with open(os.path.join(self.temporary.name, "final-review.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(self.structured_review("IMPLEMENTATION", "PASS"), handle)
+        final_review = advance(
+            "implementation-reviewer", "REVIEWER", "eight-submit-final-review",
+            review_file="final-review.json", decision="APPROVED",
+        )
+        self.assertEqual(("SUBMIT_IMPLEMENTATION_REVIEW", "WAITING_HUMAN"), (
+            final_review["operation"], final_review["queueState"],
+        ))
+        self.assertEqual("COMPLETED", get_work_item(
+            self.database, work_item_id
+        )["tasks"][2]["status"])
+
+    def test_workflow_advance_fault_rolls_back_the_entire_bundle(self):
+        self.through_plan_approval("AWB-ADV-FAULT")
+        status = workflow_status(
+            self.database, "AWB-ADV-FAULT", "implementer", "IMPLEMENTER", "repo"
+        )
+        before = self.database_snapshot()
+        with mock.patch("agent_workboard.lite._workflow_materialized",
+                        side_effect=RuntimeError("workflow commit fault")):
+            with self.assertRaisesRegex(RuntimeError, "workflow commit fault"):
+                workflow_advance(
+                    self.database, self.temporary.name, "AWB-ADV-FAULT",
+                    "implementer", "IMPLEMENTER", "repo",
+                    status["nextStep"]["fingerprint"], status["rowVersion"],
+                    "advance-fault",
+                )
+        self.assertEqual(before, self.database_snapshot())
+
+    def test_workflow_advance_concurrency_has_one_atomic_winner(self):
+        self.through_plan_approval("AWB-ADV-RACE")
+        status = workflow_status(
+            self.database, "AWB-ADV-RACE", "implementer", "IMPLEMENTER", "repo"
+        )
+        results = []
+        lock = threading.Lock()
+
+        def contender(request_id):
+            try:
+                value = workflow_advance(
+                    self.database, self.temporary.name, "AWB-ADV-RACE",
+                    "implementer", "IMPLEMENTER", "repo",
+                    status["nextStep"]["fingerprint"], status["rowVersion"],
+                    request_id,
+                )
+            except Exception as exc:
+                value = exc
+            with lock:
+                results.append(value)
+
+        threads = [threading.Thread(target=contender, args=(request_id,))
+                   for request_id in ("advance-race-a", "advance-race-b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(1, sum(isinstance(value, dict) and
+                                value.get("status") == "OK" for value in results))
+        self.assertEqual(1, sum(isinstance(value, LiteError) for value in results))
+        item = get_work_item(self.database, "AWB-ADV-RACE")
+        self.assertEqual(("IMPLEMENTING", "implementer"), (
+            item["state"], item["activeClaim"]["agent_id"],
+        ))
+        connection = open_database(self.database)
+        try:
+            self.assertEqual(1, connection.execute(
+                "SELECT count(*) FROM repository_locks WHERE work_item_id=? "
+                "AND status='ACTIVE'", ("AWB-ADV-RACE",),
+            ).fetchone()[0])
+        finally:
+            connection.close()
+
+    def test_cli_mutation_receipt_is_compact_and_full_is_compatible(self):
+        management_file = self.json_file("receipt-management.json", self.management("TI-RCPT"))
+        risk_file = self.json_file("receipt-risk.json", {
+            "protocolVersion": "AWB-CREATION-RISK-v1", "signals": []
+        })
+        receipt = self.cli(
+            "create", "TI-RCPT", "--type", "TI", "--title", "receipt",
+            "--management-file", management_file, "--risk-file", risk_file,
+            "--request-id", "receipt-create",
+        )
+        self.assertEqual("AWB-MUTATION-RECEIPT-v1", receipt["protocolVersion"])
+        self.assertNotIn("statusHistory", receipt)
+        full = self.cli("claim", "TI-RCPT", "TI-RCPT-T01", "--agent", "planner",
+                        "--role", "PLANNER", "--request-id", "receipt-claim", "--full")
+        self.assertEqual("TI-RCPT", full["work_item_id"])
+        self.assertIn("statusHistory", full)
 
     def test_lite_http_board_reads_lite_database_and_is_read_only(self):
         self.create("TI-001")

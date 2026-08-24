@@ -98,6 +98,17 @@ structured `nextStep`. `OK` and `NO_OP` exit 0; `REFUSED` and `CONFLICT` exit 2.
 Events contain only normalized request/result fields—never prompts, responses,
 tool output, credentials, hostnames, PIDs or local session paths.
 
+## Transactional routine advancement
+
+Use `awb workflow status <WorkItem> --agent <id> --role <role> --project .`
+to obtain the current row version and exact step fingerprint. Pass both values
+unchanged to `awb workflow advance`. Eight routine planning, review and
+implementation begin/submit bundles are local-safe. Each bundle writes its
+legacy audit subevents plus one `WORKFLOW_ADVANCED` receipt in one transaction;
+exact request replay is zero-write. Any HUMAN, remote, destructive, publication,
+candidate, upgrade or rollback step is returned for its proper actor and cannot
+be consumed by advance.
+
 ## Limits
 
 - One active Orchestrator lease per WorkItem; no shared ownership or force flag.

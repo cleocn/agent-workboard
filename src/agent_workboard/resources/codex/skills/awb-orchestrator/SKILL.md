@@ -53,6 +53,12 @@ lock remains authoritative across WorkItems. A recovered coordinator observes
 an already-running Agent and never releases or impersonates it. AWB does not
 spawn, supervise, kill, steer, or migrate host processes.
 
+Run `awb workflow check <WorkItem>` before resuming an item whose projection is
+uncertain. The check is read-only and content-free. Consume a deterministic
+repair only through the returned exact action, fingerprint and request id; an
+ambiguous result remains `WAITING_HUMAN`. Never substitute the legacy review
+task recovery command or edit projection tables directly.
+
 For PLAN and IMPLEMENTATION separately, route a strict serial 3+1+1 review.
 New plans opt in with `submit_plan --plan-artifact <project-relative-path>`.
 For an opt-in PLAN, each round uses a fresh Reviewer and the latest artifact
@@ -68,6 +74,10 @@ envelope retain the read-only AWB-REVIEW-v1 behavior.  IMPLEMENTATION review is
 unchanged: its Reviewer never edits the product and the existing 3+1+1
 REVISE/CONVERGENCE_REVISE route remains authoritative.  Never reset counts,
 alter the ID, or create a replacement WorkItem to evade the cap.
+Reviewer claims atomically manage the Reviewer task from claim through review;
+never issue a separate Reviewer `task --status` mutation. Planner and
+Implementer submission should use `workflow advance`, which atomically completes
+the task and releases its exact claim/writer bundle.
 
 Reviewer feedback is evidence, not authority to expand scope.  Route only valid
 blocking Findings to authors.  On exhaustion, project the Finding disagreement
@@ -88,9 +98,9 @@ projection. LIVE resources must be released by their exact owner. STALE rows
 remain visible history and may be reconciled only through the exact public
 request-id/owner/generation command. A true FINAL transition closes all activity
 atomically; BLOCKED, WAITING_HUMAN and nonterminal HELD never imply cleanup.
-For exact b3/b4/b5 upgrades, consume the single recovery-aware b6 nextStep unchanged;
+For exact b3/b4/b5/b6 upgrades, consume the single recovery-aware b7 nextStep unchanged;
 never ask the user to edit SQLite or perform a separate stale cleanup first.
-The b6 target owns the frozen `AWB-MIGRATION-GRAPH-v1`; never infer a route from
+The b7 target owns the frozen `AWB-MIGRATION-GRAPH-v1`; never infer a route from
 version ordering or install intermediate releases.
 
 Runtime events are the process audit authority.  Do not require per-round
@@ -102,6 +112,25 @@ allowlist, wheel/sdist secret and member scan, three-asset SHA-256, remote drift
 check, and independent Implementation review.  Preview does not require a
 second reproducibility build, a no-Git rebuild, per-file manifest hashes, or Git
 reachable-object/history closure.  Remote/destructive authority is unchanged.
+
+For an explicit Release WorkItem, prepare, freeze and build only through `awb
+candidate`.  Independent IMPLEMENTATION PASS/open0 produces
+`PUBLICATION_READY` instead of FINAL; exact HUMAN candidate authorization and
+accepted publication postflight are still required before FINAL.  A failed
+publication with proven `partialState=NONE` may use the HUMAN retry command only
+when the retained IMPLEMENTATION history has a legal fresh ordinary R2 or R3;
+R3/R4/R5 and ambiguous or partial remote state stop at HUMAN without resetting
+review counts.
+
+Use `awb workflow status` before `awb workflow advance`.  Consume exactly its
+single fingerprinted `LOCAL_SAFE` nextStep and expected row version.  Never use
+advance for HUMAN, remote, destructive, candidate, publication, upgrade,
+rollback or delete work.  MVP-LITE mutations return a compact
+`AWB-MUTATION-RECEIPT-v1` by default; request `--full` only when the complete
+projection is actually needed.  Managed candidates keep active, staging,
+quarantine and journal as same-filesystem sibling roots; quarantine is
+recoverable and neither quarantine nor finalize deletes bytes.  Pinned build
+toolchain drift is a refusal, not permission to install or download tools.
 
 On Darwin, while actively managing one or more WorkItems, best-effort start the
 foreground command `caffeinate -di` only through a long-running Agent tool

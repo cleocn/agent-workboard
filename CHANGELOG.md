@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1b7 Preview
+
+- Add one declarative workflow transition kernel with transaction-bound pre/post
+  invariants, atomic Reviewer task lifecycle, and fail-closed mutation receipts.
+- Add content-free `workflow check` plus a closed exact-fingerprint repair for
+  uniquely proven projection splits; ambiguous state remains zero-write.
+- Replace implicit TTL cleanup with the fingerprinted
+  `EXPIRE_AND_RECONCILE_ACTIVITY` bundle and preserve exact owner/generation
+  fencing, replay and complete old-or-new transaction outcomes.
+- Extend the frozen no-DDL migration graph with exact public b6 to b7 while
+  retaining the streamlined single-build Preview evidence policy.
+
 ## 0.3.1b6 Preview
 
 - Fix terminal and non-claimable Orchestrator claims to return the stable

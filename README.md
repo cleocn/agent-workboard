@@ -5,15 +5,15 @@ planner → reviewer → policy gate → implementer → reviewer workflow. It h
 runtime third-party dependency and its read-only board listens only on a
 loopback address.
 
-## Install the 0.3.1b6 Preview
+## Install the 0.3.1b7 Preview
 
 This release is an opt-in, local-only, observation-only Preview. Download the
-wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b6` prerelease, verify both
+wheel, sdist and `SHA256SUMS` from the GitHub `v0.3.1b7` prerelease, verify both
 artifacts, then initialize a project:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-python -m pip install agent_workboard-0.3.1b6-py3-none-any.whl
+python -m pip install agent_workboard-0.3.1b7-py3-none-any.whl
 awb init --project ./my-project
 awb doctor --project ./my-project
 awb lite --project ./my-project list
@@ -36,17 +36,17 @@ awb doctor --project .
 Stable mode refuses editable or unverified packages. Development mode is only
 for a disposable database under `.awb/dev/`.
 
-## Upgrade an exact 0.3.1b3, 0.3.1b4, or 0.3.1b5 project
+## Upgrade an exact 0.3.1b3, 0.3.1b4, 0.3.1b5, or 0.3.1b6 project
 
-Retain the exact old release wheel and install the verified 0.3.1b6 wheel. If the
+Retain the exact old release wheel and install the verified 0.3.1b7 wheel. If the
 project uses an official GitHub URL lock, place its verified source wheel beside
 the Preview wheel; a local file lock continues to use its recorded path. Always
 run the read-only preflight first, then execute only its one structured
 `nextStep`:
 
 ```bash
-awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b6-py3-none-any.whl --with-codex
-awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b6-py3-none-any.whl --with-codex
+awb upgrade --check --project ./my-project --wheel ./agent_workboard-0.3.1b7-py3-none-any.whl --with-codex
+awb upgrade --project ./my-project --wheel ./agent_workboard-0.3.1b7-py3-none-any.whl --with-codex
 awb doctor --project ./my-project
 awb codex check --project ./my-project
 ```
@@ -96,6 +96,25 @@ package-owned `review --replacement-file` path. The amendment consumes its
 round, its editor cannot approve the revision, and the next round requires a
 fresh Reviewer. PLAN remains strict 3+1+1 with no round 6. Implementation
 review remains read-only and unchanged.
+
+## Efficient local workflow and release candidates
+
+`awb workflow status` returns one fingerprinted next step. `awb workflow
+advance` consumes only a matching `LOCAL_SAFE` step and expected row version,
+combining the routine claim/task/start/writer or complete/unlock/release/submit
+sequence in one database transaction. HUMAN, remote, destructive, candidate,
+publication, upgrade and rollback steps are always refused. MVP-LITE mutations
+now return `AWB-MUTATION-RECEIPT-v1` by default; add `--full` when the complete
+WorkItem projection is needed.
+
+An explicit Release WorkItem uses `awb candidate prepare/freeze/build/status/
+quarantine/finalize`. Candidate bytes live below the project-owned managed root;
+quarantine is reversible and finalize never deletes bytes. The build command
+accepts one exact offline Python/setuptools/wheel toolchain file and never
+downloads or substitutes tools. Independent Implementation review happens
+before publication: PASS/open0 produces `PUBLICATION_READY`, while exact HUMAN
+authorization and publication postflight remain separate prerequisites for
+FINAL. AWB audits these local boundaries but does not execute remote publication.
 
 ## HUMAN-only orphan Reviewer recovery
 

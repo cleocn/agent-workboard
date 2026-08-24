@@ -7,16 +7,20 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tarfile
 import zipfile
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src"))
+from agent_workboard.candidate import scan_artifact as _package_scan_artifact
+
 
 FORBIDDEN_CONTENT = (
-    b"BEGIN " + b"RSA", b"BEGIN OPENSSH PRIVATE KEY",
-    b"-----BEGIN PRIVATE KEY-----", b"101" + b".96.", b"newstart" + b"2",
+    b"BEGIN " + b"RSA", b"BEGIN " + b"OPENSSH PRIVATE KEY",
+    b"-----BEGIN " + b"PRIVATE KEY-----", b"101" + b".96.", b"newstart" + b"2",
 )
 FORBIDDEN_PATTERNS = (
-    re.compile(br"gh[opsu]_[A-Za-z0-9_]{20,}"),
+    re.compile(br"gh" + br"[opsu]_[A-Za-z0-9_]{20,}"),
     re.compile(br"(?i)(password|secret|api[_-]?key|access[_-]?token)\s*[:=]\s*[^\s]{8,}"),
     re.compile(br"-----BEGIN (?:[A-Z0-9]+ )+PRIVATE KEY-----"),
     re.compile(br"(?i)(?:^|[\s=:'\"(]|file://)/(?:Users|private|home|root|tmp|var/(?:folders|tmp))/"),
@@ -42,49 +46,7 @@ def _scan_raw(name, raw):
 
 
 def scan_artifact(path):
-    path = os.path.realpath(os.path.abspath(path))
-    if not os.path.isfile(path) or os.path.islink(path):
-        raise ValueError("artifact must be a regular non-symlink file")
-    members = []
-    if path.endswith(".whl"):
-        with zipfile.ZipFile(path) as archive:
-            seen = set()
-            for info in archive.infolist():
-                _safe_member(info.filename)
-                if info.filename in seen:
-                    raise ValueError("artifact contains duplicate members")
-                seen.add(info.filename)
-                mode = (info.external_attr >> 16) & 0xFFFF
-                if info.is_dir():
-                    continue
-                if stat.S_IFMT(mode) and not stat.S_ISREG(mode):
-                    raise ValueError("artifact contains a non-regular member")
-                members.append(_scan_raw(info.filename, archive.read(info)))
-    elif path.endswith((".tar.gz", ".tgz")):
-        with tarfile.open(path, "r:gz") as archive:
-            seen = set()
-            for info in archive.getmembers():
-                _safe_member(info.name)
-                if info.name in seen:
-                    raise ValueError("artifact contains duplicate members")
-                seen.add(info.name)
-                if info.isdir():
-                    continue
-                if not info.isfile():
-                    raise ValueError("artifact contains a non-regular member")
-                handle = archive.extractfile(info)
-                if handle is None:
-                    raise ValueError("artifact member cannot be read")
-                members.append(_scan_raw(info.name, handle.read()))
-    else:
-        raise ValueError("artifact type must be wheel or gzipped sdist")
-    if not members:
-        raise ValueError("artifact contains no regular members")
-    with open(path, "rb") as handle:
-        artifact_sha = hashlib.sha256(handle.read()).hexdigest()
-    return {"artifact": path, "sha256": artifact_sha,
-            "memberCount": len(members), "members": sorted(members, key=lambda row: row["path"]),
-            "privacy": "ALLOWLIST_ONLY"}
+    return _package_scan_artifact(path)
 
 
 def check_successor(repository, base, candidate, tag, branch, preserved, allowlist):

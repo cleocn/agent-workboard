@@ -38,8 +38,8 @@ class ReleaseBuildTest(unittest.TestCase):
                 path = os.path.join(base, name)
                 with open(path, "rb") as handle:
                     files[os.path.relpath(path, build).replace(os.sep, "/")] = handle.read()
-        prefix = "agent_workboard-0.3.1b6.dist-info"
-        files[prefix + "/METADATA"] = b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b6\n\n"
+        prefix = "agent_workboard-0.3.1b7.dist-info"
+        files[prefix + "/METADATA"] = b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b7\n\n"
         files[prefix + "/WHEEL"] = b"Wheel-Version: 1.0\nGenerator: awb-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
         files[prefix + "/entry_points.txt"] = b"[console_scripts]\nawb = agent_workboard.cli:main\n"
         records = []
@@ -91,7 +91,7 @@ class ReleaseBuildTest(unittest.TestCase):
                             "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"})
         subprocess.check_call(["git", "commit", "-m", "release test"], cwd=repository,
                               env=environment, stdout=subprocess.DEVNULL)
-        subprocess.check_call(["git", "tag", "-a", "v0.3.1b6", "-m", "preview"], cwd=repository)
+        subprocess.check_call(["git", "tag", "-a", "v0.3.1b7", "-m", "preview"], cwd=repository)
         return repository
 
     def _identity(self, path):
@@ -153,8 +153,8 @@ class ReleaseBuildTest(unittest.TestCase):
             subprocess.check_call([sys.executable, "setup.py", "build_py"], cwd=repository, env=environment,
                                   stdout=subprocess.DEVNULL)
             direct_identity = self._identity(os.path.join(repository, "build", "lib", "agent_workboard", "_build.py"))
-            self.assertEqual("0.3.1b6", direct_identity["packageVersion"])
-            self.assertEqual("v0.3.1b6", direct_identity["sourceTag"])
+            self.assertEqual("0.3.1b7", direct_identity["packageVersion"])
+            self.assertEqual("v0.3.1b7", direct_identity["sourceTag"])
             for name in TEMPLATES:
                 with open(os.path.join(repository, "docs", "work-item-templates", name), "rb") as source:
                     expected = source.read()
@@ -187,7 +187,7 @@ class ReleaseBuildTest(unittest.TestCase):
                           "not a product\nrunner"):
                 self.assertIn(token, route)
 
-            wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b6-py3-none-any.whl")
+            wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b7-py3-none-any.whl")
             os.makedirs(os.path.dirname(wheel), exist_ok=True)
             self._wheel_from_build(repository, wheel)
             with zipfile.ZipFile(wheel) as archive:

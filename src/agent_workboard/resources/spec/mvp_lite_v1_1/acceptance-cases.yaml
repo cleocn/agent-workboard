@@ -1,5 +1,5 @@
-version: AWB-022-v2
-owner: AWB-020
+version: AWB-023-v1
+owner: AWB-023
 managementContract: AWB-WORKITEM-MGMT-v1
 templateContract: AWB-MANAGEMENT-v1
 cases:
@@ -78,3 +78,14 @@ cases:
   - {id: AWB-022-AC-011, priority: P0, title: terminal nonclaimable claim 结构化拒绝零写且 claim-next 继续选择合法项}
   - {id: AWB-022-AC-012, priority: P0, title: MANUAL AUTO FINAL 精确绑定已释放 Reviewer claim 且 legacy fault fail closed}
   - {id: AWB-022-AC-013, priority: P0, title: exact b3 b4 b5 经冻结迁移图一次 check execute 到 b6 并整路 rollback}
+  - {id: AWB-023-AC-001, priority: P0, title: Release 独立实施复审 PASS open0 后才 publication-ready 且 postflight 后才 FINAL}
+  - {id: AWB-023-AC-002, priority: P0, title: workflow advance 八类 LOCAL_SAFE bundle 单事务且拒绝 HUMAN REMOTE DESTRUCTIVE}
+  - {id: AWB-023-AC-003, priority: P0, title: mutation 默认紧凑 receipt 且 full 保留完整兼容投影}
+  - {id: AWB-023-AC-004, priority: P0, title: managed candidate sibling lifecycle replay concurrency fault 可恢复且不删除}
+  - {id: AWB-023-AC-005, priority: P0, title: pinned offline build exact toolchain 三资产 scan 且漂移 fail closed}
+  - {id: AWB-025-AC-001, priority: P0, title: 公共 workflow mutation 经单一 kernel 事务 pre plan CAS post audit 收口}
+  - {id: AWB-025-AC-002, priority: P0, title: claim 自动管理 task 且 Reviewer review 不再遗留 orphan task}
+  - {id: AWB-025-AC-003, priority: P0, title: workflow check 内容安全零写且 repair 仅执行 exact registered proof}
+  - {id: AWB-025-AC-004, priority: P0, title: time-induced activity 完整 bundle fingerprint notAfter replay 并发故障安全}
+  - {id: AWB-025-AC-005, priority: P0, title: publication ready authorize already-published status postflight FINAL 顺序唯一}
+  - {id: AWB-025-AC-006, priority: P0, title: exact b3 b4 b5 b6 经 NO_DDL route 直升 b7 并整路 rollback}

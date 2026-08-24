@@ -50,28 +50,24 @@ bundle 迁移为 `MANUAL`。
 
 PLAN 与 IMPLEMENTATION 独立使用严格串行 `3+1+1`。新 PLAN 以 `--plan-artifact` 显式 opt in；每轮使用未参加过该 PLAN 的 Reviewer，latest editor 不得自审。R1～R3 可 PASS、以 package-owned `--replacement-file` 原子 AMENDED，或把实质变更 REVISE_TO_PLANNER；R3 两种修改结果都直接进唯一 R4 convergence。R4 只允许一次最小 AMENDED 后进入 fresh ordinary R5；R5 只允许 PASS/WAITING_HUMAN，禁止修改和第 6 轮。Reviewer 不直接写文件，PASS 不取得 writer；旧 PLAN 保持 AWB-REVIEW-v1 只读语义。IMPLEMENTATION 的 REVISE/CONVERGENCE_REVISE、Reviewer 禁止编辑产品和全部质量门保持不变。Reviewer、claim generation、人工退回或 PLAN_DEVIATION 都不重置累计轮次。
 
-## 孤立 Reviewer 任务恢复
+## 工作流检查与注册修复
 
-PLAN Reviewer 只领取 Reviewer task 并提交 review，禁止为 PLAN review 手工把复用的
-Reviewer task 改为 `IN_PROGRESS`；该 task 留给 FINAL review 完成。若旧运行序列已在 PLAN
-PASS 后遗留一个无 claim 的 Reviewer `IN_PROGRESS` task，只有 HUMAN 可调用：
+b7 的 role claim 原子进入对应 task，release/review/submit 在同一事务收口 task、claim、
+writer、queue 与 role；Reviewer 手工 task mutation 被拒绝。旧的通用
+`recover-review-task` 写路径已经关闭。异常先运行只读检查，并且只能原样消费其
+fingerprint nextStep：
 
 ```text
-awb lite --project <project> recover-review-task <WorkItem> <Task> \
-  --human <human-id> --reason <reason> --request-id <unique-id>
+awb workflow check AWB-NNN --project <project>
+awb workflow repair AWB-NNN --project <project> --apply \
+  --action <exact-action> --fingerprint <exact-fingerprint> \
+  --request-id <exact-request-id> --human <human-id>
 ```
 
-`AWB-REVIEW-TASK-RECOVERY-v1` 不是通用 reset。它只接受唯一 Reviewer task、唯一
-`IN_PROGRESS`、无活动 claim/writer、已释放且身份匹配的 Reviewer claim、structured PLAN
-PASS/open0、对应 PLAN review event、已通过 gate、后续 `START_IMPLEMENTATION`、无 FINAL
-review，以及精确 `IMPLEMENTING` 或 `PLAN_DEVIATION` 投影。成功只把该 task 恢复为
-`NOT_STARTED`、递增 WorkItem row version 并追加 `HUMAN_REVIEW_TASK_RECOVERED`；不会
-unblock、approve、submit、claim、release、发布、升级或执行远程/破坏性动作。
-
-相同 request id 和内容重放返回 `NO_OP`；冲突重放、第二次恢复、active/歧义/漂移都
-`REFUSED` 且零写入。`PLAN_DEVIATION` 形态恢复后仍须 HUMAN 显式 `unblock`，Planner
-重新提交冻结计划；后续 PLAN Reviewer 不启动复用 task。T02 完成并提交实施后，FINAL
-Reviewer 才重新领取该 task，并由 FINAL review 完成它。
+repair registry 是闭集。首个 recipe 只匹配冻结的 AWB-024 public-b6 PLAN round-1
+`REVISE_TO_PLANNER` orphan shape 和 exact artifact SHA；成功仅将 T03
+`IN_PROGRESS→NOT_STARTED`，保留文件、review、Finding 与全部历史。缺少唯一证明、
+多个解释、fingerprint/file/activity 漂移或并发冲突均零写，绝不近似 reset。
 
 ## 搁置、阻塞和认领
 
@@ -94,7 +90,9 @@ writer 或 HUMAN gate 权限。`claim-next` 在一个 `BEGIN IMMEDIATE` 事务�
 旧 generation、过期或已 release 全部必须在 workflow 零副作用下拒绝。已经合法取得的
 Agent claim 不受 lease 后续过期、释放或接管影响。
 
-`recover` 只接管已过期的最新 lease 并递增 generation，不释放或冒充在途 Agent。
+过期 lease 必须先消费 `workflow check` 返回的 exact reconciliation proof；`recover`
+不会隐式清理 persisted ACTIVE lease。收口后 fresh recover/claim 才递增 generation，
+且不释放或冒充在途 Agent。
 HUMAN gate、hold/block 和同 repositoryKey 单 writer 规则保持不变。AWB 只提供一次性
 本地 JSON 命令，不创建、监督、终止或迁移宿主进程和 Agent session。
 
@@ -103,17 +101,33 @@ HUMAN gate、hold/block 和同 repositoryKey 单 writer 规则保持不变。AWB
 claim、repository writer、Orchestrator lease 的持久状态与有效状态正交：`ACTIVE` 且
 未到期才是 LIVE，已到期的 `ACTIVE` 明确投影为 STALE。`doctor`、`activity list/show`
 与 Orchestrator list/show 使用同一个时钟且只读零写。公共 `reconcile-expired` 必须绑定
-精确 WorkItem、kind、resource id、owner、generation 和 request-id；LIVE、歧义 owner、
-错误 generation 或并发冲突均拒绝且不删除历史。
+精确 WorkItem、kind、resource id、owner、generation、projection fingerprint、排序的
+`expectedActivity`、`notAfter` 和 request-id；LIVE、mixed/newly-expired bundle、歧义
+owner、错误 generation 或并发冲突均拒绝且不删除历史。
 
 只有 `FINAL_ACCEPTANCE_APPROVED` 在原 gate transaction 内关闭三类活动并写
 `TERMINAL_ACTIVITY_RECONCILED`。BLOCKED、WAITING_HUMAN、task CANCELLED 与非终态
 HELD 不触发清理。FINAL review event 绑定刚释放的精确 Reviewer claim；MANUAL gate
 只接受该绑定，legacy b5 event 仅在 actor、task、release 时刻唯一匹配时兼容。exact
-b3/b4/b5 consumer 升 b6 时先运行零写 check：冻结的 `AWB-MIGRATION-GRAPH-v1`
+b3/b4/b5/b6 consumer 升 b7 时先运行零写 check：冻结的 `AWB-MIGRATION-GRAPH-v1`
 选择唯一完整 identity route，stale-only 的唯一 nextStep 在完整备份后指纹重验并审计收口，
 LIVE 或 mixed 状态先停止于真实 owner。
 用户不需要手工清理或修改 SQLite。
+
+## 高效推进与发布候选
+
+`workflow status` 零写计算唯一结构化 nextStep；`workflow advance` 只消费 exact
+rowVersion、step fingerprint 与 `LOCAL_SAFE` 分类，在一个 SQLite transaction 内完成
+八种固定 begin/submit bundle。HUMAN、REMOTE、DESTRUCTIVE、candidate、publication、
+upgrade、rollback 和 delete 一律不能由 advance 消费。mutation 默认只返回
+`AWB-MUTATION-RECEIPT-v1`；`--full` 保留完整 WorkItem 投影。
+
+显式 Release WorkItem 使用 package-owned managed candidate。FROZEN+BUILT fingerprint
+必须由独立 IMPLEMENTATION Reviewer exact 复审，PASS/open0 只生成
+`PUBLICATION_READY`，不提前 FINAL。远程发布仍要求 exact HUMAN authorization；只有
+refs、immutable prerelease 和三资产 hash 的 postflight 通过后才进入 AUTO/MANUAL
+FINAL。candidate active/staging/quarantine/journal 为同文件系统 sibling；quarantine
+可恢复，finalize 不删除 bytes，locked build 不联网或自动安装工具链。
 
 ## 主 Agent 活动期保障
 

@@ -19,6 +19,8 @@
   },
   "requiredPaths": [
     "src/agent_workboard",
+    "src/agent_workboard/candidate.py",
+    "src/agent_workboard/workflow.py",
     "src/agent_workboard/resources/spec/mvp_lite_v1_1",
     ".codex/skills/awb-orchestrator/SKILL.md",
     "tools/release_gate.py"

@@ -205,17 +205,19 @@ activityPolicy:
   kinds: [AGENT_CLAIM, REPOSITORY_WRITER, ORCHESTRATOR_LEASE]
   effective: {LIVE: "ACTIVE and expires_at > clock", STALE: "ACTIVE and expires_at <= clock"}
   readsAreZeroWrite: true
-  exactReconciliation: [workItemId, kind, resourceId, ownerId, generation, requestId]
+  exactReconciliation: [workItemId, kind, resourceId, ownerId, generation,
+                        projectionFingerprint, expectedActivity, notAfter, requestId]
   trueTerminal: [FINAL_ACCEPTANCE_APPROVED]
   nonTerminal: [BLOCKED, WAITING_HUMAN, HELD, TASK_CANCELLED]
   finalReviewerClaimBinding: {status: RELEASED, effective: INACTIVE,
                               legacy: UNIQUE_ACTOR_TASK_RELEASE_TIME}
   migrationGraph: AWB-MIGRATION-GRAPH-v1
-  upgradeSources: [exact_0_3_1b3, exact_0_3_1b4, exact_0_3_1b5]
-  upgradeTarget: exact_0_3_1b6
+  upgradeSources: [exact_0_3_1b3, exact_0_3_1b4, exact_0_3_1b5, exact_0_3_1b6]
+  upgradeTarget: exact_0_3_1b7
   upgradeEdges: [B3_TO_B4_CONFIG_CANONICALIZATION,
                  B4_TO_B5_ACTIVITY_RECOVERY,
-                 B5_TO_B6_FINDING_CORRECTION]
+                 B5_TO_B6_FINDING_CORRECTION,
+                 B6_TO_B7_STATE_RELIABILITY]
   staleOnlyNextStep: EXECUTE_UPGRADE_WITH_RECONCILIATION
   liveOrMixedNextStep: STOP_LIVE_ACTIVITY_OWNER_AND_RECHECK
 
@@ -231,33 +233,23 @@ managementPolicy:
   defaultProgress: required_completed_over_required_total
   weightedProgress: {type: FE, explicit: true, stableStageIds: true, weightsTotal: 100}
 
-reviewTaskRecoveryPolicy:
-  protocol: AWB-REVIEW-TASK-RECOVERY-v1
-  command: recover-review-task
-  actor: HUMAN
-  onlyTransition: {from: IN_PROGRESS, to: NOT_STARTED, ownerRole: REVIEWER}
-  requires:
-    - non_empty_human_reason_request_id
-    - non_terminal_managed_work_item
-    - unique_reviewer_task_and_unique_in_progress_task
-    - no_active_claim_or_repository_writer
-    - released_matching_reviewer_claim
-    - structured_plan_review_PASS_open_findings_zero
-    - matching_plan_review_event_and_approved_gate
-    - later_start_implementation
-    - exact_IMPLEMENTING_or_PLAN_DEVIATION_runtime_shape
-    - no_final_review
-    - unique_evidence_binding
-  event:
-    {type: HUMAN_REVIEW_TASK_RECOVERED, actorKind: HUMAN,
-     payloadProtocol: AWB-REVIEW-TASK-RECOVERY-v1}
-  idempotency:
-    exactReplay: NO_OP
-    conflictingReplay: REFUSED_ZERO_WRITE
-    secondRecovery: REFUSED_ZERO_WRITE
-  neverGrants:
-    [unblock, approve, submit, claim, release, publish, deploy, upgrade,
-     remote_write, destructive_action]
+workflowReliabilityPolicy:
+  kernel: AWB-TRANSITION-KERNEL-v1
+  transaction: BEGIN_IMMEDIATE
+  phases: [canonical_snapshot, pre_invariants, exact_fence, transition_plan,
+           compare_and_set_writes, post_invariants, audit_receipt, commit]
+  taskClaimBidirectional: true
+  reviewerTaskManagedByClaim: true
+  standaloneCompletedStatus: USE_WORKFLOW_ADVANCE
+  check: {protocol: AWB-WORKFLOW-CHECK-v1, readOnly: true, contentFree: true}
+  repair:
+    protocol: AWB-WORKFLOW-REPAIR-v1
+    registry: [RESET_ORPHAN_REVIEWER_TASK_AFTER_PLAN_REVISION]
+    exactFingerprintRequired: true
+    ambiguousIsZeroWrite: true
+    arbitraryReset: forbidden
+  expiryEdge: EXPIRE_AND_RECONCILE_ACTIVITY
+  legacyRecoverReviewTask: REFUSED_USE_WORKFLOW_CHECK_AND_EXACT_REPAIR
 
 implementationQualityPolicy:
   baselineFields: [passedAcceptance, tests, modifiedScope, knownNonBlockingIssues,
@@ -265,6 +257,32 @@ implementationQualityPolicy:
   stopOn: [acceptance_regression, test_weakening, same_or_worse_defect,
            material_scope_expansion, plan_invalid]
   planDeviation: {state: DRAFT, queue: BLOCKED, role: PLANNER, resetReviewRounds: false}
+
+workflowAdvancePolicy:
+  protocol: AWB-WORKFLOW-ADVANCE-v1
+  consumableRiskClass: LOCAL_SAFE
+  actions: [BEGIN_PLANNING, SUBMIT_PLAN, BEGIN_PLAN_REVIEW, SUBMIT_PLAN_REVIEW,
+            BEGIN_IMPLEMENTATION, SUBMIT_IMPLEMENTATION,
+            BEGIN_IMPLEMENTATION_REVIEW, SUBMIT_IMPLEMENTATION_REVIEW]
+  transaction: BEGIN_IMMEDIATE
+  exactReplayIsZeroWrite: true
+  refusedRiskClasses: [HUMAN, REMOTE, DESTRUCTIVE, AMBIGUOUS]
+
+mutationReceiptPolicy:
+  protocol: AWB-MUTATION-RECEIPT-v1
+  default: concise
+  fullFlag: --full
+  dedicatedProtocolsUnchanged: [upgrade, rollback, usage, orchestrator, activity, project]
+
+releaseCandidatePolicy:
+  protocol: AWB-MANAGED-CANDIDATE-v1
+  lifecycle: [PREPARED, FROZEN, BUILT, QUARANTINED, FINALIZED, RECOVERY_REQUIRED]
+  siblingRoots: [active, staging, quarantine, journal]
+  deleteCapability: false
+  buildProtocol: AWB-PINNED-PYTHON-BUILD-v1
+  implementationPassResult: PUBLICATION_READY
+  finalRequires: [exact_human_authorization, accepted_publication_postflight]
+  remoteExecutor: false
 
 phase2Only:
   - mysql_storage_adapter

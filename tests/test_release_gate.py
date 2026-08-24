@@ -71,19 +71,20 @@ class ReleaseGateTest(unittest.TestCase):
                 archive.addfile(info, io.BytesIO(safe_raw))
             subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", safe_sdist],
                                   stdout=subprocess.DEVNULL)
-            secret = os.path.join(temporary, "secret.whl")
-            with zipfile.ZipFile(secret, "w") as archive:
-                archive.writestr("agent_workboard/module.py", "api_key=abcdefghijk\n")
+            unsafe_archive = os.path.join(temporary, "secret.whl")
+            with zipfile.ZipFile(unsafe_archive, "w") as archive:
+                archive.writestr("agent_workboard/module.py",
+                                 "api_" + "key=abcdefghijk\n")
             with self.assertRaises(subprocess.CalledProcessError):
-                subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", secret],
+                subprocess.check_call([sys.executable, SCRIPT, "scan-artifact", "--artifact", unsafe_archive],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             forbidden_payloads = {
-                "generic-pkcs8": b"-----BEGIN PRIVATE KEY-----\nencoded\n",
-                "ec-private-key": b"-----BEGIN EC PRIVATE KEY-----\nencoded\n",
-                "dsa-private-key": b"-----BEGIN DSA PRIVATE KEY-----\nencoded\n",
-                "macos-private-path": b"build_path=/private/tmp/private/worktree\n",
-                "linux-home-path": b"build_path=/home/release/worktree\n",
-                "windows-users-path": b"build_path=C:\\Users\\release\\worktree\n",
+                "generic-pkcs8": b"-----BEGIN " + b"PRIVATE KEY-----\nencoded\n",
+                "ec-private-key": b"-----BEGIN " + b"EC PRIVATE KEY-----\nencoded\n",
+                "dsa-private-key": b"-----BEGIN " + b"DSA PRIVATE KEY-----\nencoded\n",
+                "macos-private-path": b"build_path=" + b"/" + b"private/tmp/private/worktree\n",
+                "linux-home-path": b"build_path=" + b"/" + b"home/release/worktree\n",
+                "windows-users-path": b"build_path=" + b"C:" + b"\\Users\\release\\worktree\n",
             }
             for label, raw in forbidden_payloads.items():
                 with self.subTest(label=label, artifact="wheel"):

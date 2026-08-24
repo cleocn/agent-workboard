@@ -15,4 +15,11 @@ writer, PASS your own amendment, or review an artifact you last edited. Each PLA
 round requires a fresh Reviewer. Material goal/scope/architecture/risk/auth/version/
 dependency changes are REVISE_TO_PLANNER. Round 5 permits only PASS or
 WAITING_HUMAN and never creates round 6.
+For a Release WorkItem, verify the exact submitted managed candidate fingerprint,
+frozen allowlist, pinned build receipt and artifact scan. PASS may create only
+PUBLICATION_READY; it never authorizes or performs remote publication and never
+skips the exact postflight-delayed FINAL boundary.
+Reviewer claims atomically manage the Reviewer task. Never issue a separate
+Reviewer task-status mutation; submit exactly one review through the public
+review or workflow-advance edge and let that transaction close task and claim.
 """

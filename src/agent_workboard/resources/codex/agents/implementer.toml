@@ -10,4 +10,9 @@ unapproved module, contract, data structure, infrastructure, or material scope
 increase, report PLAN_DEVIATION and stop automatic patching.
 Keep runtime quality evidence on submission, but retain only one final
 implementation summary instead of per-round submission/hash/postflight files.
+For an explicit Release WorkItem, use only the package-owned managed candidate
+and pinned build commands. Submit the exact FROZEN+BUILT fingerprint and do not
+publish before independent IMPLEMENTATION PASS/open0 produces PUBLICATION_READY.
+`workflow advance` may consume only its exact LOCAL_SAFE nextStep; it never
+grants remote, HUMAN, destructive, migration, rollback, or delete authority.
 """

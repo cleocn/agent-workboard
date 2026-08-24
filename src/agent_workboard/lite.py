@@ -14,10 +14,14 @@ import os
 import pkgutil
 import re
 import sqlite3
+import stat
+import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import unquote, urlsplit
+
+from . import workflow as workflow_kernel
 
 
 SCHEMA_VERSION = "MVP-LITE-v1"
@@ -31,6 +35,8 @@ CREATION_RISK_KINDS = ("REMOTE", "DESTRUCTIVE", "ANOMALOUS_STATE")
 USAGE_POLICIES = ("OFF", "BEST_EFFORT")
 PLAN_ARTIFACT_PROTOCOL = "AWB-PLAN-ARTIFACT-v1"
 REVIEW_V2_PROTOCOL = "AWB-REVIEW-v2"
+MUTATION_RECEIPT_PROTOCOL = "AWB-MUTATION-RECEIPT-v1"
+WORKFLOW_ADVANCE_PROTOCOL = "AWB-WORKFLOW-ADVANCE-v1"
 PLAN_AMEND_CATEGORIES = (
     "INTERNAL_CONTRADICTION", "COMMAND_OR_PATH", "TEST_OMISSION",
     "ACCEPTANCE_EXPRESSION", "IMPLEMENTATION_ORDER", "DUPLICATE_EVIDENCE",
@@ -242,23 +248,6 @@ def initialize_database(path, schema_path=DEFAULT_SCHEMA):
         if connection:
             connection.close()
     return {"status": "ok", "schemaVersion": SCHEMA_VERSION, "database": path}
-
-
-def _event(connection, work_item_id, request_id, event_type, actor_kind, actor_id, payload):
-    existing = connection.execute(
-        "SELECT event_type, payload_json FROM events WHERE request_id=?", (request_id,)
-    ).fetchone()
-    encoded = _json(payload)
-    if existing:
-        if existing["event_type"] != event_type or existing["payload_json"] != encoded:
-            raise LiteError("request_id was already used with different content")
-        return False
-    connection.execute(
-        "INSERT INTO events(work_item_id,request_id,event_type,actor_kind,actor_id,payload_json,created_at) "
-        "VALUES(?,?,?,?,?,?,?)",
-        (work_item_id, request_id, event_type, actor_kind, actor_id, encoded, _now()),
-    )
-    return True
 
 
 def _item(connection, work_item_id):
@@ -515,20 +504,29 @@ def create_work_item(database, work_item_id, item_type, title, mode="STANDARD", 
         )
         create_payload = dict(basic_payload)
         create_payload["management"] = normalized
-        connection.execute(
-            "INSERT INTO work_items(work_item_id,work_item_type,title,mode,priority,current_role,"
-            "created_at,updated_at,human_gate_policy) VALUES(?,?,?,?,?,'PLANNER',?,?,?)",
-            (work_item_id, item_type, title, mode, priority, now, now, policy),
-        )
+        task_rows = []
         for task in normalized["tasks"]:
-            connection.execute(
-                "INSERT INTO tasks(task_id,work_item_id,seq,title,owner_role,status,required,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (task["taskId"], work_item_id, task["seq"], task["title"], task["ownerRole"],
-                 task["status"], int(task["required"]), now, now),
-            )
-        _event(connection, work_item_id, request_id, "WORK_ITEM_CREATED", "SYSTEM", actor_id,
-               create_payload)
+            task_rows.append((
+                ("task_id", task["taskId"]), ("work_item_id", work_item_id),
+                ("seq", task["seq"]), ("title", task["title"]),
+                ("owner_role", task["ownerRole"]), ("status", task["status"]),
+                ("required", int(task["required"])), ("created_at", now),
+                ("updated_at", now),
+            ))
+        intent = {
+            "operation": "CREATE_WORK_ITEM", "workItemId": work_item_id,
+            "requestId": request_id, "actorKind": "SYSTEM",
+            "actorId": actor_id, "now": now, "payload": create_payload,
+            "item": (
+                ("work_item_id", work_item_id), ("work_item_type", item_type),
+                ("title", title), ("mode", mode), ("priority", priority),
+                ("current_role", "PLANNER"), ("created_at", now),
+                ("updated_at", now), ("human_gate_policy", policy),
+            ),
+            "tasks": task_rows,
+        }
+        snapshot, plan = workflow_kernel.plan_create_work_item(intent)
+        _kernel_apply(connection, work_item_id, snapshot, plan)
         connection.commit()
         return get_work_item(database, work_item_id)
     except sqlite3.IntegrityError as exc:
@@ -654,16 +652,19 @@ def _align_management_with_item(connection, item, management, now, allow_task_am
     if ((not allow_task_amendment and len(database_tasks) != len(normalized["tasks"])) or
             len(normalized["tasks"]) < len(database_tasks)):
         raise LiteError("management tasks do not match existing WorkItem")
+    task_changes = []
     for actual, contract in zip(database_tasks, normalized["tasks"][:len(database_tasks)]):
         if (actual["task_id"], actual["seq"], actual["owner_role"]) != (
             contract["taskId"], contract["seq"], contract["ownerRole"]
         ):
             raise LiteError("management task identity does not match existing WorkItem")
         if allow_task_amendment:
-            connection.execute(
-                "UPDATE tasks SET title=?,required=?,updated_at=? WHERE task_id=?",
-                (contract["title"], int(contract["required"]), now, actual["task_id"]),
-            )
+            task_changes.append({"kind": "UPDATE", "taskId": actual["task_id"],
+                                 "title": contract["title"],
+                                 "required": contract["required"]})
+            actual.update({"title": contract["title"],
+                           "required": int(contract["required"]),
+                           "updated_at": now})
         elif bool(actual["required"]) != contract["required"]:
             raise LiteError("management task required flag does not match existing WorkItem")
         contract["status"] = actual["status"]
@@ -671,16 +672,19 @@ def _align_management_with_item(connection, item, management, now, allow_task_am
             contract["title"] = actual["title"]
     if allow_task_amendment:
         for contract in normalized["tasks"][len(database_tasks):]:
-            connection.execute(
-                "INSERT INTO tasks(task_id,work_item_id,seq,title,owner_role,status,required,evidence_json,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'NOT_STARTED',?,'[]',?,?)",
-                (contract["taskId"], item["work_item_id"], contract["seq"], contract["title"],
-                 contract["ownerRole"], int(contract["required"]), now, now),
-            )
+            task_changes.append({"kind": "INSERT", "taskId": contract["taskId"],
+                                 "seq": contract["seq"],
+                                 "title": contract["title"],
+                                 "ownerRole": contract["ownerRole"],
+                                 "required": contract["required"]})
             contract["status"] = "NOT_STARTED"
-        database_tasks = [dict(row) for row in connection.execute(
-            "SELECT * FROM tasks WHERE work_item_id=? ORDER BY seq", (item["work_item_id"],)
-        )]
+            database_tasks.append({
+                "task_id": contract["taskId"], "work_item_id": item["work_item_id"],
+                "seq": contract["seq"], "title": contract["title"],
+                "owner_role": contract["ownerRole"], "status": "NOT_STARTED",
+                "required": int(contract["required"]), "evidence_json": "[]",
+                "created_at": now, "updated_at": now,
+            })
     normalized.update({
         "createdAt": item["created_at"], "updatedAt": now, "state": item["state"],
         "queueState": item["queue_state"],
@@ -696,7 +700,7 @@ def _align_management_with_item(connection, item, management, now, allow_task_am
     normalized["statusHistory"] = [{
         "at": item["created_at"], "actor": "SYSTEM", "event": "LEGACY_HISTORY_PRESERVED"
     }]
-    return normalized
+    return normalized, task_changes
 
 
 def backfill_management(database, work_item_id, agent_id, management, basis, request_id=None):
@@ -716,13 +720,20 @@ def backfill_management(database, work_item_id, agent_id, management, basis, req
         if claim is None or claim["role"] not in ("PLANNER", "IMPLEMENTER"):
             raise LiteError("management backfill requires active Planner or Implementer claim")
         now = _now()
-        normalized = _align_management_with_item(connection, item, management, now)
-        _event(connection, work_item_id, request_id, "WORK_ITEM_MANAGEMENT_BACKFILLED", "AGENT",
-               agent_id, {"management": normalized, "basis": basis})
-        connection.execute(
-            "UPDATE work_items SET row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (now, work_item_id),
+        normalized, unused_changes = _align_management_with_item(
+            connection, item, management, now
         )
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
+        intent = {
+            "operation": "BACKFILL_MANAGEMENT", "workItemId": work_item_id,
+            "requestId": request_id, "actorKind": "AGENT", "actorId": agent_id,
+            "now": now, "taskChanges": (),
+            "payload": {"management": normalized, "basis": basis},
+        }
+        _kernel_apply(connection, work_item_id, snapshot,
+                      workflow_kernel.plan_management(snapshot, intent),
+                      evaluation_time=now)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -741,10 +752,13 @@ def amend_management(database, work_item_id, human_id, management, reason, reque
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
         previous = _management_from_events(connection, work_item_id)
+        now = _now()
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         if previous is None:
             raise LiteError("management envelope must be backfilled before amendment")
         now = _now()
-        normalized = _align_management_with_item(
+        normalized, task_changes = _align_management_with_item(
             connection, item, management, now, allow_task_amendment=True
         )
         protected = (
@@ -757,13 +771,16 @@ def amend_management(database, work_item_id, human_id, management, reason, reque
         }
         if not changes:
             raise LiteError("management amendment has no changes")
-        _event(connection, work_item_id, request_id, "WORK_ITEM_MANAGEMENT_AMENDED", "HUMAN",
-               human_id, {"management": normalized, "changes": changes, "reason": reason,
-                          "authorizedBy": human_id})
-        connection.execute(
-            "UPDATE work_items SET row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (now, work_item_id),
-        )
+        intent = {
+            "operation": "AMEND_MANAGEMENT", "workItemId": work_item_id,
+            "requestId": request_id, "actorKind": "HUMAN", "actorId": human_id,
+            "now": now, "taskChanges": task_changes,
+            "payload": {"management": normalized, "changes": changes,
+                        "reason": reason, "authorizedBy": human_id},
+        }
+        _kernel_apply(connection, work_item_id, snapshot,
+                      workflow_kernel.plan_management(snapshot, intent),
+                      evaluation_time=now)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -771,24 +788,6 @@ def amend_management(database, work_item_id, human_id, management, reason, reque
         raise
     finally:
         connection.close()
-
-
-def _expire_claims(connection, work_item_id, now):
-    rows = connection.execute(
-        "SELECT claim_id,work_item_id,agent_id,generation,expires_at FROM claims "
-        "WHERE work_item_id=? AND status='ACTIVE' AND expires_at<=?",
-        (work_item_id, now),
-    ).fetchall()
-    connection.execute(
-        "UPDATE claims SET status='EXPIRED',released_at=? "
-        "WHERE work_item_id=? AND status='ACTIVE' AND expires_at<=?",
-        (now, work_item_id, now),
-    )
-    return [{"kind": "AGENT_CLAIM", "resourceId": row["claim_id"],
-             "workItemId": row["work_item_id"], "ownerId": row["agent_id"],
-             "generation": row["generation"], "expiresAt": row["expires_at"],
-             "beforeStatus": "ACTIVE", "effectiveStatus": "STALE",
-             "afterStatus": "EXPIRED"} for row in rows]
 
 
 def _validate_orchestrator_fence(connection, work_item_id, orchestrator_id,
@@ -857,10 +856,20 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
         now = _now()
+        if not isinstance(expires_at, str) or expires_at <= now:
+            raise LiteError("claim expiry must be in the future")
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         _validate_orchestrator_fence(
             connection, work_item_id, orchestrator_id, orchestrator_generation, now
         )
-        reconciled = _expire_claims(connection, work_item_id, now)
+        stale = connection.execute(
+            "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE' "
+            "AND expires_at<=? LIMIT 1", (work_item_id, now),
+        ).fetchone()
+        if stale is not None:
+            raise LiteError("EXPIRED_ACTIVITY_RECONCILIATION_REQUIRED")
+        reconciled = []
         active = connection.execute(
             "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE'", (work_item_id,)
         ).fetchone()
@@ -875,6 +884,8 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
         ).fetchone()
         if task is None or task["owner_role"] != role:
             raise LiteError("task role does not match")
+        if task["status"] != "NOT_STARTED":
+            raise LiteError("claim requires an exact NOT_STARTED task")
         if role == "REVIEWER" and item["state"] == "PLAN_REVIEW_PENDING":
             artifact_head = _plan_artifact_head(connection, work_item_id)
             if artifact_head is not None:
@@ -890,17 +901,17 @@ def acquire_claim(database, work_item_id, task_id, agent_id, role, expires_at,
             "SELECT coalesce(max(generation),0)+1 FROM claims WHERE work_item_id=?", (work_item_id,)
         ).fetchone()[0]
         claim_id = _id("claim")
-        connection.execute(
-            "INSERT INTO claims VALUES(?,?,?,?,? ,?,'ACTIVE',?,?,NULL)",
-            (claim_id, work_item_id, task_id, agent_id, role, generation, now, expires_at),
-        )
-        connection.execute(
-            "UPDATE work_items SET queue_state='CLAIMED',current_role=?,row_version=row_version+1,updated_at=? "
-            "WHERE work_item_id=?", (role, now, work_item_id),
-        )
-        _event(connection, work_item_id, request_id, "CLAIM_ACQUIRED", "AGENT", agent_id,
-               {"claimId": claim_id, "taskId": task_id, "role": role,
-                "generation": generation, "reconciledActivity": reconciled})
+        intent = {
+            "operation": "CLAIM_ROLE", "workItemId": work_item_id,
+            "taskId": task_id, "claimId": claim_id, "actorKind": "AGENT",
+            "actorId": agent_id, "role": role, "generation": generation,
+            "expiresAt": expires_at, "requestId": request_id, "now": now,
+            "orchestratorId": orchestrator_id,
+            "orchestratorGeneration": orchestrator_generation,
+        }
+        plan = workflow_kernel.plan_claim_role(snapshot, intent)
+        _kernel_apply(connection, work_item_id, snapshot, plan,
+                      evaluation_time=now)
         if all(usage_values) and usage_policy == "BEST_EFFORT":
             try:
                 from .usage import record_binding
@@ -944,6 +955,9 @@ def release_claim(database, work_item_id, agent_id, request_id=None,
     try:
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
+        now = _now()
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         claim = connection.execute(
             "SELECT * FROM claims WHERE work_item_id=? AND status='ACTIVE'", (work_item_id,)
         ).fetchone()
@@ -954,15 +968,17 @@ def release_claim(database, work_item_id, agent_id, request_id=None,
             (work_item_id, agent_id),
         ).fetchone():
             raise LiteError("release repository lock before WorkItem claim")
-        now = _now()
-        connection.execute("UPDATE claims SET status='RELEASED',released_at=? WHERE claim_id=?", (now, claim["claim_id"]))
         queue = item["queue_state"] if item["queue_state"] in ("WAITING_HUMAN", "HELD", "BLOCKED") else "CLAIMABLE"
-        connection.execute(
-            "UPDATE work_items SET queue_state=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (queue, now, work_item_id),
-        )
-        _event(connection, work_item_id, request_id, "CLAIM_RELEASED", "AGENT", agent_id,
-               {"claimId": claim["claim_id"], "generation": claim["generation"]})
+        intent = {
+            "operation": "RELEASE_ROLE", "workItemId": work_item_id,
+            "taskId": claim["task_id"], "claimId": claim["claim_id"],
+            "actorKind": "AGENT", "actorId": agent_id,
+            "generation": claim["generation"], "requestId": request_id,
+            "now": now, "queue": queue, "role": item["current_role"],
+        }
+        plan = workflow_kernel.plan_release_role(snapshot, intent)
+        _kernel_apply(connection, work_item_id, snapshot, plan,
+                      evaluation_time=now)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -977,23 +993,24 @@ def acquire_repository_lock(database, work_item_id, repository_key, agent_id, ex
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        now = _now()
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         claim = connection.execute(
             "SELECT * FROM claims WHERE work_item_id=? AND agent_id=? AND status='ACTIVE'",
             (work_item_id, agent_id),
         ).fetchone()
         if claim is None or claim["role"] not in ("PLANNER", "IMPLEMENTER"):
             raise LiteError("repository lock requires Planner or Implementer claim")
-        now = _now()
+        if not isinstance(expires_at, str) or expires_at <= now:
+            raise LiteError("repository writer expiry must be in the future")
         stale = connection.execute(
             "SELECT lock_id,work_item_id,agent_id,generation,expires_at "
             "FROM repository_locks WHERE repository_key=? AND status='ACTIVE' "
             "AND expires_at<=?", (repository_key, now),
         ).fetchall()
-        connection.execute(
-            "UPDATE repository_locks SET status='EXPIRED',released_at=? "
-            "WHERE repository_key=? AND status='ACTIVE' AND expires_at<=?",
-            (now, repository_key, now),
-        )
+        if stale:
+            raise LiteError("EXPIRED_ACTIVITY_RECONCILIATION_REQUIRED")
         if connection.execute(
             "SELECT 1 FROM repository_locks WHERE repository_key=? AND status='ACTIVE'",
             (repository_key,),
@@ -1004,19 +1021,16 @@ def acquire_repository_lock(database, work_item_id, repository_key, agent_id, ex
             (repository_key,),
         ).fetchone()[0]
         lock_id = _id("repo")
-        connection.execute(
-            "INSERT INTO repository_locks VALUES(?,?,?,?,?,'ACTIVE',?,?,NULL)",
-            (lock_id, repository_key, work_item_id, agent_id, generation, now, expires_at),
-        )
-        _event(connection, work_item_id, request_id, "REPOSITORY_LOCK_ACQUIRED", "AGENT", agent_id,
-               {"repositoryKey": repository_key, "generation": generation,
-                "reconciledActivity": [
-                    {"kind": "REPOSITORY_WRITER", "resourceId": row["lock_id"],
-                     "workItemId": row["work_item_id"], "ownerId": row["agent_id"],
-                     "generation": row["generation"], "expiresAt": row["expires_at"],
-                     "beforeStatus": "ACTIVE", "effectiveStatus": "STALE",
-                     "afterStatus": "EXPIRED"} for row in stale
-                ]})
+        intent = {
+            "operation": "ACQUIRE_WRITER", "workItemId": work_item_id,
+            "repositoryKey": repository_key, "lockId": lock_id,
+            "actorKind": "AGENT", "actorId": agent_id,
+            "generation": generation, "expiresAt": expires_at,
+            "requestId": request_id, "now": now,
+        }
+        plan = workflow_kernel.plan_writer(snapshot, intent, True)
+        _kernel_apply(connection, work_item_id, snapshot, plan,
+                      evaluation_time=now)
         connection.commit()
         return {"lockId": lock_id, "generation": generation}
     except Exception:
@@ -1032,6 +1046,9 @@ def release_repository_lock(database, work_item_id, repository_key, agent_id,
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        now = _now()
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         lock = connection.execute(
             "SELECT * FROM repository_locks WHERE repository_key=? AND work_item_id=? "
             "AND agent_id=? AND status='ACTIVE'",
@@ -1039,13 +1056,16 @@ def release_repository_lock(database, work_item_id, repository_key, agent_id,
         ).fetchone()
         if lock is None:
             raise LiteError("active repository lock is not owned by agent")
-        now = _now()
-        connection.execute(
-            "UPDATE repository_locks SET status='RELEASED',released_at=? WHERE lock_id=?",
-            (now, lock["lock_id"]),
-        )
-        _event(connection, work_item_id, request_id, "REPOSITORY_LOCK_RELEASED", "AGENT", agent_id,
-               {"repositoryKey": repository_key, "generation": lock["generation"]})
+        intent = {
+            "operation": "RELEASE_WRITER", "workItemId": work_item_id,
+            "repositoryKey": repository_key, "lockId": lock["lock_id"],
+            "actorKind": "AGENT", "actorId": agent_id,
+            "generation": lock["generation"], "requestId": request_id,
+            "now": now,
+        }
+        plan = workflow_kernel.plan_writer(snapshot, intent, False)
+        _kernel_apply(connection, work_item_id, snapshot, plan,
+                      evaluation_time=now)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -1063,6 +1083,9 @@ def set_task_status(database, work_item_id, task_id, agent_id, status, evidence=
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        now = _now()
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         claim = connection.execute(
             "SELECT * FROM claims WHERE work_item_id=? AND task_id=? AND agent_id=? AND status='ACTIVE'",
             (work_item_id, task_id, agent_id),
@@ -1074,10 +1097,17 @@ def set_task_status(database, work_item_id, task_id, agent_id, status, evidence=
         task = connection.execute(
             "SELECT * FROM tasks WHERE task_id=? AND work_item_id=?", (task_id, work_item_id)
         ).fetchone()
+        if task["owner_role"] == "REVIEWER":
+            raise LiteError("REVIEWER_TASK_MANAGED_BY_CLAIM")
+        if task["status"] == "IN_PROGRESS" and status == "IN_PROGRESS":
+            connection.rollback()
+            return
+        if status in ("COMPLETED", "WAITING_ACCEPTANCE"):
+            raise LiteError("USE_WORKFLOW_ADVANCE")
         allowed = {
             "NOT_STARTED": {"IN_PROGRESS"},
-            "IN_PROGRESS": {"WAITING_ACCEPTANCE", "COMPLETED", "BLOCKED", "CANCELLED"},
-            "WAITING_ACCEPTANCE": {"IN_PROGRESS", "COMPLETED"},
+            "IN_PROGRESS": {"BLOCKED", "CANCELLED"},
+            "WAITING_ACCEPTANCE": set(),
             "BLOCKED": set(), "COMPLETED": set(), "CANCELLED": set(),
         }
         if status not in allowed[task["status"]]:
@@ -1097,20 +1127,23 @@ def set_task_status(database, work_item_id, task_id, agent_id, status, evidence=
         except (TypeError, ValueError):
             previous_evidence = []
         full_evidence = previous_evidence + list(evidence)
-        now = _now()
-        connection.execute(
-            "UPDATE tasks SET status=?,evidence_json=?,updated_at=? WHERE task_id=? AND work_item_id=?",
-            (status, _json(full_evidence), now, task_id, work_item_id),
-        )
-        queue = "BLOCKED" if status == "BLOCKED" else "CLAIMED"
-        blocked = "TASK_BLOCKED" if status == "BLOCKED" else None
-        connection.execute(
-            "UPDATE work_items SET queue_state=?,blocked_reason=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (queue, blocked, now, work_item_id),
-        )
-        _event(connection, work_item_id, request_id, "TASK_STATUS_CHANGED", "AGENT", agent_id,
-               {"taskId": task_id, "from": task["status"], "status": status,
-                "evidence": full_evidence})
+        writers = [{"lockId": row["lock_id"], "generation": row["generation"]}
+                   for row in connection.execute(
+                       "SELECT lock_id,generation FROM repository_locks "
+                       "WHERE work_item_id=? AND agent_id=? AND status='ACTIVE'",
+                       (work_item_id, agent_id))]
+        intent = {
+            "operation": "BLOCK", "workItemId": work_item_id,
+            "taskId": task_id, "fromStatus": task["status"],
+            "status": status, "evidence": full_evidence,
+            "claimId": claim["claim_id"],
+            "claimGeneration": claim["generation"], "writers": writers,
+            "role": task["owner_role"], "actorKind": "AGENT",
+            "actorId": agent_id, "requestId": request_id, "now": now,
+        }
+        plan = workflow_kernel.plan_task_status(snapshot, intent)
+        _kernel_apply(connection, work_item_id, snapshot, plan,
+                      evaluation_time=now)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -1127,13 +1160,6 @@ def _active_claim(connection, work_item_id, role, agent_id):
     if row is None:
         raise LiteError("transition requires active role claim")
     return row
-
-
-def _release_active(connection, work_item_id, now):
-    connection.execute(
-        "UPDATE claims SET status='RELEASED',released_at=? WHERE work_item_id=? AND status='ACTIVE'",
-        (now, work_item_id),
-    )
 
 
 def _latest_submission_baseline(connection, work_item_id):
@@ -1305,23 +1331,27 @@ def _next_plan_artifact(connection, work_item_id, agent_id, artifact):
 
 def transition(database, work_item_id, action, agent_id, request_id=None,
                local_tests_passed=False, submission=None, quality_baseline=None,
-               usage_policy="BEST_EFFORT", plan_artifact=None):
+               usage_policy="BEST_EFFORT", plan_artifact=None,
+               candidate_id=None, candidate_fingerprint=None):
     _usage_sync_boundary(database, work_item_id, usage_policy)
     request_id = request_id or _id(action)
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
+        now = _now()
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         if _management_from_events(connection, work_item_id) is None:
             raise LiteError("management envelope must be backfilled before transition")
-        now = _now()
         artifact_event = None
         if action == "submit_plan":
-            _active_claim(connection, work_item_id, "PLANNER", agent_id)
+            active_claim = _active_claim(connection, work_item_id, "PLANNER", agent_id)
             if item["state"] != "DRAFT":
                 raise LiteError("submit_plan requires DRAFT")
             pending = connection.execute(
-                "SELECT count(*) FROM tasks WHERE work_item_id=? AND owner_role='PLANNER' AND required=1 AND status<>'COMPLETED'",
+                "SELECT count(*) FROM tasks WHERE work_item_id=? AND owner_role='PLANNER' "
+                "AND required=1 AND status NOT IN ('IN_PROGRESS','COMPLETED')",
                 (work_item_id,),
             ).fetchone()[0]
             if pending:
@@ -1336,17 +1366,18 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
             new_state, queue, role = "PLAN_REVIEW_PENDING", "CLAIMABLE", "REVIEWER"
             release_after = True
         elif action == "start_implementation":
-            _active_claim(connection, work_item_id, "IMPLEMENTER", agent_id)
+            active_claim = _active_claim(connection, work_item_id, "IMPLEMENTER", agent_id)
             if item["state"] != "PLAN_REVIEW_APPROVED":
                 raise LiteError("implementation requires approved plan")
             new_state, queue, role = "IMPLEMENTING", "CLAIMED", "IMPLEMENTER"
             release_after = False
         elif action == "submit_implementation":
-            _active_claim(connection, work_item_id, "IMPLEMENTER", agent_id)
+            active_claim = _active_claim(connection, work_item_id, "IMPLEMENTER", agent_id)
             if item["state"] != "IMPLEMENTING":
                 raise LiteError("submit_implementation requires IMPLEMENTING")
             pending = connection.execute(
-                "SELECT count(*) FROM tasks WHERE work_item_id=? AND owner_role='IMPLEMENTER' AND required=1 AND status<>'COMPLETED'",
+                "SELECT count(*) FROM tasks WHERE work_item_id=? AND owner_role='IMPLEMENTER' "
+                "AND required=1 AND status NOT IN ('IN_PROGRESS','COMPLETED')",
                 (work_item_id,),
             ).fetchone()[0]
             if pending or not local_tests_passed:
@@ -1354,32 +1385,50 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
             quality_baseline = _validate_quality_baseline(
                 connection, work_item_id, quality_baseline
             )
+            from .candidate import release_submission_candidate
+            release_candidate = release_submission_candidate(connection, work_item_id)
+            if release_candidate is not None:
+                if (candidate_id != release_candidate["candidateId"] or
+                        candidate_fingerprint != release_candidate["candidateFingerprint"]):
+                    raise LiteError("Release submission requires the exact FROZEN+BUILT candidate")
+                modified = sorted(quality_baseline.get("modifiedScope", []))
+                if modified != sorted(release_candidate["changedPaths"]):
+                    raise LiteError("Release quality modifiedScope must equal the frozen allowlist")
+            elif candidate_id is not None or candidate_fingerprint is not None:
+                raise LiteError("ordinary WorkItem must not provide candidate flags")
             new_state, queue, role = "IMPLEMENTATION_COMPLETED", "CLAIMABLE", "REVIEWER"
             release_after = True
         else:
             raise LiteError("unknown transition")
-        if release_after and connection.execute(
-            "SELECT 1 FROM repository_locks WHERE work_item_id=? AND agent_id=? AND status='ACTIVE'",
-            (work_item_id, agent_id),
-        ).fetchone():
-            raise LiteError("release repository lock before submitting work")
-        if release_after:
-            _release_active(connection, work_item_id, now)
-        connection.execute(
-            "UPDATE work_items SET state=?,queue_state=?,current_role=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (new_state, queue, role, now, work_item_id),
-        )
         payload = {"from": item["state"], "to": new_state}
         if submission is not None:
             payload["submission"] = submission
         if quality_baseline is not None:
             payload["qualityBaseline"] = quality_baseline
+        if action == "submit_implementation" and release_candidate is not None:
+            payload["reviewedCandidate"] = release_candidate
         if artifact_event is not None:
             payload["planArtifact"] = artifact_event
-        _event(connection, work_item_id, request_id, action.upper(), "AGENT", agent_id, payload)
-        if artifact_event is not None:
-            _event(connection, work_item_id, request_id + "-artifact", "PLAN_ARTIFACT_HEAD",
-                   "AGENT", agent_id, artifact_event)
+        writers = [{"lockId": row["lock_id"], "generation": row["generation"]}
+                   for row in connection.execute(
+                       "SELECT lock_id,generation FROM repository_locks "
+                       "WHERE work_item_id=? AND agent_id=? AND status='ACTIVE'",
+                       (work_item_id, agent_id))]
+        intent = {
+            "operation": {"submit_plan": "SUBMIT_PLAN",
+                          "start_implementation": "BEGIN_IMPLEMENTATION",
+                          "submit_implementation": "SUBMIT_IMPLEMENTATION"}[action],
+            "workItemId": work_item_id, "taskId": active_claim["task_id"],
+            "claimId": active_claim["claim_id"],
+            "claimGeneration": active_claim["generation"], "writers": writers,
+            "state": new_state, "queue": queue, "role": role,
+            "eventType": action.upper(), "payload": payload,
+            "artifact": artifact_event, "actorKind": "AGENT",
+            "actorId": agent_id, "requestId": request_id, "now": now,
+        }
+        plan = workflow_kernel.plan_legacy_transition(snapshot, intent)
+        _kernel_apply(connection, work_item_id, snapshot, plan,
+                      evaluation_time=now)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -1397,6 +1446,27 @@ def _decoded_review(row):
     if (isinstance(value, dict) and
             value.get("protocolVersion") in ("AWB-REVIEW-v1", REVIEW_V2_PROTOCOL)):
         return value
+    # Public b3-b6 accepted this closed pre-protocol JSON shape.  Preserve every
+    # verifiable field and infer only the stage that was stored separately in
+    # the review row.  Unknown near-matches remain LEGACY/round=None and are
+    # rejected by the invariant validator instead of being blanket-skipped.
+    legacy_required = {
+        "result", "round", "reviewerMode", "findings",
+        "resolvedFindingIds", "nonBlockingSuggestions",
+    }
+    if (isinstance(value, dict) and legacy_required.issubset(value) and
+            value.get("result") in ("PASS", "REVISE", "BLOCKED") and
+            type(value.get("round")) is int and
+            value.get("reviewerMode") in ("ORDINARY", "CONVERGENCE") and
+            isinstance(value.get("findings"), list) and
+            isinstance(value.get("resolvedFindingIds"), list) and
+            isinstance(value.get("nonBlockingSuggestions"), list)):
+        normalized = dict(value)
+        normalized.update({
+            "protocolVersion": "AWB-LEGACY-REVIEW-v1",
+            "stage": ("IMPLEMENTATION" if row["stage"] == "FINAL" else "PLAN"),
+        })
+        return normalized
     return {
         "protocolVersion": "LEGACY", "stage": "IMPLEMENTATION" if row["stage"] == "FINAL" else "PLAN",
         "result": "PASS" if row["decision"] == "APPROVED" else "REVISE",
@@ -1581,6 +1651,20 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
     if opt_in:
         normalized["reviewedArtifact"] = expected_artifact
         normalized["amendments"] = []
+    if stage == "FINAL":
+        submission = connection.execute(
+            "SELECT payload_json FROM events WHERE work_item_id=? "
+            "AND event_type='SUBMIT_IMPLEMENTATION' ORDER BY event_id DESC LIMIT 1",
+            (work_item_id,),
+        ).fetchone()
+        try:
+            reviewed_candidate = json.loads(submission[0]).get("reviewedCandidate") if submission else None
+        except (TypeError, ValueError):
+            reviewed_candidate = None
+        if reviewed_candidate is not None:
+            if incoming.get("reviewedCandidate") != reviewed_candidate:
+                raise LiteError("Release review must identify the exact submitted candidate")
+            normalized["reviewedCandidate"] = reviewed_candidate
     return normalized
 
 
@@ -1621,7 +1705,8 @@ def _quality_baseline_is_auto_safe(baseline, management):
     )
 
 
-def _approved_gate_preconditions(connection, item, stage):
+def _approved_gate_preconditions(connection, item, stage,
+                                 pending_publication_postflight=False):
     expected = "PLAN_REVIEW_PENDING" if stage == "PLAN" else "IMPLEMENTATION_COMPLETED"
     if item["mode"] != "STANDARD" or item["state"] != expected:
         raise LiteError("gate stage is invalid")
@@ -1636,6 +1721,29 @@ def _approved_gate_preconditions(connection, item, stage):
     if projection[projected_stage]["openFindings"]:
         raise LiteError("approval requires no open {0} Findings".format(projected_stage.lower()))
     if stage == "FINAL":
+        submission = connection.execute(
+            "SELECT event_id,payload_json FROM events WHERE work_item_id=? "
+            "AND event_type='SUBMIT_IMPLEMENTATION' ORDER BY event_id DESC LIMIT 1",
+            (item["work_item_id"],),
+        ).fetchone()
+        try:
+            release_candidate = json.loads(submission["payload_json"]).get("reviewedCandidate") if submission else None
+        except (TypeError, ValueError):
+            release_candidate = None
+        if release_candidate is not None:
+            ready = connection.execute(
+                "SELECT event_id FROM events WHERE work_item_id=? AND event_type='PUBLICATION_READY' "
+                "ORDER BY event_id DESC LIMIT 1", (item["work_item_id"],)
+            ).fetchone()
+            postflight = connection.execute(
+                "SELECT event_id FROM events WHERE work_item_id=? "
+                "AND event_type='PUBLICATION_POSTFLIGHT_ACCEPTED' ORDER BY event_id DESC LIMIT 1",
+                (item["work_item_id"],),
+            ).fetchone()
+            if (ready is None or
+                    (not pending_publication_postflight and
+                     (postflight is None or postflight["event_id"] < ready["event_id"]))):
+                raise LiteError("Release FINAL requires exact accepted publication postflight")
         pending = connection.execute(
             "SELECT count(*) FROM tasks WHERE work_item_id=? AND required=1 AND status<>'COMPLETED'",
             (item["work_item_id"],),
@@ -1647,32 +1755,6 @@ def _approved_gate_preconditions(connection, item, stage):
         if not _quality_baseline_is_auto_safe(baseline, management or {}):
             raise LiteError("final approval requires passing implementation quality evidence")
     return review
-
-
-def _approve_gate(connection, item, stage, now, trigger_request_id,
-                  reviewer_claim=None):
-    _approved_gate_preconditions(connection, item, stage)
-    if stage == "PLAN":
-        state, queue, role, held, closed = (
-            "PLAN_REVIEW_APPROVED", "CLAIMABLE", "IMPLEMENTER", None, None
-        )
-    else:
-        state, queue, role, held, closed = (
-            "FINAL_ACCEPTANCE_APPROVED", "HELD", None, "TERMINAL_STATE", now
-        )
-    connection.execute(
-        "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,"
-        "blocked_reason=NULL,closed_at=?,row_version=row_version+1,updated_at=? "
-        "WHERE work_item_id=?",
-        (state, queue, role, held, closed, now, item["work_item_id"]),
-    )
-    if stage == "FINAL":
-        from .orchestrator import reconcile_terminal_activity
-        reconcile_terminal_activity(
-            connection, item["work_item_id"], now,
-            trigger_request_id + "-terminal-activity",
-            reviewer_claim=reviewer_claim,
-        )
 
 
 def _reviewer_claim_identity(row):
@@ -1755,6 +1837,53 @@ def _auto_gate_context(connection, work_item_id):
     }
 
 
+def _review_materialized(connection, work_item_id, request_id):
+    """Fault-injection seam after a complete review plan and before commit."""
+    return None
+
+
+def _terminal_resource_projection(snapshot, reviewer_claim):
+    resources = []
+    for collection, kind, owner_kind, safe in (
+            ("writers", "REPOSITORY_WRITER", "AGENT",
+             "RELEASE_REPOSITORY_WRITER_BY_OWNER"),
+            ("leases", "ORCHESTRATOR_LEASE", "ORCHESTRATOR",
+             "RELEASE_ORCHESTRATOR_LEASE_BY_OWNER")):
+        for value in snapshot[collection]:
+            if value["status"] != "ACTIVE":
+                continue
+            projected = {
+                "kind": kind, "resourceId": value["id"],
+                "workItemId": snapshot["workItem"]["work_item_id"],
+                "ownerKind": owner_kind, "ownerId": value["owner"],
+                "generation": value["generation"],
+                "expiresAt": value["expiresAt"],
+                "persistedStatus": "ACTIVE",
+                "effectiveStatus": value["effectiveStatus"],
+                "terminal": False,
+                "reasonCode": "LIVE_ACTIVITY_HELD" if
+                value["effectiveStatus"] == "LIVE" else "EXPIRED_ACTIVITY_RESIDUE",
+                "safeAction": safe if value["effectiveStatus"] == "LIVE" else
+                "RECONCILE_EXPIRED_ACTIVITY",
+                "afterStatus": "RELEASED" if value["effectiveStatus"] == "LIVE"
+                else "EXPIRED", "mutated": True,
+            }
+            resources.append(projected)
+    resources.append({
+        "kind": "AGENT_CLAIM", "resourceId": reviewer_claim["claimId"],
+        "workItemId": reviewer_claim["workItemId"],
+        "taskId": reviewer_claim["taskId"], "ownerKind": "AGENT",
+        "ownerId": reviewer_claim["agentId"], "role": reviewer_claim["role"],
+        "generation": reviewer_claim["generation"],
+        "releasedAt": reviewer_claim["releasedAt"],
+        "persistedStatus": "RELEASED", "beforeStatus": "RELEASED",
+        "effectiveStatus": "INACTIVE", "afterStatus": "RELEASED",
+        "terminal": True, "reasonCode": None, "safeAction": "NONE",
+        "mutated": False, "source": "FINAL_REVIEW_CLAIM",
+    })
+    return resources
+
+
 def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decision, summary,
                         request_id=None, usage_policy="BEST_EFFORT"):
     _usage_sync_boundary(database, work_item_id, usage_policy)
@@ -1782,6 +1911,9 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
             connection.rollback()
             return get_work_item(database, work_item_id)
         item = _item(connection, work_item_id)
+        now = _now()
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre",
+                                  evaluation_time=now)
         reviewer_claim_row = _active_claim(
             connection, work_item_id, "REVIEWER", reviewer_agent_id
         )
@@ -1798,116 +1930,130 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
         if author is not None and author[0] == reviewer_agent_id:
             raise LiteError("author cannot review own work")
         review = _normalize_review(connection, work_item_id, stage, decision, summary)
+        reviewed_candidate = review.get("reviewedCandidate") if stage == "FINAL" else None
+        release_review = reviewed_candidate is not None
         stored_decision = "APPROVED" if review["result"] == "PASS" else "REJECTED"
-        now = _now()
         review_id = _id("review")
-        connection.execute(
-            "INSERT INTO reviews VALUES(?,?,?,?,?,?,?)",
-            (review_id, work_item_id, stage, reviewer_agent_id, stored_decision, _json(review), now),
-        )
         result = review["result"]
         round_number = review["round"]
         policy = item["human_gate_policy"] if "human_gate_policy" in item.keys() else "MANUAL"
-        if result == "PASS" and item["mode"] == "STANDARD":
-            state, queue, role = item["state"], "WAITING_HUMAN", None
-        elif result == "PASS":
-            state, queue, role = "PLAN_REVIEW_APPROVED", "HELD", None
-        elif result == "BLOCKED":
-            state, queue, role = item["state"], "BLOCKED", None
-        elif result == "WAITING_HUMAN" or (round_number == 5 and result == "REVISE"):
-            state, queue, role = item["state"], "WAITING_HUMAN", None
-        elif (round_number == 3 and
-              result in ("REVISE", "REVISE_TO_PLANNER")):
-            state, queue, role = item["state"], "CLAIMABLE", "REVIEWER"
-        else:
-            state = "DRAFT" if stage == "PLAN" else "IMPLEMENTING"
-            queue, role = "CLAIMABLE", author_role
-            connection.execute(
-                "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? AND owner_role=?",
-                (now, work_item_id, author_role),
-            )
-        reviewer_status = None
-        if result == "PASS" and (stage == "FINAL" or item["mode"] == "READ_ONLY_DIAGNOSIS"):
-            reviewer_status = "COMPLETED"
-        elif queue == "BLOCKED":
-            reviewer_status = "BLOCKED"
-        elif queue == "WAITING_HUMAN" and result != "PASS":
-            reviewer_status = "WAITING_ACCEPTANCE"
-        if reviewer_status:
-            connection.execute(
-                "UPDATE tasks SET status=?,evidence_json=?,updated_at=? WHERE work_item_id=? AND owner_role='REVIEWER'",
-                (reviewer_status, _json([{"reviewRound": round_number, "result": result}]), now,
-                 work_item_id),
-            )
+        route = workflow_kernel.review_route(
+            stage, result, round_number, item["mode"], policy,
+            release_review=release_review,
+        )
+        state = route["state"] or item["state"]
+        queue, role = route["queue"], route["role"]
+        reviewer_status = route["reviewerTask"]
         auto_approved = False
         auto_gate_failure = None
-        final_reviewer_claim = None
+        final_reviewer_claim = _reviewer_claim_identity(dict(reviewer_claim_row))
+        final_reviewer_claim.update({"status": "RELEASED", "releasedAt": now})
         if (result == "PASS" and item["mode"] == "STANDARD" and
                 policy == "AUTO_ON_PASS" and item["queue_state"] == "CLAIMED" and
-                item["held_reason"] is None and item["blocked_reason"] is None):
-            try:
-                if stage == "FINAL":
-                    connection.execute(
-                        "UPDATE claims SET status='RELEASED',released_at=? "
-                        "WHERE claim_id=? AND status='ACTIVE'",
-                        (now, reviewer_claim_row["claim_id"]),
-                    )
-                    final_reviewer_claim = _reviewer_claim_identity(
-                        connection.execute(
-                            "SELECT * FROM claims WHERE claim_id=?",
-                            (reviewer_claim_row["claim_id"],),
-                        ).fetchone()
-                    )
-                _approve_gate(
-                    connection, item, stage, now, request_id,
-                    reviewer_claim=final_reviewer_claim,
-                )
+                item["held_reason"] is None and item["blocked_reason"] is None and
+                not release_review):
+            if stage == "FINAL":
+                baseline = _latest_submission_baseline(connection, work_item_id)
+                management = _management_from_events(connection, work_item_id) or {}
+                pending = connection.execute(
+                    "SELECT count(*) FROM tasks WHERE work_item_id=? AND required=1 "
+                    "AND owner_role<>'REVIEWER' AND status<>'COMPLETED'",
+                    (work_item_id,),
+                ).fetchone()[0]
+                if pending or not _quality_baseline_is_auto_safe(baseline, management):
+                    auto_gate_failure = (
+                        "final approval requires passing implementation quality evidence")
+                else:
+                    auto_approved = True
+            else:
                 auto_approved = True
-            except LiteError as exc:
-                # The independent PASS remains recorded, but runtime drift or
-                # incomplete quality evidence deliberately falls back to HUMAN.
-                auto_gate_failure = str(exc)
-        if not (auto_approved and stage == "FINAL"):
-            _release_active(connection, work_item_id, now)
-        if result == "PASS" and stage == "FINAL" and final_reviewer_claim is None:
-            final_reviewer_claim = _reviewer_claim_identity(
-                connection.execute(
-                    "SELECT * FROM claims WHERE claim_id=?",
-                    (reviewer_claim_row["claim_id"],),
-                ).fetchone()
-            )
-        if not auto_approved:
-            connection.execute(
-                "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,"
-                "blocked_reason=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-                (state, queue, role, "TARGET_REACHED" if queue == "HELD" else None,
-                 "REVIEW_BLOCKED" if queue == "BLOCKED" else None, now, work_item_id),
-            )
-        review_payload = {"decision": stored_decision, "review": review,
+        if release_review and result == "PASS":
+            state, queue, role = "IMPLEMENTATION_COMPLETED", "WAITING_HUMAN", None
+        review_payload = {"eventProtocolVersion": "AWB-REVIEW-EVENT-v7",
+                          "decision": stored_decision, "review": review,
                           "requestFingerprint": fingerprint}
-        if final_reviewer_claim is not None:
+        if stage == "FINAL":
             review_payload["reviewerClaim"] = final_reviewer_claim
         if auto_gate_failure:
             review_payload["autoGate"] = {
                 "status": "FAIL_CLOSED", "reason": auto_gate_failure,
             }
-        _event(connection, work_item_id, request_id, "AGENT_{0}_REVIEW".format(stage), "AGENT",
-               reviewer_agent_id, review_payload)
+        next_event_id = connection.execute(
+            "SELECT coalesce(max(event_id),0)+1 FROM events"
+        ).fetchone()[0]
+        ready_payload = None
+        if release_review and result == "PASS":
+            ready_payload = {
+                "protocolVersion": "AWB-PUBLICATION-READY-v1",
+                "candidateId": reviewed_candidate["candidateId"],
+                "candidateFingerprint": reviewed_candidate["candidateFingerprint"],
+                "buildFingerprint": reviewed_candidate["buildFingerprint"],
+                "submissionEventId": connection.execute(
+                    "SELECT event_id FROM events WHERE work_item_id=? "
+                    "AND event_type='SUBMIT_IMPLEMENTATION' ORDER BY event_id DESC LIMIT 1",
+                    (work_item_id,),
+                ).fetchone()[0],
+                "reviewId": review_id, "reviewEventId": next_event_id,
+                "reviewRequestId": request_id, "reviewRound": round_number,
+                "reviewerAgentId": reviewer_agent_id,
+                "rowVersion": item["row_version"] + 1,
+            }
+            ready_payload["readyFingerprint"] = _sha(_json(ready_payload))
+        auto_payload = None
+        terminal_resources = None
         if auto_approved:
-            review_event = connection.execute(
-                "SELECT event_id FROM events WHERE request_id=?", (request_id,)
-            ).fetchone()[0]
-            payload = {
+            auto_payload = {
                 "policy": policy, "stage": stage, "reviewId": review_id,
                 "reviewRound": round_number, "reviewRequestId": request_id,
-                "reviewEventId": review_event,
+                "reviewEventId": next_event_id,
                 "idempotencyRequestId": request_id,
             }
-            payload.update(_auto_gate_context(connection, work_item_id))
-            _event(
-                connection, work_item_id, "auto-gate-" + _sha(request_id + ":" + stage),
-                "AUTO_GATE_APPROVED", "SYSTEM", "auto-gate", payload,
-            )
+            auto_payload.update(_auto_gate_context(connection, work_item_id))
+            if stage == "FINAL":
+                terminal_resources = _terminal_resource_projection(
+                    snapshot, final_reviewer_claim)
+        reviewer_task = next(row for row in snapshot["tasks"]
+                             if row["owner_role"] == "REVIEWER" and
+                             row["status"] == "IN_PROGRESS")
+        author_task = next((row for row in snapshot["tasks"]
+                            if row["owner_role"] == author_role), None)
+        next_step = {"action": ("NONE" if auto_approved and stage == "FINAL" else
+                                "CLAIM_ROLE" if queue == "CLAIMABLE" else
+                                "HUMAN_GATE" if queue == "WAITING_HUMAN" else
+                                "HUMAN_UNBLOCK" if queue == "BLOCKED" else "NONE"),
+                     "arguments": {"workItem": work_item_id}}
+        intent = {
+            "operation": "PLAN_REVIEW" if stage == "PLAN" else "FINAL_REVIEW",
+            "workItemId": work_item_id, "stage": stage,
+            "reviewId": review_id, "review": review,
+            "storedDecision": stored_decision, "claimId": reviewer_claim_row["claim_id"],
+            "claimGeneration": reviewer_claim_row["generation"],
+            "reviewerTaskId": reviewer_task["task_id"],
+            "reviewerStatus": reviewer_status,
+            "reviewEvidence": [{"reviewRound": round_number, "result": result}],
+            "authorRole": author_role,
+            "authorTaskId": (author_task["task_id"] if
+                             route["authorTask"] == "NOT_STARTED" else None),
+            "state": state, "queue": queue, "role": role,
+            "autoApproved": auto_approved, "reviewPayload": review_payload,
+            "reviewRequestId": request_id, "reviewEventId": next_event_id,
+            "readyPayload": ready_payload,
+            "readyRequestId": request_id + "-publication-ready",
+            "readyEventId": next_event_id + 1 if ready_payload else None,
+            "terminalResources": terminal_resources,
+            "terminalRequestId": request_id + "-terminal-activity",
+            "terminalEventId": next_event_id + 1 if terminal_resources else None,
+            "autoPayload": auto_payload,
+            "autoRequestId": "auto-gate-" + _sha(request_id + ":" + stage),
+            "autoEventId": (next_event_id + (2 if terminal_resources else 1)
+                            if auto_payload else None),
+            "actorKind": "AGENT", "actorId": reviewer_agent_id,
+            "requestId": request_id, "now": now, "nextStep": next_step,
+        }
+        plan = workflow_kernel.plan_review(snapshot, intent)
+        _kernel_apply(connection, work_item_id, snapshot, plan,
+                      evaluation_time=now)
+        _review_materialized(connection, work_item_id, request_id)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -1932,22 +2078,27 @@ def _release_plan_amend_lock(database, lock_id, work_item_id, agent_id, request_
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre")
         lock = connection.execute(
             "SELECT * FROM repository_locks WHERE lock_id=? AND work_item_id=? "
             "AND agent_id=? AND status='ACTIVE'", (lock_id, work_item_id, agent_id),
         ).fetchone()
         if lock is not None:
             now = _now()
-            connection.execute(
-                "UPDATE repository_locks SET status='RELEASED',released_at=? WHERE lock_id=?",
-                (now, lock_id),
-            )
-            _event(connection, work_item_id, request_id, "REPOSITORY_LOCK_RELEASED",
-                   "SYSTEM", "plan-amend", {
-                       "repositoryKey": lock["repository_key"],
-                       "generation": lock["generation"], "purpose": "PLAN_AMEND",
-                       "reviewerAgentId": agent_id,
-                   })
+            intent = {
+                "operation": "RELEASE_WRITER", "workItemId": work_item_id,
+                "requestId": request_id, "actorKind": "SYSTEM",
+                "actorId": "plan-amend", "now": now,
+                "repositoryKey": lock["repository_key"], "lockId": lock_id,
+                "generation": lock["generation"],
+                "payload": {"repositoryKey": lock["repository_key"],
+                            "generation": lock["generation"],
+                            "purpose": "PLAN_AMEND",
+                            "reviewerAgentId": agent_id},
+            }
+            _kernel_apply(connection, work_item_id, snapshot,
+                          workflow_kernel.plan_writer(snapshot, intent, False),
+                          evaluation_time=now)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -2010,6 +2161,7 @@ def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_fil
     try:
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
+        snapshot = _kernel_assert(connection, work_item_id, project_root, phase="pre")
         claim = _active_claim(connection, work_item_id, "REVIEWER", reviewer_agent_id)
         if item["state"] != "PLAN_REVIEW_PENDING":
             raise LiteError("PLAN_AMEND requires pending PLAN review")
@@ -2074,11 +2226,8 @@ def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_fil
             "FROM repository_locks WHERE repository_key=? AND status='ACTIVE' "
             "AND expires_at<=?", (repository_key, now),
         ).fetchall()
-        connection.execute(
-            "UPDATE repository_locks SET status='EXPIRED',released_at=? "
-            "WHERE repository_key=? AND status='ACTIVE' AND expires_at<=?",
-            (now, repository_key, now),
-        )
+        if stale_locks:
+            raise LiteError("EXPIRED_ACTIVITY_RECONCILIATION_REQUIRED")
         if connection.execute(
             "SELECT 1 FROM repository_locks WHERE repository_key=? AND status='ACTIVE'",
             (repository_key,),
@@ -2091,25 +2240,25 @@ def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_fil
         lock_id = _id("repo")
         expires_at = (datetime.datetime.now(datetime.timezone.utc) +
                       datetime.timedelta(minutes=5)).replace(microsecond=0).isoformat()
-        connection.execute(
-            "INSERT INTO repository_locks VALUES(?,?,?,?,?,'ACTIVE',?,?,NULL)",
-            (lock_id, repository_key, work_item_id, reviewer_agent_id, generation,
-             now, expires_at),
-        )
-        _event(connection, work_item_id, "plan-amend-lock-" + _sha(request_id),
-               "REPOSITORY_LOCK_ACQUIRED", "SYSTEM", "plan-amend", {
-                   "repositoryKey": repository_key, "generation": generation,
-                   "purpose": "PLAN_AMEND", "reviewerAgentId": reviewer_agent_id,
-                   "path": relative, "baseRevision": head["revision"],
-                   "baseSha256": head["sha256"], "requestId": request_id,
-                   "reconciledActivity": [
-                       {"kind": "REPOSITORY_WRITER", "resourceId": row["lock_id"],
-                        "workItemId": row["work_item_id"], "ownerId": row["agent_id"],
-                        "generation": row["generation"], "expiresAt": row["expires_at"],
-                        "beforeStatus": "ACTIVE", "effectiveStatus": "STALE",
-                        "afterStatus": "EXPIRED"} for row in stale_locks
-                   ],
-               })
+        lock_request = "plan-amend-lock-" + _sha(request_id)
+        intent = {
+            "operation": "ACQUIRE_WRITER", "workItemId": work_item_id,
+            "requestId": lock_request, "actorKind": "SYSTEM",
+            "actorId": "plan-amend", "now": now,
+            "ownerId": reviewer_agent_id, "repositoryKey": repository_key,
+            "lockId": lock_id, "generation": generation,
+            "expiresAt": expires_at,
+            "payload": {"repositoryKey": repository_key,
+                        "generation": generation, "purpose": "PLAN_AMEND",
+                        "reviewerAgentId": reviewer_agent_id,
+                        "path": relative, "baseRevision": head["revision"],
+                        "baseSha256": head["sha256"],
+                        "requestId": request_id,
+                        "reconciledActivity": []},
+        }
+        _kernel_apply(connection, work_item_id, snapshot,
+                      workflow_kernel.plan_writer(snapshot, intent, True),
+                      project_root=project_root, evaluation_time=now)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -2123,7 +2272,10 @@ def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_fil
         try:
             connection.execute("BEGIN IMMEDIATE")
             item = _item(connection, work_item_id)
-            _active_claim(connection, work_item_id, "REVIEWER", reviewer_agent_id)
+            snapshot = _kernel_assert(connection, work_item_id, project_root, phase="pre")
+            reviewer_claim = _active_claim(
+                connection, work_item_id, "REVIEWER", reviewer_agent_id
+            )
             lock = connection.execute(
                 "SELECT * FROM repository_locks WHERE lock_id=? AND repository_key=? "
                 "AND work_item_id=? AND agent_id=? AND status='ACTIVE'",
@@ -2148,36 +2300,29 @@ def amend_plan_review(database, work_item_id, reviewer_agent_id, replacement_fil
                 "summary": review_input.get("summary", ""),
                 "reviewedArtifact": reviewed, "amendments": amendments,
             }
-            connection.execute(
-                "INSERT INTO reviews VALUES(?,?,?,?,?,?,?)",
-                (_id("review"), work_item_id, "PLAN", reviewer_agent_id,
-                 "REJECTED", _json(review), now),
-            )
-            _release_active(connection, work_item_id, now)
-            connection.execute(
-                "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? "
-                "AND owner_role='REVIEWER' AND status='IN_PROGRESS'", (now, work_item_id),
-            )
-            connection.execute(
-                "UPDATE work_items SET state='PLAN_REVIEW_PENDING',queue_state='CLAIMABLE',"
-                "current_role='REVIEWER',held_reason=NULL,blocked_reason=NULL,"
-                "row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-                (now, work_item_id),
-            )
-            _event(connection, work_item_id, request_id, "AGENT_PLAN_REVIEW", "AGENT",
-                   reviewer_agent_id, {"decision": "REJECTED", "review": review,
-                                       "requestFingerprint": fingerprint})
-            _event(connection, work_item_id, request_id + "-artifact", "PLAN_ARTIFACT_HEAD",
-                   "AGENT", reviewer_agent_id, new_head)
-            connection.execute(
-                "UPDATE repository_locks SET status='RELEASED',released_at=? WHERE lock_id=?",
-                (now, lock_id),
-            )
-            _event(connection, work_item_id, request_id + "-release",
-                   "REPOSITORY_LOCK_RELEASED", "SYSTEM", "plan-amend", {
-                       "repositoryKey": repository_key, "generation": lock["generation"],
-                       "purpose": "PLAN_AMEND", "reviewerAgentId": reviewer_agent_id,
-                   })
+            reviewer_task = next(row for row in snapshot["tasks"]
+                                 if row["owner_role"] == "REVIEWER" and
+                                 row["status"] == "IN_PROGRESS")
+            intent = {
+                "operation": "PLAN_REVIEW_AMEND", "workItemId": work_item_id,
+                "requestId": request_id, "actorKind": "AGENT",
+                "actorId": reviewer_agent_id, "now": now,
+                "reviewId": _id("review"), "review": review,
+                "claimId": reviewer_claim["claim_id"],
+                "claimGeneration": reviewer_claim["generation"],
+                "reviewerTaskId": reviewer_task["task_id"],
+                "lockId": lock_id, "lockGeneration": lock["generation"],
+                "reviewPayload": {"decision": "REJECTED", "review": review,
+                                  "requestFingerprint": fingerprint},
+                "artifactPayload": new_head,
+                "releasePayload": {"repositoryKey": repository_key,
+                                   "generation": lock["generation"],
+                                   "purpose": "PLAN_AMEND",
+                                   "reviewerAgentId": reviewer_agent_id},
+            }
+            _kernel_apply(connection, work_item_id, snapshot,
+                          workflow_kernel.plan_plan_amend(snapshot, intent),
+                          project_root=project_root, evaluation_time=now)
             try:
                 connection.commit()
             except Exception:
@@ -2242,6 +2387,7 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
     try:
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre")
         if item["mode"] != "STANDARD" or item["queue_state"] != "WAITING_HUMAN":
             raise LiteError("human gate is not waiting")
         expected = "PLAN_REVIEW_PENDING" if stage == "PLAN" else "IMPLEMENTATION_COMPLETED"
@@ -2249,6 +2395,18 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
             raise LiteError("human gate stage or decision is invalid")
         if _management_from_events(connection, work_item_id) is None:
             raise LiteError("management envelope is required before human gate")
+        if stage == "FINAL":
+            submission = connection.execute(
+                "SELECT payload_json FROM events WHERE work_item_id=? "
+                "AND event_type='SUBMIT_IMPLEMENTATION' ORDER BY event_id DESC LIMIT 1",
+                (work_item_id,),
+            ).fetchone()
+            try:
+                release_candidate = json.loads(submission[0]).get("reviewedCandidate") if submission else None
+            except (TypeError, ValueError):
+                release_candidate = None
+            if release_candidate is not None and decision == "REJECTED":
+                raise LiteError("USE_RELEASE_PUBLICATION_RETRY")
         if decision == "APPROVED":
             _approved_gate_preconditions(connection, item, stage)
         reviewer_claim = None
@@ -2257,38 +2415,21 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
                 connection, work_item_id
             )
         now = _now()
-        connection.execute(
-            "INSERT INTO human_gates VALUES(?,?,?,?,?,?,?)",
-            (_id("gate"), work_item_id, stage, human_id, decision, reason, now),
-        )
-        if decision == "APPROVED":
-            _approve_gate(
-                connection, item, stage, now, request_id,
-                reviewer_claim=reviewer_claim,
+        intent = {
+            "operation": "HUMAN_GATE", "workItemId": work_item_id,
+            "requestId": request_id, "actorKind": "HUMAN", "actorId": human_id,
+            "now": now, "stage": stage, "decision": decision, "reason": reason,
+            "gateId": _id("gate"),
+            "terminalResources": (_terminal_resource_projection(
+                snapshot, reviewer_claim) if reviewer_claim else []),
+        }
+        _kernel_apply(connection, work_item_id, snapshot,
+                      workflow_kernel.plan_human_gate(snapshot, intent),
+                      evaluation_time=now)
+        if decision == "APPROVED" and stage == "FINAL":
+            _terminal_activity_materialized(
+                connection, work_item_id, request_id + "-terminal-activity"
             )
-            state = None
-        elif stage == "PLAN":
-            state = "PLAN_REVIEW_APPROVED" if decision == "APPROVED" else "DRAFT"
-            queue, role, held, closed = "CLAIMABLE", "IMPLEMENTER" if decision == "APPROVED" else "PLANNER", None, None
-            if decision == "REJECTED":
-                connection.execute(
-                    "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? AND owner_role='PLANNER'",
-                    (now, work_item_id),
-                )
-        else:
-            state, queue, role, held, closed = "IMPLEMENTING", "CLAIMABLE", "IMPLEMENTER", None, None
-            connection.execute(
-                "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? AND owner_role='IMPLEMENTER'",
-                (now, work_item_id),
-            )
-        if state is not None:
-            connection.execute(
-                "UPDATE work_items SET state=?,queue_state=?,current_role=?,held_reason=?,closed_at=?,"
-                "row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-                (state, queue, role, held, closed, now, work_item_id),
-            )
-        _event(connection, work_item_id, request_id, "HUMAN_{0}_GATE".format(stage), "HUMAN",
-               human_id, {"decision": decision, "reason": reason})
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -2298,26 +2439,34 @@ def record_human_gate(database, work_item_id, stage, human_id, decision, reason,
         connection.close()
 
 
+def _terminal_activity_materialized(connection, work_item_id, request_id):
+    """Fault-injection seam after terminal activity materialization."""
+    return None
+
+
 def set_hold(database, work_item_id, human_id, held, reason="USER_PAUSED", request_id=None):
     request_id = request_id or _id("hold")
     connection = open_database(database)
     try:
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre")
         if item["state"] == "FINAL_ACCEPTANCE_APPROVED":
             raise LiteError("terminal item cannot be resumed")
         if connection.execute(
             "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE'", (work_item_id,)
         ).fetchone():
             raise LiteError("release active claim before hold/resume")
-        queue = "HELD" if held else ("WAITING_HUMAN" if item["current_role"] is None else "CLAIMABLE")
         now = _now()
-        connection.execute(
-            "UPDATE work_items SET queue_state=?,held_reason=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (queue, reason if held else None, now, work_item_id),
-        )
-        _event(connection, work_item_id, request_id, "WORK_ITEM_HELD" if held else "WORK_ITEM_RESUMED",
-               "HUMAN", human_id, {"reason": reason})
+        intent = {
+            "operation": "HOLD" if held else "RESUME",
+            "workItemId": work_item_id, "requestId": request_id,
+            "actorKind": "HUMAN", "actorId": human_id, "now": now,
+            "held": held, "reason": reason,
+        }
+        _kernel_apply(connection, work_item_id, snapshot,
+                      workflow_kernel.plan_hold(snapshot, intent),
+                      evaluation_time=now)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -2333,6 +2482,7 @@ def unblock_task(database, work_item_id, task_id, human_id, reason, request_id=N
     try:
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre")
         if item["queue_state"] != "BLOCKED":
             raise LiteError("WorkItem is not blocked")
         if connection.execute(
@@ -2346,24 +2496,15 @@ def unblock_task(database, work_item_id, task_id, human_id, reason, request_id=N
         if task is None or task[0] != "BLOCKED":
             raise LiteError("task is not blocked")
         now = _now()
-        connection.execute(
-            "UPDATE tasks SET status='NOT_STARTED',updated_at=? WHERE work_item_id=? AND task_id=?",
-            (now, work_item_id, task_id),
-        )
-        remaining = connection.execute(
-            "SELECT owner_role FROM tasks WHERE work_item_id=? AND status='BLOCKED' ORDER BY seq LIMIT 1",
-            (work_item_id,),
-        ).fetchone()
-        queue = "BLOCKED" if remaining else "CLAIMABLE"
-        role = remaining["owner_role"] if remaining else (
-            item["current_role"] or task["owner_role"]
-        )
-        connection.execute(
-            "UPDATE work_items SET queue_state=?,current_role=?,blocked_reason=?,row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (queue, role, "TASK_BLOCKED" if remaining else None, now, work_item_id),
-        )
-        _event(connection, work_item_id, request_id, "TASK_UNBLOCKED", "HUMAN", human_id,
-               {"taskId": task_id, "reason": reason})
+        intent = {
+            "operation": "UNBLOCK", "workItemId": work_item_id,
+            "requestId": request_id, "actorKind": "HUMAN",
+            "actorId": human_id, "now": now,
+            "taskId": task_id, "reason": reason,
+        }
+        _kernel_apply(connection, work_item_id, snapshot,
+                      workflow_kernel.plan_unblock(snapshot, intent),
+                      evaluation_time=now)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -2400,283 +2541,11 @@ def _event_payload(row):
 
 def recover_review_task(database, work_item_id, task_id, human_id, reason,
                         request_id):
-    """Recover one precisely bound orphaned PLAN Reviewer task.
-
-    This is intentionally not a general task reset.  Every refusal rolls the
-    transaction back and returns a stable structured result; unexpected faults
-    are rolled back and re-raised so callers cannot mistake them for recovery.
-    """
-    values = (work_item_id, task_id, human_id, reason, request_id)
-    if any(not isinstance(value, str) or not value.strip() for value in values):
-        return _review_task_recovery_result(
-            "REFUSED", "INPUT_REQUIRED", work_item_id, task_id, human_id,
-            reason, request_id,
-        )
-    work_item_id, task_id, human_id, reason, request_id = (
-        value.strip() for value in values
+    """Refuse the removed ad-hoc reset and route callers to exact repair."""
+    return _review_task_recovery_result(
+        "REFUSED", "USE_WORKFLOW_CHECK_AND_EXACT_REPAIR", work_item_id,
+        task_id, human_id, reason, request_id,
     )
-    connection = open_database(database)
-
-    def refused(code):
-        connection.rollback()
-        return _review_task_recovery_result(
-            "REFUSED", code, work_item_id, task_id, human_id, reason, request_id,
-        )
-
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        replay = connection.execute(
-            "SELECT * FROM events WHERE request_id=?", (request_id,)
-        ).fetchone()
-        if replay is not None:
-            payload = _event_payload(replay)
-            exact = (
-                replay["event_type"] == "HUMAN_REVIEW_TASK_RECOVERED" and
-                replay["actor_kind"] == "HUMAN" and replay["actor_id"] == human_id and
-                replay["work_item_id"] == work_item_id and
-                payload.get("protocolVersion") == REVIEW_TASK_RECOVERY_PROTOCOL and
-                payload.get("workItemId") == work_item_id and
-                payload.get("taskId") == task_id and payload.get("humanId") == human_id and
-                payload.get("reason") == reason and payload.get("requestId") == request_id and
-                payload.get("from") == "IN_PROGRESS" and
-                payload.get("to") == "NOT_STARTED"
-            )
-            if not exact:
-                return refused("REQUEST_ID_CONFLICT")
-            binding = payload.get("binding")
-            connection.rollback()
-            return _review_task_recovery_result(
-                "NO_OP", "EXACT_REPLAY", work_item_id, task_id, human_id,
-                reason, request_id, binding,
-            )
-
-        try:
-            item = _item(connection, work_item_id)
-        except LiteError:
-            return refused("WORK_ITEM_NOT_FOUND")
-        if item["state"] == "FINAL_ACCEPTANCE_APPROVED" or item["closed_at"] is not None:
-            return refused("TERMINAL_WORK_ITEM")
-        management = _management_from_events(connection, work_item_id)
-        if not isinstance(management, dict):
-            return refused("MANAGEMENT_REQUIRED")
-
-        reviewer_tasks = connection.execute(
-            "SELECT * FROM tasks WHERE work_item_id=? AND owner_role='REVIEWER' ORDER BY seq",
-            (work_item_id,),
-        ).fetchall()
-        if len(reviewer_tasks) != 1 or reviewer_tasks[0]["task_id"] != task_id:
-            return refused("REVIEWER_TASK_NOT_UNIQUE")
-        task = reviewer_tasks[0]
-        if task["status"] != "IN_PROGRESS":
-            return refused("TASK_NOT_ORPHANED")
-        in_progress = connection.execute(
-            "SELECT task_id FROM tasks WHERE work_item_id=? AND status='IN_PROGRESS'",
-            (work_item_id,),
-        ).fetchall()
-        if len(in_progress) != 1 or in_progress[0]["task_id"] != task_id:
-            return refused("IN_PROGRESS_TASK_AMBIGUOUS")
-        if connection.execute(
-            "SELECT 1 FROM claims WHERE work_item_id=? AND status='ACTIVE' LIMIT 1",
-            (work_item_id,),
-        ).fetchone() is not None:
-            return refused("ACTIVE_CLAIM")
-        if connection.execute(
-            "SELECT 1 FROM repository_locks WHERE work_item_id=? AND status='ACTIVE' LIMIT 1",
-            (work_item_id,),
-        ).fetchone() is not None:
-            return refused("ACTIVE_REPOSITORY_WRITER")
-
-        implementer_tasks = connection.execute(
-            "SELECT * FROM tasks WHERE work_item_id=? AND owner_role='IMPLEMENTER' ORDER BY seq",
-            (work_item_id,),
-        ).fetchall()
-        if len(implementer_tasks) != 1:
-            return refused("IMPLEMENTER_TASK_NOT_UNIQUE")
-        implementer_status = implementer_tasks[0]["status"]
-        implementing_shape = (
-            item["state"] == "IMPLEMENTING" and item["queue_state"] == "CLAIMABLE" and
-            item["current_role"] == "IMPLEMENTER" and item["held_reason"] is None and
-            item["blocked_reason"] is None and
-            implementer_status not in ("COMPLETED", "CANCELLED")
-        )
-        deviation_shape = (
-            item["state"] == "DRAFT" and item["queue_state"] == "BLOCKED" and
-            item["current_role"] == "PLANNER" and item["held_reason"] is None and
-            item["blocked_reason"] == "PLAN_DEVIATION" and
-            implementer_status == "BLOCKED"
-        )
-        if not (implementing_shape or deviation_shape):
-            return refused("UNSUPPORTED_RUNTIME_SHAPE")
-
-        projection = _review_projection(connection, work_item_id)
-        if (projection["PLAN"]["latestResult"] != "PASS" or
-                projection["PLAN"]["openFindings"]):
-            return refused("PLAN_REVIEW_NOT_PASS_OPEN_ZERO")
-        if connection.execute(
-            "SELECT 1 FROM reviews WHERE work_item_id=? AND stage='FINAL' LIMIT 1",
-            (work_item_id,),
-        ).fetchone() is not None:
-            return refused("FINAL_REVIEW_ALREADY_EXISTS")
-
-        task_events = []
-        for row in connection.execute(
-                "SELECT * FROM events WHERE work_item_id=? AND event_type='TASK_STATUS_CHANGED' "
-                "ORDER BY event_id", (work_item_id,)):
-            payload = _event_payload(row)
-            if payload.get("taskId") == task_id:
-                task_events.append((row, payload))
-        if not task_events or task_events[-1][1].get("status") != "IN_PROGRESS":
-            return refused("TASK_EVENT_NOT_BOUND")
-        task_event, task_payload = task_events[-1]
-        reviewer_agent_id = task_event["actor_id"]
-        if (task_event["actor_kind"] != "AGENT" or
-                task_payload.get("from") != "NOT_STARTED"):
-            return refused("TASK_EVENT_NOT_BOUND")
-
-        claims = []
-        for claim in connection.execute(
-                "SELECT * FROM claims WHERE work_item_id=? AND task_id=? AND agent_id=? "
-                "AND role='REVIEWER'", (work_item_id, task_id, reviewer_agent_id)):
-            acquired_event = connection.execute(
-                "SELECT * FROM events WHERE work_item_id=? AND event_type='CLAIM_ACQUIRED' "
-                "AND actor_kind='AGENT' AND actor_id=? ORDER BY event_id",
-                (work_item_id, reviewer_agent_id),
-            ).fetchall()
-            acquired_event = [
-                row for row in acquired_event
-                if _event_payload(row).get("claimId") == claim["claim_id"] and
-                _event_payload(row).get("taskId") == task_id and
-                _event_payload(row).get("generation") == claim["generation"]
-            ]
-            if (claim["status"] == "RELEASED" and claim["released_at"] and
-                    len(acquired_event) == 1 and
-                    claim["acquired_at"] == acquired_event[0]["created_at"] and
-                    acquired_event[0]["event_id"] < task_event["event_id"]):
-                claims.append((claim, acquired_event[0]))
-        if len(claims) != 1:
-            return refused("RELEASED_REVIEWER_CLAIM_NOT_UNIQUE")
-        claim, claim_event = claims[0]
-
-        review_candidates = []
-        for review in connection.execute(
-                "SELECT rowid AS review_rowid,* FROM reviews WHERE work_item_id=? "
-                "AND stage='PLAN' ORDER BY created_at,rowid", (work_item_id,)):
-            decoded = _decoded_review(review)
-            if (review["reviewer_agent_id"] != reviewer_agent_id or
-                    decoded.get("protocolVersion") != "AWB-REVIEW-v1" or
-                    decoded.get("result") != "PASS" or decoded.get("findings") != []):
-                continue
-            matching_events = []
-            for event in connection.execute(
-                    "SELECT * FROM events WHERE work_item_id=? AND event_type='AGENT_PLAN_REVIEW' "
-                    "AND actor_kind='AGENT' AND actor_id=? ORDER BY event_id",
-                    (work_item_id, reviewer_agent_id)):
-                event_payload = _event_payload(event)
-                if (event_payload.get("decision") == "APPROVED" and
-                        event_payload.get("review") == decoded and
-                        event["created_at"] == review["created_at"] and
-                        event["event_id"] > task_event["event_id"]):
-                    matching_events.append((event, event_payload))
-            if len(matching_events) != 1:
-                continue
-            review_event, review_payload = matching_events[0]
-            gate_events = []
-            for gate_event in connection.execute(
-                    "SELECT * FROM events WHERE work_item_id=? AND event_type IN "
-                    "('AUTO_GATE_APPROVED','HUMAN_PLAN_GATE') ORDER BY event_id",
-                    (work_item_id,)):
-                if gate_event["event_id"] <= review_event["event_id"]:
-                    continue
-                gate_payload = _event_payload(gate_event)
-                if gate_event["event_type"] == "AUTO_GATE_APPROVED":
-                    valid_gate = (
-                        gate_event["actor_kind"] == "SYSTEM" and
-                        gate_payload.get("stage") == "PLAN" and
-                        gate_payload.get("reviewId") == review["review_id"] and
-                        gate_payload.get("reviewRequestId") == review_event["request_id"] and
-                        gate_payload.get("reviewEventId") == review_event["event_id"] and
-                        gate_payload.get("reviewRound") == decoded.get("round")
-                    )
-                else:
-                    human_gate = connection.execute(
-                        "SELECT 1 FROM human_gates WHERE work_item_id=? AND stage='PLAN' "
-                        "AND human_id=? AND decision='APPROVED' AND reason=? AND created_at=?",
-                        (work_item_id, gate_event["actor_id"], gate_payload.get("reason"),
-                         gate_event["created_at"]),
-                    ).fetchone()
-                    valid_gate = (
-                        gate_event["actor_kind"] == "HUMAN" and
-                        gate_payload.get("decision") == "APPROVED" and
-                        human_gate is not None
-                    )
-                if valid_gate:
-                    gate_events.append(gate_event)
-            for gate_event in gate_events:
-                starts = connection.execute(
-                    "SELECT * FROM events WHERE work_item_id=? AND event_type='START_IMPLEMENTATION' "
-                    "AND event_id>? ORDER BY event_id", (work_item_id, gate_event["event_id"]),
-                ).fetchall()
-                if len(starts) == 1 and starts[0]["actor_kind"] == "AGENT" and _event_payload(
-                        starts[0]) == {
-                            "from": "PLAN_REVIEW_APPROVED", "to": "IMPLEMENTING",
-                        }:
-                    review_candidates.append((review, review_event, gate_event, starts[0]))
-        if len(review_candidates) != 1:
-            return refused("PLAN_EVIDENCE_NOT_UNIQUE")
-        review, review_event, gate_event, start_event = review_candidates[0]
-        if claim["released_at"] != review["created_at"]:
-            return refused("CLAIM_REVIEW_TIMELINE_DRIFT")
-
-        binding = {
-            "reviewerAgentId": reviewer_agent_id,
-            "claimId": claim["claim_id"],
-            "claimGeneration": claim["generation"],
-            "claimEventId": claim_event["event_id"],
-            "taskStatusEventId": task_event["event_id"],
-            "planReviewId": review["review_id"],
-            "planReviewRound": _decoded_review(review).get("round"),
-            "planReviewRequestId": review_event["request_id"],
-            "planReviewEventId": review_event["event_id"],
-            "planGateEventId": gate_event["event_id"],
-            "startImplementationEventId": start_event["event_id"],
-        }
-        payload = {
-            "protocolVersion": REVIEW_TASK_RECOVERY_PROTOCOL,
-            "workItemId": work_item_id,
-            "taskId": task_id,
-            "from": "IN_PROGRESS",
-            "to": "NOT_STARTED",
-            "humanId": human_id,
-            "reason": reason,
-            "requestId": request_id,
-            "binding": binding,
-        }
-        now = _now()
-        updated_task = connection.execute(
-            "UPDATE tasks SET status='NOT_STARTED',updated_at=? "
-            "WHERE work_item_id=? AND task_id=? AND status='IN_PROGRESS'",
-            (now, work_item_id, task_id),
-        )
-        if updated_task.rowcount != 1:
-            return refused("TASK_NOT_ORPHANED")
-        connection.execute(
-            "UPDATE work_items SET row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (now, work_item_id),
-        )
-        _event(
-            connection, work_item_id, request_id, "HUMAN_REVIEW_TASK_RECOVERED",
-            "HUMAN", human_id, payload,
-        )
-        connection.commit()
-        return _review_task_recovery_result(
-            "OK", "RECOVERED", work_item_id, task_id, human_id, reason,
-            request_id, binding,
-        )
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
 
 
 def report_plan_deviation(database, work_item_id, task_id, agent_id, evidence,
@@ -2688,28 +2557,19 @@ def report_plan_deviation(database, work_item_id, task_id, agent_id, evidence,
     try:
         connection.execute("BEGIN IMMEDIATE")
         item = _item(connection, work_item_id)
+        snapshot = _kernel_assert(connection, work_item_id, phase="pre")
         claim = _active_claim(connection, work_item_id, "IMPLEMENTER", agent_id)
         if item["state"] != "IMPLEMENTING" or claim["task_id"] != task_id:
             raise LiteError("PLAN_DEVIATION requires active implementation")
         now = _now()
-        connection.execute(
-            "UPDATE repository_locks SET status='RELEASED',released_at=? "
-            "WHERE work_item_id=? AND agent_id=? AND status='ACTIVE'",
-            (now, work_item_id, agent_id),
-        )
-        _release_active(connection, work_item_id, now)
-        connection.execute(
-            "UPDATE tasks SET status='BLOCKED',evidence_json=?,updated_at=? "
-            "WHERE work_item_id=? AND task_id=?",
-            (_json([evidence]), now, work_item_id, task_id),
-        )
-        connection.execute(
-            "UPDATE work_items SET state='DRAFT',queue_state='BLOCKED',current_role='PLANNER',"
-            "blocked_reason='PLAN_DEVIATION',row_version=row_version+1,updated_at=? WHERE work_item_id=?",
-            (now, work_item_id),
-        )
-        _event(connection, work_item_id, request_id, "PLAN_DEVIATION", "AGENT", agent_id,
-               {"taskId": task_id, "evidence": evidence, "roundsPreserved": True})
+        intent = {
+            "operation": "PLAN_DEVIATION", "workItemId": work_item_id,
+            "requestId": request_id, "actorKind": "AGENT", "actorId": agent_id,
+            "now": now, "taskId": task_id, "evidence": evidence,
+        }
+        _kernel_apply(connection, work_item_id, snapshot,
+                      workflow_kernel.plan_plan_deviation(snapshot, intent),
+                      evaluation_time=now)
         connection.commit()
         return get_work_item(database, work_item_id)
     except Exception:
@@ -2717,6 +2577,1034 @@ def report_plan_deviation(database, work_item_id, task_id, agent_id, evidence,
         raise
     finally:
         connection.close()
+
+
+def _structured_next(action, arguments=None, required_inputs=None, risk_class="LOCAL_SAFE"):
+    value = {"action": action, "arguments": arguments or {},
+             "requiredInputs": required_inputs or [], "riskClass": risk_class}
+    value["fingerprint"] = _sha(_json(value))
+    return value
+
+
+def _workflow_snapshot(connection, work_item_id, agent_id, role, repository_key,
+                       orchestrator_id=None, orchestrator_generation=None,
+                       project_root=None):
+    item = _item(connection, work_item_id)
+    tasks = connection.execute(
+        "SELECT * FROM tasks WHERE work_item_id=? AND owner_role=? "
+        "ORDER BY seq", (work_item_id, role)
+    ).fetchall()
+    task = tasks[0] if len(tasks) == 1 else None
+    claim = connection.execute(
+        "SELECT * FROM claims WHERE work_item_id=? AND status='ACTIVE'", (work_item_id,)
+    ).fetchone()
+    writer = connection.execute(
+        "SELECT * FROM repository_locks WHERE repository_key=? AND status='ACTIVE'",
+        (repository_key,),
+    ).fetchone()
+    publication_step = None
+    if project_root and item["queue_state"] == "WAITING_HUMAN":
+        ready = connection.execute(
+            "SELECT * FROM events WHERE work_item_id=? AND event_type='PUBLICATION_READY' "
+            "ORDER BY event_id DESC LIMIT 1", (work_item_id,),
+        ).fetchone()
+        authorization = connection.execute(
+            "SELECT * FROM events WHERE work_item_id=? AND event_type='PUBLICATION_AUTHORIZED' "
+            "ORDER BY event_id DESC LIMIT 1", (work_item_id,),
+        ).fetchone()
+        invalidation = connection.execute(
+            "SELECT event_id FROM events WHERE work_item_id=? "
+            "AND event_type='PUBLICATION_READY_INVALIDATED' ORDER BY event_id DESC LIMIT 1",
+            (work_item_id,),
+        ).fetchone()
+        if (ready is not None and authorization is not None and
+                (invalidation is None or invalidation["event_id"] < ready["event_id"])):
+            try:
+                ready_payload = json.loads(ready["payload_json"])
+                authorization_payload = json.loads(authorization["payload_json"])
+                exact = authorization_payload.get("candidateFingerprint")
+                if exact != ready_payload.get("candidateFingerprint"):
+                    raise LiteError("publication identity drift")
+                from .candidate import _verify_current_build
+                _verify_current_build(project_root, work_item_id, {
+                    "candidateId": ready_payload["candidateId"],
+                    "candidateFingerprint": exact,
+                    "buildFingerprint": ready_payload["buildFingerprint"],
+                })
+                publication_step = _structured_next(
+                    "EXECUTE_EXACT_AUTHORIZED_PUBLICATION", {
+                        "readyFingerprint": ready_payload["readyFingerprint"],
+                        "authorizationRequestId": authorization["request_id"],
+                        "candidateFingerprint": exact,
+                    }, risk_class="REMOTE",
+                )
+            except (KeyError, TypeError, ValueError, LiteError):
+                publication_step = _structured_next(
+                    "HUMAN_INSPECT_PUBLICATION_IDENTITY", risk_class="HUMAN"
+                )
+    if item["state"] == "FINAL_ACCEPTANCE_APPROVED":
+        step = _structured_next("NONE")
+        status, reason = "NO_OP", None
+    elif publication_step is not None:
+        step = publication_step
+        status = "REFUSED" if step["riskClass"] == "REMOTE" else "WAITING_HUMAN"
+        reason = ("REMOTE_STEP_NOT_CONSUMABLE" if step["riskClass"] == "REMOTE" else
+                  "PUBLICATION_IDENTITY_DRIFT")
+    elif item["queue_state"] in ("WAITING_HUMAN", "HELD", "BLOCKED"):
+        action = {"WAITING_HUMAN": "HUMAN_GATE_DECISION",
+                  "HELD": "HUMAN_RESUME", "BLOCKED": "HUMAN_UNBLOCK"}[item["queue_state"]]
+        step = _structured_next(action, risk_class="HUMAN")
+        status, reason = "WAITING_HUMAN", item["queue_state"]
+    elif claim is not None and (claim["agent_id"] != agent_id or claim["role"] != role):
+        step = _structured_next("RELEASE_RESOURCE_BY_EXACT_OWNER", {
+            "owner": claim["agent_id"], "generation": claim["generation"]
+        }, risk_class="AMBIGUOUS")
+        status, reason = "REFUSED", "RESOURCE_CONFLICT"
+    else:
+        state = item["state"]
+        active = claim is not None
+        action = None
+        required = []
+        if state == "DRAFT" and role == "PLANNER":
+            action = "SUBMIT_PLAN" if active else "BEGIN_PLANNING"
+            required = ["--plan-artifact"] if active else []
+            if active and _review_stage_projection(_review_history(connection, work_item_id, "PLAN"))["openFindings"]:
+                required.append("--submission-file")
+        elif state == "PLAN_REVIEW_PENDING" and role == "REVIEWER":
+            action = "SUBMIT_PLAN_REVIEW" if active else "BEGIN_PLAN_REVIEW"
+            required = ["--review-file", "--decision"] if active else []
+        elif state == "PLAN_REVIEW_APPROVED" and role == "IMPLEMENTER":
+            action = "BEGIN_IMPLEMENTATION"
+        elif state == "IMPLEMENTING" and role == "IMPLEMENTER":
+            action = "SUBMIT_IMPLEMENTATION" if active else "BEGIN_IMPLEMENTATION"
+            if active:
+                required = ["--quality-file", "--local-tests-passed"]
+                from .candidate import release_submission_candidate
+                if release_submission_candidate(connection, work_item_id) is not None:
+                    required += ["--candidate", "--candidate-fingerprint"]
+        elif state == "IMPLEMENTATION_COMPLETED" and role == "REVIEWER":
+            action = "SUBMIT_IMPLEMENTATION_REVIEW" if active else "BEGIN_IMPLEMENTATION_REVIEW"
+            required = ["--review-file", "--decision"] if active else []
+        if len(tasks) != 1:
+            step = _structured_next("HUMAN_RESOLVE_TASK_AMBIGUITY", risk_class="AMBIGUOUS")
+            status, reason = "REFUSED", "AMBIGUOUS_NEXT_STEP"
+        elif action is None:
+            step = _structured_next("NONE")
+            status, reason = "NO_OP", "NO_LOCAL_SAFE_NEXT_STEP"
+        else:
+            arguments = {"agent": agent_id, "role": role,
+                         "repository": repository_key, "taskId": task["task_id"]}
+            if orchestrator_id is not None:
+                arguments.update({"orchestratorId": orchestrator_id,
+                                  "orchestratorGeneration": orchestrator_generation})
+            step = _structured_next(action, arguments, required)
+            status, reason = "READY", None
+    fingerprint_input = {
+        "project": connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0],
+        "workItemId": work_item_id, "state": item["state"],
+        "queueState": item["queue_state"], "currentRole": item["current_role"],
+        "task": dict(task) if task else None, "rowVersion": item["row_version"],
+        "claim": dict(claim) if claim else None, "writer": dict(writer) if writer else None,
+        "orchestratorId": orchestrator_id,
+        "orchestratorGeneration": orchestrator_generation,
+        "reviewHeads": [dict(row) for row in connection.execute(
+            "SELECT stage,review_id,decision,summary,created_at FROM reviews "
+            "WHERE work_item_id=? ORDER BY created_at,rowid", (work_item_id,)
+        )],
+        "planHead": [dict(row) for row in connection.execute(
+            "SELECT event_id,event_type,payload_json FROM events WHERE work_item_id=? "
+            "AND event_type='PLAN_ARTIFACT_HEAD' ORDER BY event_id DESC LIMIT 1",
+            (work_item_id,),
+        )],
+        "candidateHead": [dict(row) for row in connection.execute(
+            "SELECT event_id,event_type,payload_json FROM events WHERE work_item_id=? "
+            "AND event_type LIKE 'CANDIDATE_%' ORDER BY event_id DESC LIMIT 1",
+            (work_item_id,),
+        )],
+        "step": step,
+    }
+    step["fingerprint"] = _sha(_json(fingerprint_input))
+    return item, task, claim, writer, {
+        "protocolVersion": WORKFLOW_ADVANCE_PROTOCOL, "status": status,
+        "reasonCode": reason, "workItemId": work_item_id,
+        "rowVersion": item["row_version"], "nextStep": step,
+    }
+
+
+def workflow_status(database, work_item_id, agent_id, role, repository_key,
+                    orchestrator_id=None, orchestrator_generation=None,
+                    project_root=None):
+    if role not in ("PLANNER", "IMPLEMENTER", "REVIEWER"):
+        raise LiteError("workflow role is invalid")
+    connection = open_database(database)
+    try:
+        connection.execute("BEGIN")
+        unused_item, unused_task, unused_claim, unused_writer, result = _workflow_snapshot(
+            connection, work_item_id, agent_id, role, repository_key,
+            orchestrator_id, orchestrator_generation, project_root,
+        )
+        connection.rollback()
+        return result
+    finally:
+        connection.close()
+
+
+def _workflow_input(project_root, relative, label):
+    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+        raise LiteError("{0} must be project-relative".format(label))
+    root = os.path.realpath(os.path.abspath(project_root))
+    path = os.path.realpath(os.path.join(root, relative))
+    if os.path.commonpath((root, path)) != root or not os.path.isfile(path) or os.path.islink(path):
+        raise LiteError("{0} must be a project regular non-symlink file".format(label))
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    return path, raw, _sha(raw)
+
+
+def workflow_advance(database, project_root, work_item_id, agent_id, role,
+                     repository_key, expected_step, expected_row_version, request_id,
+                     orchestrator_id=None, orchestrator_generation=None, ttl=900,
+                     plan_artifact=None, submission_file=None, quality_file=None,
+                     review_file=None, decision=None, local_tests_passed=False,
+                     candidate_id=None, candidate_fingerprint=None):
+    if ttl < 1 or not request_id:
+        raise LiteError("workflow advance requires positive ttl and request-id")
+    file_inputs = {}
+    for name, value in (("planArtifact", plan_artifact), ("submissionFile", submission_file),
+                        ("qualityFile", quality_file), ("reviewFile", review_file)):
+        if value:
+            path, raw, digest = _workflow_input(project_root, value, name)
+            try:
+                parsed = json.loads(raw.decode("utf-8")) if name != "planArtifact" else None
+            except (UnicodeError, ValueError):
+                raise LiteError("{0} is invalid JSON".format(name))
+            file_inputs[name] = {"path": path, "relative": value, "raw": raw,
+                                 "sha256": digest, "value": parsed}
+    connection = open_database(database)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _kernel_assert(connection, work_item_id, project_root, phase="pre")
+        item, task, claim, writer, status_result = _workflow_snapshot(
+            connection, work_item_id, agent_id, role, repository_key,
+            orchestrator_id, orchestrator_generation, project_root,
+        )
+        step = status_result["nextStep"]
+        fingerprint = _sha(_json({"workItemId": work_item_id, "agent": agent_id,
+                                  "role": role, "expectedStep": expected_step,
+                                  "expectedRowVersion": expected_row_version,
+                                  "files": {key: value["sha256"] for key, value in file_inputs.items()},
+                                  "decision": decision, "localTestsPassed": local_tests_passed,
+                                  "ttl": ttl, "orchestratorId": orchestrator_id,
+                                  "orchestratorGeneration": orchestrator_generation,
+                                  "candidateId": candidate_id,
+                                  "candidateFingerprint": candidate_fingerprint}))
+        replay = connection.execute("SELECT * FROM events WHERE request_id=?", (request_id,)).fetchone()
+        if replay:
+            payload = json.loads(replay["payload_json"])
+            if replay["event_type"] != "WORKFLOW_ADVANCED" or payload.get("requestFingerprint") != fingerprint:
+                raise LiteError("REQUEST_REPLAY_CONFLICT")
+            connection.rollback()
+            return payload["receipt"]
+        if status_result["status"] != "READY" or step.get("riskClass") != "LOCAL_SAFE":
+            connection.rollback()
+            result = dict(status_result)
+            result.update({"status": "REFUSED", "reasonCode": status_result.get("reasonCode") or
+                           "NON_LOCAL_SAFE_NEXT_STEP"})
+            return result
+        if expected_row_version != item["row_version"]:
+            raise LiteError("ROW_VERSION_DRIFT")
+        if expected_step != step["fingerprint"]:
+            raise LiteError("NEXT_STEP_DRIFT")
+        for name, value in file_inputs.items():
+            info = os.lstat(value["path"])
+            with open(value["path"], "rb") as handle:
+                current_sha = _sha(handle.read())
+            if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or
+                    current_sha != value["sha256"]):
+                raise LiteError("{0} changed after workflow preflight".format(name))
+        expected_flags = set(step.get("requiredInputs", []))
+        provided_flags = set()
+        if plan_artifact: provided_flags.add("--plan-artifact")
+        if submission_file: provided_flags.add("--submission-file")
+        if quality_file: provided_flags.add("--quality-file")
+        if review_file: provided_flags.add("--review-file")
+        if decision: provided_flags.add("--decision")
+        if local_tests_passed: provided_flags.add("--local-tests-passed")
+        if candidate_id: provided_flags.add("--candidate")
+        if candidate_fingerprint: provided_flags.add("--candidate-fingerprint")
+        allowed_flags = set(expected_flags)
+        if step["action"] == "SUBMIT_PLAN" and "--submission-file" not in expected_flags:
+            allowed_flags.add("--submission-file")
+        if not expected_flags.issubset(provided_flags) or not provided_flags.issubset(allowed_flags):
+            raise LiteError("UNEXPECTED_ADVANCE_INPUT")
+        now = _now()
+        expires_at = (datetime.datetime.now(datetime.timezone.utc) +
+                      datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat()
+        action = step["action"]
+        operation_event = action
+        receipt = None
+        if action.startswith("BEGIN_"):
+            if task is None or task["status"] != "NOT_STARTED" or claim is not None:
+                raise LiteError("workflow begin has no eligible task")
+            _validate_orchestrator_fence(
+                connection, work_item_id, orchestrator_id,
+                orchestrator_generation, now)
+            claim_generation = connection.execute(
+                "SELECT coalesce(max(generation),0)+1 FROM claims WHERE work_item_id=?",
+                (work_item_id,),
+            ).fetchone()[0]
+            claim_id = _id("claim")
+            needs_writer = action in ("BEGIN_PLANNING", "BEGIN_IMPLEMENTATION")
+            lock_id = lock_generation = None
+            if needs_writer:
+                if connection.execute(
+                    "SELECT 1 FROM repository_locks WHERE repository_key=? "
+                    "AND status='ACTIVE'", (repository_key,),
+                ).fetchone():
+                    raise LiteError("repository already has an active writer")
+                lock_generation = connection.execute(
+                    "SELECT coalesce(max(generation),0)+1 FROM repository_locks "
+                    "WHERE repository_key=?", (repository_key,),
+                ).fetchone()[0]
+                lock_id = _id("repo")
+            begin_snapshot = _kernel_snapshot(connection, work_item_id, project_root,
+                                              evaluation_time=now)
+            first_event_id = connection.execute(
+                "SELECT coalesce(max(event_id),0)+1 FROM events"
+            ).fetchone()[0]
+            event_count = 2 + int(needs_writer) + int(action == "BEGIN_IMPLEMENTATION")
+            advance_event_id = first_event_id + event_count
+            next_action = ("SUBMIT_PLAN" if action == "BEGIN_PLANNING" else
+                           "SUBMIT_IMPLEMENTATION" if action == "BEGIN_IMPLEMENTATION" else
+                           "SUBMIT_PLAN_REVIEW" if action == "BEGIN_PLAN_REVIEW" else
+                           "SUBMIT_IMPLEMENTATION_REVIEW")
+            receipt = {"protocolVersion": MUTATION_RECEIPT_PROTOCOL,
+                       "operation": operation_event, "status": "OK", "reasonCode": None,
+                       "workItemId": work_item_id,
+                       "state": "IMPLEMENTING" if action == "BEGIN_IMPLEMENTATION" else item["state"],
+                       "queueState": "CLAIMED", "currentRole": role,
+                       "currentTask": task["task_id"], "eventId": advance_event_id,
+                       "rowVersion": item["row_version"] + 1,
+                       "nextStep": {"action": next_action, "riskClass": "LOCAL_SAFE",
+                                    "arguments": {"workItemId": work_item_id,
+                                                  "taskId": task["task_id"],
+                                                  "role": role}}}
+            begin_intent = {
+                "operation": "WORKFLOW_ADVANCE", "beginAction": action,
+                "workItemId": work_item_id, "taskId": task["task_id"],
+                "role": role, "claimId": claim_id,
+                "claimGeneration": claim_generation, "lockId": lock_id,
+                "lockGeneration": lock_generation, "repositoryKey": repository_key,
+                "expiresAt": expires_at, "firstEventId": first_event_id,
+                "actorKind": "AGENT", "actorId": agent_id,
+                "requestId": request_id, "now": now,
+                "advanceReceipt": receipt, "advanceFingerprint": fingerprint,
+            }
+            plan = workflow_kernel.plan_begin(begin_snapshot, begin_intent)
+            _kernel_apply(connection, work_item_id, begin_snapshot, plan, project_root,
+                          evaluation_time=now)
+        elif action in ("SUBMIT_PLAN", "SUBMIT_IMPLEMENTATION"):
+            if claim is None or claim["agent_id"] != agent_id or writer is None or writer["agent_id"] != agent_id:
+                raise LiteError("workflow submit requires exact claim and writer")
+            if task["status"] != "IN_PROGRESS":
+                raise LiteError("workflow submit requires IN_PROGRESS task")
+            payload = {"from": item["state"]}
+            if action == "SUBMIT_PLAN":
+                artifact = _next_plan_artifact(connection, work_item_id, agent_id,
+                                               {"projectRoot": project_root,
+                                                "path": plan_artifact})
+                _validate_revision_submission(connection, work_item_id, "PLAN",
+                                              file_inputs.get("submissionFile", {}).get("value"))
+                state, next_role = "PLAN_REVIEW_PENDING", "REVIEWER"
+                payload.update({"to": state, "planArtifact": artifact})
+            else:
+                if not local_tests_passed:
+                    raise LiteError("implementation local tests must pass")
+                quality = _validate_quality_baseline(connection, work_item_id,
+                                                     file_inputs["qualityFile"]["value"])
+                from .candidate import release_submission_candidate
+                release_candidate = release_submission_candidate(connection, work_item_id)
+                if release_candidate:
+                    if candidate_id != release_candidate["candidateId"] or candidate_fingerprint != release_candidate["candidateFingerprint"]:
+                        raise LiteError("Release submission candidate drift")
+                    if sorted(quality.get("modifiedScope", [])) != sorted(release_candidate["changedPaths"]):
+                        raise LiteError("Release modifiedScope drift")
+                    payload["reviewedCandidate"] = release_candidate
+                state, next_role = "IMPLEMENTATION_COMPLETED", "REVIEWER"
+                payload.update({"to": state, "qualityBaseline": quality})
+            snapshot = _kernel_snapshot(connection, work_item_id, project_root,
+                                        evaluation_time=now)
+            next_event_id = connection.execute(
+                "SELECT coalesce(max(event_id),0)+1 FROM events"
+            ).fetchone()[0]
+            event_count = 5 if action == "SUBMIT_PLAN" else 4
+            advance_event_id = next_event_id + event_count
+            reviewer_tasks = [row for row in snapshot["tasks"]
+                              if row["owner_role"] == "REVIEWER" and
+                              row["status"] != "COMPLETED"]
+            current_task = min(reviewer_tasks, key=lambda row: row["seq"])["task_id"]
+            receipt = {
+                "protocolVersion": MUTATION_RECEIPT_PROTOCOL,
+                "operation": operation_event, "status": "OK", "reasonCode": None,
+                "workItemId": work_item_id, "state": state,
+                "queueState": "CLAIMABLE", "currentRole": "REVIEWER",
+                "currentTask": current_task, "eventId": advance_event_id,
+                "rowVersion": item["row_version"] + 1,
+                "nextStep": {"action": "BEGIN_REVIEW", "riskClass": "LOCAL_SAFE",
+                             "arguments": {"workItemId": work_item_id,
+                                           "taskId": current_task,
+                                           "role": "REVIEWER"}},
+            }
+            intent = {
+                "operation": action, "workItemId": work_item_id,
+                "taskId": task["task_id"], "claimId": claim["claim_id"],
+                "claimGeneration": claim["generation"], "lockId": writer["lock_id"],
+                "lockGeneration": writer["generation"], "role": claim["role"],
+                "repositoryKey": repository_key, "state": state, "payload": payload,
+                "artifact": artifact if action == "SUBMIT_PLAN" else None,
+                "actorKind": "AGENT", "actorId": agent_id,
+                "requestId": request_id, "now": now,
+                "advanceReceipt": receipt, "advanceFingerprint": fingerprint,
+            }
+            plan = workflow_kernel.plan_submit(snapshot, intent)
+            _kernel_apply(connection, work_item_id, snapshot, plan, project_root,
+                          evaluation_time=now)
+        else:
+            if claim is None or claim["agent_id"] != agent_id or task["status"] != "IN_PROGRESS":
+                raise LiteError("workflow review submit requires exact Reviewer claim")
+            stage = "PLAN" if action == "SUBMIT_PLAN_REVIEW" else "FINAL"
+            if decision not in ("APPROVED", "REJECTED"):
+                raise LiteError("workflow review decision is invalid")
+            author_role = "PLANNER" if stage == "PLAN" else "IMPLEMENTER"
+            author = connection.execute(
+                "SELECT agent_id FROM claims WHERE work_item_id=? AND role=? "
+                "ORDER BY generation DESC LIMIT 1", (work_item_id, author_role),
+            ).fetchone()
+            if author is not None and author[0] == agent_id:
+                raise LiteError("author cannot review own work")
+            review = _normalize_review(connection, work_item_id, stage, decision,
+                                       file_inputs["reviewFile"]["value"])
+            result = review["result"]
+            stored = "APPROVED" if result == "PASS" else "REJECTED"
+            review_id = _id("review")
+            reviewer_claim = _reviewer_claim_identity(dict(claim))
+            reviewer_claim.update({"status": "RELEASED", "releasedAt": now})
+            release_review = stage == "FINAL" and review.get("reviewedCandidate") is not None
+            round_number = review["round"]
+            policy = item["human_gate_policy"]
+            route = workflow_kernel.review_route(
+                stage, result, round_number, item["mode"], policy,
+                release_review=release_review,
+            )
+            reviewer_status = route["reviewerTask"]
+            state = route["state"] or item["state"]
+            queue, next_role = route["queue"], route["role"]
+            auto_approved = False
+            auto_failure = None
+            if (result == "PASS" and item["mode"] == "STANDARD" and
+                    policy == "AUTO_ON_PASS" and not release_review):
+                if stage == "FINAL":
+                    baseline = _latest_submission_baseline(connection, work_item_id)
+                    management = _management_from_events(connection, work_item_id) or {}
+                    pending = connection.execute(
+                        "SELECT count(*) FROM tasks WHERE work_item_id=? AND required=1 "
+                        "AND owner_role<>'REVIEWER' AND status<>'COMPLETED'",
+                        (work_item_id,),
+                    ).fetchone()[0]
+                    if pending or not _quality_baseline_is_auto_safe(baseline, management):
+                        auto_failure = "final approval requires passing implementation quality evidence"
+                    else:
+                        auto_approved = True
+                else:
+                    auto_approved = True
+            if release_review and result == "PASS":
+                state, queue, next_role = "IMPLEMENTATION_COMPLETED", "WAITING_HUMAN", None
+            review_payload = {"eventProtocolVersion": "AWB-REVIEW-EVENT-v7",
+                              "decision": stored, "review": review,
+                              "requestFingerprint": _review_request_fingerprint(work_item_id, stage, agent_id, decision, file_inputs["reviewFile"]["value"]),
+                              "reviewerClaim": reviewer_claim}
+            if auto_failure:
+                review_payload["autoGate"] = {"status": "FAIL_CLOSED",
+                                               "reason": auto_failure}
+            review_snapshot = _kernel_snapshot(connection, work_item_id, project_root,
+                                               evaluation_time=now)
+            next_event_id = connection.execute(
+                "SELECT coalesce(max(event_id),0)+1 FROM events"
+            ).fetchone()[0]
+            terminal_resources = (_terminal_resource_projection(
+                review_snapshot, reviewer_claim)
+                if auto_approved and stage == "FINAL" else None)
+            ready = None
+            if release_review and result == "PASS":
+                submission_event = connection.execute(
+                    "SELECT event_id FROM events WHERE work_item_id=? "
+                    "AND event_type='SUBMIT_IMPLEMENTATION' ORDER BY event_id DESC LIMIT 1",
+                    (work_item_id,),
+                ).fetchone()[0]
+                ready = {"protocolVersion": "AWB-PUBLICATION-READY-v1",
+                         "candidateId": review["reviewedCandidate"]["candidateId"],
+                         "candidateFingerprint": review["reviewedCandidate"]["candidateFingerprint"],
+                         "buildFingerprint": review["reviewedCandidate"]["buildFingerprint"],
+                         "submissionEventId": submission_event, "reviewId": review_id,
+                         "reviewEventId": next_event_id,
+                         "reviewRequestId": request_id + "-review",
+                         "reviewRound": round_number, "reviewerAgentId": agent_id,
+                         "rowVersion": item["row_version"] + 1}
+                ready["readyFingerprint"] = _sha(_json(ready))
+            auto = None
+            if auto_approved:
+                auto = {"policy": policy, "stage": stage, "reviewId": review_id,
+                        "reviewRound": round_number, "reviewRequestId": request_id + "-review",
+                        "reviewEventId": next_event_id, "idempotencyRequestId": request_id}
+                auto.update(_auto_gate_context(connection, work_item_id))
+            optional_count = int(bool(terminal_resources)) + int(bool(ready)) + int(bool(auto))
+            advance_event_id = next_event_id + 3 + optional_count
+            if auto_approved and stage == "FINAL":
+                receipt_state, receipt_queue, receipt_role, current_task = (
+                    "FINAL_ACCEPTANCE_APPROVED", "HELD", None, None)
+            elif auto_approved:
+                implementer_tasks = [row for row in review_snapshot["tasks"]
+                                     if row["owner_role"] == "IMPLEMENTER" and
+                                     row["status"] != "COMPLETED"]
+                current_task = min(implementer_tasks, key=lambda row: row["seq"])["task_id"]
+                receipt_state, receipt_queue, receipt_role = (
+                    "PLAN_REVIEW_APPROVED", "CLAIMABLE", "IMPLEMENTER")
+            else:
+                receipt_state, receipt_queue, receipt_role = state, queue, next_role
+                candidates = [row for row in review_snapshot["tasks"]
+                              if row["owner_role"] == next_role and row["status"] != "COMPLETED"]
+                current_task = (min(candidates, key=lambda row: row["seq"])["task_id"]
+                                if candidates else None)
+            receipt = {"protocolVersion": MUTATION_RECEIPT_PROTOCOL,
+                       "operation": operation_event, "status": "OK", "reasonCode": None,
+                       "workItemId": work_item_id, "state": receipt_state,
+                       "queueState": receipt_queue, "currentRole": receipt_role,
+                       "currentTask": current_task, "eventId": advance_event_id,
+                       "rowVersion": item["row_version"] + 1,
+                       "nextStep": {"action": "NONE", "arguments": {}}}
+            author_task = next((row for row in review_snapshot["tasks"]
+                                if row["owner_role"] == author_role), None)
+            extra_events = [
+                {"requestId": request_id + "-task-review", "eventId": next_event_id + 1,
+                 "eventType": "TASK_STATUS_CHANGED", "actorKind": "AGENT",
+                 "actorId": agent_id, "payload": {"taskId": task["task_id"],
+                 "from": "IN_PROGRESS", "status": reviewer_status,
+                 "evidence": [{"reviewRound": round_number, "result": result}]}},
+                {"requestId": request_id + "-claim-release", "eventId": next_event_id + 2,
+                 "eventType": "CLAIM_RELEASED", "actorKind": "AGENT",
+                 "actorId": agent_id, "payload": {"claimId": claim["claim_id"],
+                 "taskId": claim["task_id"], "role": claim["role"],
+                 "generation": claim["generation"]}},
+            ]
+            optional_event_id = next_event_id + 3
+            review_intent = {
+                "operation": "PLAN_REVIEW" if stage == "PLAN" else "FINAL_REVIEW",
+                "workItemId": work_item_id, "stage": stage, "reviewId": review_id,
+                "review": review, "storedDecision": stored, "claimId": claim["claim_id"],
+                "claimGeneration": claim["generation"], "reviewerTaskId": task["task_id"],
+                "reviewerStatus": reviewer_status,
+                "reviewEvidence": [{"reviewRound": round_number, "result": result}],
+                "authorRole": author_role, "authorTaskId": (author_task["task_id"] if
+                    route["authorTask"] == "NOT_STARTED" else None),
+                "state": state, "queue": queue, "role": next_role,
+                "autoApproved": auto_approved, "reviewPayload": review_payload,
+                "reviewRequestId": request_id + "-review", "reviewEventId": next_event_id,
+                "extraEvents": extra_events, "terminalResources": terminal_resources,
+                "terminalRequestId": request_id + "-terminal-activity",
+                "terminalEventId": optional_event_id if terminal_resources else None,
+                "readyPayload": ready, "readyRequestId": request_id + "-publication-ready",
+                "readyEventId": optional_event_id if ready else None,
+                "autoPayload": auto, "autoRequestId": request_id + "-auto-gate",
+                "autoEventId": (optional_event_id + int(bool(terminal_resources or ready))
+                                if auto else None),
+                "actorKind": "AGENT", "actorId": agent_id,
+                "requestId": request_id, "now": now,
+                "advanceReceipt": receipt, "advanceFingerprint": fingerprint,
+                "nextStep": receipt["nextStep"],
+            }
+            plan = workflow_kernel.plan_review(review_snapshot, review_intent)
+            _kernel_apply(connection, work_item_id, review_snapshot, plan, project_root,
+                          evaluation_time=now)
+        if receipt is None:
+            raise LiteError("UNREGISTERED_WORKFLOW_ADVANCE_EDGE")
+        _kernel_assert(connection, work_item_id, project_root, phase="post")
+        _workflow_materialized(connection, work_item_id, request_id)
+        connection.commit()
+        return receipt
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _workflow_materialized(connection, work_item_id, request_id):
+    """Fault-injection seam after complete workflow plan and before commit."""
+    return None
+
+
+def _kernel_snapshot(connection, work_item_id, project_root=None,
+                     evaluation_time=None):
+    """Build the one canonical projection consumed by the workflow kernel."""
+    evaluation_time = evaluation_time or _now()
+    item = dict(_item(connection, work_item_id))
+    tasks = [dict(row) for row in connection.execute(
+        "SELECT * FROM tasks WHERE work_item_id=? ORDER BY seq", (work_item_id,)
+    )]
+    claims = [dict(row) for row in connection.execute(
+        "SELECT * FROM claims WHERE work_item_id=? ORDER BY generation,claim_id",
+        (work_item_id,),
+    )]
+    writers = [dict(row) for row in connection.execute(
+        "SELECT * FROM repository_locks WHERE work_item_id=? "
+        "ORDER BY generation,lock_id", (work_item_id,),
+    )]
+    try:
+        leases = [dict(row) for row in connection.execute(
+            "SELECT * FROM orchestrator_leases WHERE work_item_id=? "
+            "ORDER BY generation,lease_id", (work_item_id,),
+        )]
+    except sqlite3.Error:
+        leases = []
+    reviews = [dict(row) for row in connection.execute(
+        "SELECT * FROM reviews WHERE work_item_id=? ORDER BY rowid",
+        (work_item_id,),
+    )]
+    for review_row in reviews:
+        review_row["review"] = _decoded_review(review_row)
+    events = [dict(row) for row in connection.execute(
+        "SELECT event_id,event_type,actor_kind,actor_id,request_id,payload_json,created_at "
+        "FROM events WHERE work_item_id=? ORDER BY event_id", (work_item_id,),
+    )]
+    # A repair receipt binds the post-repair projection.  Exclude only that
+    # self-referential value from the history digest so it can be computed in a
+    # rolled-back dry materialization and then stored immutably in the request
+    # event without changing the projection it identifies.
+    history_events = []
+    for event in events:
+        canonical_event = dict(event)
+        if event["event_type"] == "WORKFLOW_REPAIRED":
+            payload = _event_payload(event)
+            receipt = payload.get("receipt")
+            if isinstance(receipt, dict) and "toFingerprint" in receipt:
+                payload = dict(payload)
+                payload["receipt"] = dict(receipt)
+                payload["receipt"].pop("toFingerprint", None)
+                canonical_event["payload_json"] = _json(payload)
+        history_events.append(canonical_event)
+    history_digest = workflow_kernel.content_fingerprint(history_events)
+    event_head = events[-1]["event_id"] if events else 0
+    artifact_head = _plan_artifact_head(connection, work_item_id)
+    artifact_sha = None
+    if artifact_head is not None and project_root is not None:
+        try:
+            unused_root, unused_relative, absolute = _regular_plan_path(
+                project_root, artifact_head.get("path")
+            )
+            artifact_sha = _artifact_sha(absolute)
+        except LiteError:
+            artifact_sha = "UNAVAILABLE"
+    review_events = []
+    gate_events = []
+    artifact_at_event = None
+    candidate_at_event = None
+    for event in events:
+        payload = _event_payload(event)
+        if event["event_type"] == "PLAN_ARTIFACT_HEAD":
+            artifact_at_event = payload
+            continue
+        if event["event_type"] == "SUBMIT_IMPLEMENTATION":
+            candidate_at_event = payload.get("reviewedCandidate")
+        if event["event_type"] in ("AGENT_PLAN_REVIEW", "AGENT_FINAL_REVIEW"):
+            payload_keys = set(payload)
+            native_required = {
+                "eventProtocolVersion", "decision", "review", "requestFingerprint",
+            }
+            if (payload.get("eventProtocolVersion") == "AWB-REVIEW-EVENT-v7" and
+                    native_required.issubset(payload_keys) and
+                    payload_keys.difference(native_required).issubset(
+                        {"reviewerClaim", "autoGate"}) and
+                    isinstance(payload.get("review"), dict)):
+                record_format = "AWB-REVIEW-EVENT-v7"
+                event_review = payload.get("review")
+            elif (payload_keys in (
+                    {"decision", "review", "requestFingerprint"},
+                    {"decision", "review", "requestFingerprint", "reviewerClaim"}) and
+                  isinstance(payload.get("review"), dict) and
+                  isinstance(payload.get("requestFingerprint"), str) and
+                  payload.get("requestFingerprint")):
+                record_format = "AWB-REVIEW-EVENT-v6"
+                event_review = payload.get("review")
+            elif (payload_keys == {"decision", "review"} and
+                  isinstance(payload.get("review"), dict)):
+                record_format = "AWB-REVIEW-EVENT-v3-v6"
+                event_review = payload.get("review")
+            elif (payload_keys == {"decision", "summary"} and
+                  isinstance(payload.get("summary"), str)):
+                record_format = "AWB-REVIEW-SUMMARY-EVENT-v3-v6"
+                event_review = _decoded_review({
+                    "summary": payload["summary"],
+                    "stage": ("PLAN" if event["event_type"] ==
+                              "AGENT_PLAN_REVIEW" else "FINAL"),
+                    "decision": payload.get("decision"),
+                })
+            else:
+                record_format = "UNKNOWN"
+                event_review = None
+            review_events.append({
+                "eventId": event["event_id"],
+                "eventType": event["event_type"],
+                "actorKind": event["actor_kind"],
+                "actorId": event["actor_id"],
+                "requestId": event["request_id"],
+                "createdAt": event["created_at"],
+                "decision": payload.get("decision"),
+                "requestFingerprint": payload.get("requestFingerprint"),
+                "review": event_review,
+                "recordFormat": record_format,
+                "rawSummary": payload.get("summary"),
+                "artifactAtReview": artifact_at_event,
+                "candidateAtReview": candidate_at_event,
+            })
+        elif event["event_type"] in (
+                "HUMAN_PLAN_GATE", "HUMAN_FINAL_GATE", "AUTO_GATE_APPROVED"):
+            gate_events.append({
+                "eventId": event["event_id"],
+                "eventType": event["event_type"],
+                "requestId": event["request_id"],
+                "decision": payload.get("decision"),
+                "stage": payload.get("stage"),
+                "reviewId": payload.get("reviewId"),
+                "reviewEventId": payload.get("reviewEventId"),
+                "reviewRequestId": payload.get("reviewRequestId"),
+                "reviewRound": payload.get("reviewRound"),
+            })
+    return workflow_kernel.canonical_projection(
+        item, tasks, claims, writers, leases, reviews, event_head,
+        history_digest, artifact_head=artifact_head,
+        artifact_sha=artifact_sha, evaluation_time=evaluation_time,
+        review_events=review_events, gate_events=gate_events,
+    )
+
+
+def _kernel_assert(connection, work_item_id, project_root=None, phase="post",
+                   allow_time_split=False, evaluation_time=None):
+    snapshot = _kernel_snapshot(
+        connection, work_item_id, project_root,
+        evaluation_time=evaluation_time,
+    )
+    try:
+        workflow_kernel.assert_invariants(
+            snapshot, phase=phase, allow_time_split=allow_time_split
+        )
+    except RuntimeError as exc:
+        prefix = ("INTERNAL_INVARIANT_VIOLATION" if phase == "post" else
+                  "WORKFLOW_INVARIANT_VIOLATION")
+        raise LiteError("{0}:{1}".format(prefix, str(exc).split(":")[-1]))
+    return snapshot
+
+
+def _kernel_apply(connection, work_item_id, snapshot, plan, project_root=None,
+                  evaluation_time=None):
+    """The only public-adapter seam that may materialize lifecycle writes."""
+    try:
+        return workflow_kernel.apply_transition_plan(
+            connection, snapshot, plan,
+            lambda: _kernel_snapshot(
+                connection, work_item_id, project_root,
+                evaluation_time=evaluation_time,
+            ),
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise LiteError("INTERNAL_INVARIANT_VIOLATION:{0}".format(exc))
+
+
+def _stale_activity_recipe(snapshot, work_item_id):
+    expected = []
+    kinds = (("claims", "AGENT_CLAIM", "AGENT"),
+             ("writers", "REPOSITORY_WRITER", "AGENT"),
+             ("leases", "ORCHESTRATOR_LEASE", "ORCHESTRATOR"))
+    for collection, kind, owner_kind in kinds:
+        for row in snapshot[collection]:
+            if row["effectiveStatus"] != "STALE":
+                continue
+            value = {
+                "kind": kind, "resourceId": row["id"],
+                "workItemId": work_item_id, "ownerKind": owner_kind,
+                "ownerId": row["owner"], "generation": row["generation"],
+                "expiresAt": row["expiresAt"], "persistedStatus": "ACTIVE",
+                "effectiveStatus": "STALE",
+            }
+            if row.get("taskId") is not None:
+                value["taskId"] = row["taskId"]
+            if row.get("repositoryKey") is not None:
+                value["repositoryKey"] = row["repositoryKey"]
+            expected.append(value)
+    expected.sort(key=lambda row: (row["kind"], row["resourceId"]))
+    if not expected:
+        return None, None, None
+    live_claims = [row for row in snapshot["claims"]
+                   if row["effectiveStatus"] == "LIVE"]
+    live_agent_activity = [row for collection in
+                           (snapshot["claims"], snapshot["writers"])
+                           for row in collection
+                           if row["effectiveStatus"] == "LIVE"]
+    live_activity = [row for collection in
+                     (snapshot["claims"], snapshot["writers"], snapshot["leases"])
+                     for row in collection if row["effectiveStatus"] == "LIVE"]
+    stale_claims = [row for row in snapshot["claims"]
+                    if row["effectiveStatus"] == "STALE"]
+    stale_writers = [row for row in snapshot["writers"]
+                     if row["effectiveStatus"] == "STALE"]
+    # Agent claim/writer resources are one bound ownership bundle.  A LIVE
+    # member makes a stale sibling ambiguous, but an independently fenced LIVE
+    # Orchestrator lease is not part of that bundle and must be preserved.
+    if stale_claims and live_agent_activity:
+        return None, None, None
+    # Writer-only expiry may preserve its exact live owner claim.  A live claim
+    # owned by anyone else is an ambiguous repository hand-off.
+    if stale_writers and live_claims and any(
+            writer["owner"] != claim["owner"]
+            for writer in stale_writers for claim in live_claims):
+        return None, None, None
+    request_id = "workflow-expire-" + snapshot["projectionFingerprint"][:24]
+    not_after = min((row["expiresAt"] for row in live_activity), default=None)
+    return expected, request_id, not_after
+
+
+def _orphan_reviewer_recipe(connection, snapshot, project_root):
+    """Recognize only the frozen AWB-024 public-b6 projection split."""
+    item = snapshot["workItem"]
+    if (item["work_item_id"] != "AWB-024" or item["state"] != "DRAFT" or
+            item["queue_state"] != "CLAIMABLE" or
+            item["current_role"] != "PLANNER"):
+        return None
+    tasks = snapshot["tasks"]
+    reviewers = [row for row in tasks if row["owner_role"] == "REVIEWER"]
+    authors = [row for row in tasks if row["owner_role"] in
+               ("PLANNER", "IMPLEMENTER")]
+    if (len(reviewers) != 1 or reviewers[0]["status"] != "IN_PROGRESS" or
+            any(row["status"] != "NOT_STARTED" for row in authors)):
+        return None
+    if any(row["status"] == "ACTIVE" for collection in
+           (snapshot["claims"], snapshot["writers"], snapshot["leases"])
+           for row in collection):
+        return None
+    review_rows = connection.execute(
+        "SELECT * FROM reviews WHERE work_item_id=? AND stage='PLAN' ORDER BY rowid",
+        (item["work_item_id"],),
+    ).fetchall()
+    if len(review_rows) != 1:
+        return None
+    review = _decoded_review(review_rows[0])
+    if (review.get("round") != 1 or review.get("result") != "REVISE_TO_PLANNER" or
+            review_rows[0]["decision"] != "REJECTED"):
+        return None
+    event = connection.execute(
+        "SELECT * FROM events WHERE work_item_id=? AND event_type='AGENT_PLAN_REVIEW' "
+        "ORDER BY event_id DESC LIMIT 1", (item["work_item_id"],),
+    ).fetchone()
+    if event is None or event["actor_id"] != review_rows[0]["reviewer_agent_id"]:
+        return None
+    claim_rows = connection.execute(
+        "SELECT * FROM claims WHERE work_item_id=? AND role='REVIEWER' "
+        "AND agent_id=? AND status='RELEASED' ORDER BY generation",
+        (item["work_item_id"], event["actor_id"]),
+    ).fetchall()
+    if len(claim_rows) != 1 or claim_rows[0]["task_id"] != reviewers[0]["task_id"]:
+        return None
+    later = connection.execute(
+        "SELECT 1 FROM events WHERE work_item_id=? AND event_id>? AND event_type IN "
+        "('AGENT_PLAN_REVIEW','SUBMIT_PLAN','HUMAN_PLAN_GATE',"
+        "'AUTO_GATE_APPROVED','WORK_ITEM_MANAGEMENT_AMENDED') LIMIT 1",
+        (item["work_item_id"], event["event_id"]),
+    ).fetchone()
+    if later is not None:
+        return None
+    head = snapshot.get("artifactHead") or {}
+    if (head.get("path") != "docs/work-items/AWB-024-v0.3.1b7-preview-release.md" or
+            snapshot.get("artifactSha256") !=
+            "c406cffab3dc3ec91853637f08f2d7d80f45632457bc59e9d9e40019af07c09a"):
+        return None
+    return {"taskId": reviewers[0]["task_id"],
+            "reviewId": review_rows[0]["review_id"],
+            "reviewEventId": event["event_id"],
+            "claimId": claim_rows[0]["claim_id"]}
+
+
+def _check_one(connection, project_root, work_item_id, evaluation_time=None):
+    snapshot = _kernel_snapshot(connection, work_item_id, project_root,
+                                evaluation_time=evaluation_time)
+    violations = workflow_kernel.invariant_violations(snapshot)
+    recipe = _orphan_reviewer_recipe(connection, snapshot, project_root)
+    if recipe is not None:
+        # The closed recipe is stronger than the generic invariant classifier.
+        request_id = "workflow-repair-" + snapshot["projectionFingerprint"][:24]
+        return workflow_kernel.repair_result(
+            work_item_id, snapshot, violations,
+            recipe=workflow_kernel.RESET_ORPHAN_REVIEWER_TASK,
+            request_id=request_id,
+        )
+    expected, request_id, not_after = _stale_activity_recipe(
+        snapshot, work_item_id
+    )
+    if expected is not None:
+        return workflow_kernel.repair_result(
+            work_item_id, snapshot, violations,
+            request_id=request_id, expected_activity=expected,
+            not_after=not_after,
+        )
+    return workflow_kernel.repair_result(work_item_id, snapshot, violations)
+
+
+def workflow_check(database, project_root, work_item_id=None):
+    """Read-only invariant check for one WorkItem or the complete board."""
+    connection = open_database(database)
+    try:
+        connection.execute("BEGIN")
+        if work_item_id is not None:
+            result = _check_one(connection, project_root, work_item_id)
+            connection.rollback()
+            return result
+        identifiers = [row[0] for row in connection.execute(
+            "SELECT work_item_id FROM work_items ORDER BY work_item_id"
+        )]
+        results = [_check_one(connection, project_root, value)
+                   for value in identifiers]
+        connection.rollback()
+        status = ("PASS" if all(row["status"] == "PASS" for row in results)
+                  else "WAITING_HUMAN" if any(row["status"] == "WAITING_HUMAN"
+                                               for row in results)
+                  else "VIOLATION")
+        digest = workflow_kernel.content_fingerprint([
+            {"workItemId": row["workItemId"],
+             "projectionFingerprint": row["projectionFingerprint"],
+             "status": row["status"]} for row in results
+        ])
+        return {
+            "protocolVersion": workflow_kernel.CHECK_PROTOCOL,
+            "operation": "CHECK_ALL", "status": status,
+            "projectionFingerprint": digest, "results": results,
+            "nextStep": {"action": ("NONE" if status == "PASS" else
+                                    "CONSUME_EACH_EXACT_RESULT"),
+                         "arguments": {}},
+        }
+    finally:
+        connection.close()
+
+
+def workflow_repair(database, project_root, work_item_id, action,
+                    fingerprint, request_id, human_id):
+    if action != workflow_kernel.RESET_ORPHAN_REVIEWER_TASK:
+        return {
+            "protocolVersion": workflow_kernel.REPAIR_PROTOCOL,
+            "operation": "REPAIR", "status": "WAITING_HUMAN",
+            "reasonCode": "UNREGISTERED_OR_AMBIGUOUS_REPAIR",
+            "workItemId": work_item_id,
+            "nextStep": {"action": "HUMAN_INSPECT_WORKFLOW_PROJECTION",
+                         "arguments": {}},
+        }
+    if not human_id or not request_id or not fingerprint:
+        raise LiteError("workflow repair requires exact proof and HUMAN identity")
+    connection = open_database(database)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        replay = connection.execute(
+            "SELECT * FROM events WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if replay is not None:
+            payload = _event_payload(replay)
+            if (replay["event_type"] != "WORKFLOW_REPAIRED" or
+                    replay["actor_kind"] != "HUMAN" or
+                    replay["actor_id"] != human_id or
+                    payload.get("action") != action or
+                    payload.get("fromFingerprint") != fingerprint):
+                raise LiteError("REQUEST_REPLAY_CONFLICT")
+            replay_receipt = dict(payload["receipt"])
+            if not replay_receipt.get("toFingerprint"):
+                raise LiteError("INCOMPLETE_REPAIR_RECEIPT")
+            connection.rollback()
+            return replay_receipt
+        check = _check_one(connection, project_root, work_item_id)
+        expected = check.get("nextStep", {}).get("arguments", {})
+        if (check.get("repairability") != "DETERMINISTIC" or
+                check.get("projectionFingerprint") != fingerprint or
+                expected.get("action") != action or
+                expected.get("requestId") != request_id):
+            connection.rollback()
+            return {
+                "protocolVersion": workflow_kernel.REPAIR_PROTOCOL,
+                "operation": "REPAIR", "status": "REFUSED",
+                "reasonCode": "STALE_REPAIR_PROOF", "workItemId": work_item_id,
+                "nextStep": {"action": "RUN_WORKFLOW_CHECK", "arguments": {
+                    "workItem": work_item_id}},
+            }
+        snapshot = _kernel_snapshot(connection, work_item_id, project_root)
+        proof = _orphan_reviewer_recipe(connection, snapshot, project_root)
+        if proof is None:
+            raise LiteError("STALE_REPAIR_PROOF")
+        item = _item(connection, work_item_id)
+        now = _now()
+        event_id = connection.execute(
+            "SELECT coalesce(max(event_id),0)+1 FROM events"
+        ).fetchone()[0]
+        receipt = {
+            "protocolVersion": MUTATION_RECEIPT_PROTOCOL,
+            "operation": "WORKFLOW_REPAIRED", "status": "OK",
+            "workItemId": work_item_id, "eventId": event_id,
+            "rowVersion": item["row_version"] + 1,
+            "fromFingerprint": fingerprint,
+            "nextStep": {"action": "RUN_WORKFLOW_CHECK",
+                         "arguments": {"workItem": work_item_id}},
+        }
+        payload = {
+            "protocolVersion": workflow_kernel.REPAIR_PROTOCOL,
+            "action": action, "fromFingerprint": fingerprint,
+            "proof": proof, "changedProjection": ["REVIEWER_TASK_STATUS"],
+            "historyPreserved": True, "receipt": receipt,
+        }
+        intent = {
+            "operation": workflow_kernel.RESET_ORPHAN_REVIEWER_TASK,
+            "workItemId": work_item_id, "requestId": request_id,
+            "actorKind": "HUMAN", "actorId": human_id, "now": now,
+            "taskId": proof["taskId"], "eventId": event_id, "payload": payload,
+        }
+        # Determine the exact post state without committing any write.  The
+        # canonical history digest intentionally ignores only this receipt's
+        # self-reference, so the final materialization has the same fingerprint.
+        connection.execute("SAVEPOINT workflow_repair_receipt")
+        trial_post = _kernel_apply(
+            connection, work_item_id, snapshot,
+            workflow_kernel.plan_orphan_repair(snapshot, intent),
+            project_root=project_root, evaluation_time=now,
+        )
+        connection.execute("ROLLBACK TO workflow_repair_receipt")
+        connection.execute("RELEASE workflow_repair_receipt")
+        receipt["toFingerprint"] = trial_post["projectionFingerprint"]
+        payload["receipt"] = dict(receipt)
+        post = _kernel_apply(
+            connection, work_item_id, snapshot,
+            workflow_kernel.plan_orphan_repair(snapshot, intent),
+            project_root=project_root, evaluation_time=now,
+        )
+        if post["projectionFingerprint"] != receipt["toFingerprint"]:
+            raise LiteError("INTERNAL_INVARIANT_VIOLATION:REPAIR_RECEIPT_DRIFT")
+        _workflow_repair_materialized(connection, work_item_id, request_id)
+        connection.commit()
+        return receipt
+    except RuntimeError as exc:
+        connection.rollback()
+        raise LiteError("INTERNAL_INVARIANT_VIOLATION:{0}".format(exc))
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _workflow_repair_materialized(connection, work_item_id, request_id):
+    """Fault-injection seam after exact repair materialization and before commit."""
+    return None
 
 
 def timeline(database, work_item_id):
@@ -2873,6 +3761,61 @@ def _print(value):
     print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
 
 
+def _reason_code(message):
+    explicit = re.match(r"^[A-Z][A-Z0-9_]+$", str(message))
+    if explicit:
+        return str(message)
+    normalized = re.sub(r"[^A-Z0-9]+", "_", str(message).upper()).strip("_")
+    return normalized[:96] or "MUTATION_REFUSED"
+
+
+def mutation_receipt(database, work_item_id, request_id, operation):
+    connection = open_database(database)
+    try:
+        item = _item(connection, work_item_id)
+        event = connection.execute(
+            "SELECT event_id,event_type FROM events WHERE request_id=?", (request_id,)
+        ).fetchone() if request_id else None
+    finally:
+        connection.close()
+    projection = get_work_item(database, work_item_id)
+    action = projection.get("nextStep") or "NONE"
+    return {
+        "protocolVersion": MUTATION_RECEIPT_PROTOCOL,
+        "operation": event["event_type"] if event else operation,
+        "status": "OK", "reasonCode": None, "workItemId": work_item_id,
+        "state": item["state"], "queueState": item["queue_state"],
+        "currentRole": item["current_role"], "currentTask": projection.get("currentTask"),
+        "eventId": event["event_id"] if event else None,
+        "rowVersion": item["row_version"],
+        "nextStep": {"action": action, "arguments": {}},
+    }
+
+
+def mutation_error_receipt(database, work_item_id, operation, message):
+    state = queue = role = task = row_version = None
+    if work_item_id:
+        try:
+            projection = get_work_item(database, work_item_id)
+            state, queue = projection["state"], projection["queue_state"]
+            role, task = projection["current_role"], projection.get("currentTask")
+            row_version = projection["row_version"]
+        except LiteError:
+            pass
+    code = _reason_code(message)
+    return {
+        "protocolVersion": MUTATION_RECEIPT_PROTOCOL, "operation": operation,
+        "status": "REFUSED", "reasonCode": code, "workItemId": work_item_id,
+        "state": state, "queueState": queue, "currentRole": role,
+        "currentTask": task, "eventId": None, "rowVersion": row_version,
+        "nextStep": {"action": "RESOLVE_" + code, "arguments": {}},
+    }
+
+
+def _mutation_print(database, work_item_id, request_id, operation, full, result=None):
+    _print(result if full else mutation_receipt(database, work_item_id, request_id, operation))
+
+
 def _load_json_file(path, label):
     if not path:
         return None
@@ -2904,6 +3847,8 @@ def main(argv=None):
     create.add_argument("--risk-file", required=True)
     create.add_argument("--human-review", choices=("auto-on-pass", "manual"))
     create.add_argument("--decision-actor")
+    create.add_argument("--request-id")
+    create.add_argument("--full", action="store_true")
     sub.add_parser("list")
     show = sub.add_parser("show")
     show.add_argument("work_item_id")
@@ -2920,24 +3865,34 @@ def main(argv=None):
     claim.add_argument("--model")
     claim.add_argument("--orchestrator-id")
     claim.add_argument("--orchestrator-generation", type=int)
+    claim.add_argument("--request-id")
+    claim.add_argument("--full", action="store_true")
     release = sub.add_parser("release")
     release.add_argument("work_item_id")
     release.add_argument("--agent", required=True)
+    release.add_argument("--request-id")
+    release.add_argument("--full", action="store_true")
     lock = sub.add_parser("lock")
     lock.add_argument("work_item_id")
     lock.add_argument("--repository", required=True)
     lock.add_argument("--agent", required=True)
     lock.add_argument("--ttl", type=int, default=900)
+    lock.add_argument("--request-id")
+    lock.add_argument("--full", action="store_true")
     unlock = sub.add_parser("unlock")
     unlock.add_argument("work_item_id")
     unlock.add_argument("--repository", required=True)
     unlock.add_argument("--agent", required=True)
+    unlock.add_argument("--request-id")
+    unlock.add_argument("--full", action="store_true")
     task = sub.add_parser("task")
     task.add_argument("work_item_id")
     task.add_argument("task_id")
     task.add_argument("--agent", required=True)
     task.add_argument("--status", required=True, choices=("IN_PROGRESS", "BLOCKED", "WAITING_ACCEPTANCE", "COMPLETED", "CANCELLED"))
     task.add_argument("--evidence", action="append", default=[])
+    task.add_argument("--request-id")
+    task.add_argument("--full", action="store_true")
     transition_parser = sub.add_parser("transition")
     transition_parser.add_argument("work_item_id")
     transition_parser.add_argument("action", choices=("submit_plan", "start_implementation", "submit_implementation"))
@@ -2947,6 +3902,9 @@ def main(argv=None):
     transition_parser.add_argument("--quality-file")
     transition_parser.add_argument("--plan-artifact")
     transition_parser.add_argument("--request-id")
+    transition_parser.add_argument("--candidate")
+    transition_parser.add_argument("--candidate-fingerprint")
+    transition_parser.add_argument("--full", action="store_true")
     review = sub.add_parser("review")
     review.add_argument("work_item_id")
     review.add_argument("--stage", required=True, choices=("PLAN", "FINAL"))
@@ -2956,43 +3914,57 @@ def main(argv=None):
     review.add_argument("--review-file")
     review.add_argument("--replacement-file")
     review.add_argument("--request-id")
+    review.add_argument("--full", action="store_true")
     gate = sub.add_parser("gate")
     gate.add_argument("work_item_id")
     gate.add_argument("--stage", required=True, choices=("PLAN", "FINAL"))
     gate.add_argument("--human", required=True)
     gate.add_argument("--decision", required=True, choices=("APPROVED", "REJECTED"))
     gate.add_argument("--reason", required=True)
+    gate.add_argument("--request-id")
+    gate.add_argument("--full", action="store_true")
     for command in ("hold", "resume"):
         hold = sub.add_parser(command)
         hold.add_argument("work_item_id")
         hold.add_argument("--human", required=True)
         hold.add_argument("--reason", default="USER_PAUSED")
+        hold.add_argument("--request-id")
+        hold.add_argument("--full", action="store_true")
     unblock = sub.add_parser("unblock")
     unblock.add_argument("work_item_id")
     unblock.add_argument("task_id")
     unblock.add_argument("--human", required=True)
     unblock.add_argument("--reason", required=True)
+    unblock.add_argument("--request-id")
+    unblock.add_argument("--full", action="store_true")
     recover = sub.add_parser("recover-review-task")
     recover.add_argument("work_item_id")
     recover.add_argument("task_id")
     recover.add_argument("--human")
     recover.add_argument("--reason")
     recover.add_argument("--request-id")
+    recover.add_argument("--full", action="store_true")
     backfill = sub.add_parser("management-backfill")
     backfill.add_argument("work_item_id")
     backfill.add_argument("--agent", required=True)
     backfill.add_argument("--management-file", required=True)
     backfill.add_argument("--basis", required=True)
+    backfill.add_argument("--request-id")
+    backfill.add_argument("--full", action="store_true")
     amend = sub.add_parser("management-amend")
     amend.add_argument("work_item_id")
     amend.add_argument("--human", required=True)
     amend.add_argument("--management-file", required=True)
     amend.add_argument("--reason", required=True)
+    amend.add_argument("--request-id")
+    amend.add_argument("--full", action="store_true")
     deviation = sub.add_parser("plan-deviation")
     deviation.add_argument("work_item_id")
     deviation.add_argument("task_id")
     deviation.add_argument("--agent", required=True)
     deviation.add_argument("--evidence-file", required=True)
+    deviation.add_argument("--request-id")
+    deviation.add_argument("--full", action="store_true")
     serve = sub.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
@@ -3001,7 +3973,8 @@ def main(argv=None):
         if args.command == "init":
             _print(initialize_database(args.database))
         elif args.command == "create":
-            _print(create_work_item(
+            request_id = args.request_id or _id("create")
+            result = create_work_item(
                 args.database, args.work_item_id, args.type, args.title, args.mode, args.priority,
                 management=_load_json_file(args.management_file, "management file"),
                 creation_risk=_load_json_file(args.risk_file, "risk file"),
@@ -3009,7 +3982,10 @@ def main(argv=None):
                     args.human_review
                 )),
                 decision_actor=args.decision_actor,
-            ))
+                request_id=request_id,
+            )
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "WORK_ITEM_CREATED", args.full, result)
         elif args.command == "list":
             _print(list_work_items(args.database))
         elif args.command == "show":
@@ -3020,40 +3996,65 @@ def main(argv=None):
             if args.ttl < 1:
                 raise LiteError("ttl must be positive")
             expires = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=args.ttl)).replace(microsecond=0).isoformat()
-            _print(acquire_claim(args.database, args.work_item_id, args.task_id, args.agent,
-                                 args.role, expires, session_id=args.session_id,
-                                 usage_provider=args.usage_provider, model=args.model,
-                                 orchestrator_id=args.orchestrator_id,
-                                 orchestrator_generation=args.orchestrator_generation,
-                                 usage_policy=args.usage_policy))
-        elif args.command == "release":
-            release_claim(args.database, args.work_item_id, args.agent,
+            request_id = args.request_id or _id("claim")
+            acquire_claim(args.database, args.work_item_id, args.task_id, args.agent,
+                          args.role, expires, request_id=request_id,
+                          session_id=args.session_id, usage_provider=args.usage_provider,
+                          model=args.model, orchestrator_id=args.orchestrator_id,
+                          orchestrator_generation=args.orchestrator_generation,
                           usage_policy=args.usage_policy)
-            _print(get_work_item(args.database, args.work_item_id))
+            result = get_work_item(args.database, args.work_item_id)
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "CLAIM_ACQUIRED", args.full, result)
+        elif args.command == "release":
+            request_id = args.request_id or _id("release")
+            release_claim(args.database, args.work_item_id, args.agent,
+                          request_id=request_id, usage_policy=args.usage_policy)
+            result = get_work_item(args.database, args.work_item_id)
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "CLAIM_RELEASED", args.full, result)
         elif args.command == "lock":
             if args.ttl < 1:
                 raise LiteError("ttl must be positive")
             expires = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=args.ttl)).replace(microsecond=0).isoformat()
-            _print(acquire_repository_lock(args.database, args.work_item_id, args.repository, args.agent, expires))
+            request_id = args.request_id or _id("repo-lock")
+            acquire_repository_lock(args.database, args.work_item_id, args.repository,
+                                    args.agent, expires, request_id=request_id)
+            result = get_work_item(args.database, args.work_item_id)
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "REPOSITORY_LOCK_ACQUIRED", args.full, result)
         elif args.command == "unlock":
-            release_repository_lock(args.database, args.work_item_id, args.repository, args.agent)
-            _print(get_work_item(args.database, args.work_item_id))
+            request_id = args.request_id or _id("repo-release")
+            release_repository_lock(args.database, args.work_item_id, args.repository,
+                                    args.agent, request_id=request_id)
+            result = get_work_item(args.database, args.work_item_id)
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "REPOSITORY_LOCK_RELEASED", args.full, result)
         elif args.command == "task":
+            request_id = args.request_id or _id("task")
             set_task_status(args.database, args.work_item_id, args.task_id, args.agent,
-                            args.status, args.evidence, usage_policy=args.usage_policy)
-            _print(get_work_item(args.database, args.work_item_id))
+                            args.status, args.evidence, request_id=request_id,
+                            usage_policy=args.usage_policy)
+            result = get_work_item(args.database, args.work_item_id)
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "TASK_STATUS_CHANGED", args.full, result)
         elif args.command == "transition":
-            _print(transition(
+            request_id = args.request_id or _id(args.action)
+            result = transition(
                 args.database, args.work_item_id, args.action, args.agent,
                 local_tests_passed=args.local_tests_passed,
                 submission=_load_json_file(args.submission_file, "submission file"),
                 quality_baseline=_load_json_file(args.quality_file, "quality file"),
                 usage_policy=args.usage_policy,
-                request_id=args.request_id,
+                request_id=request_id,
                 plan_artifact=({"projectRoot": args.project_root,
                                 "path": args.plan_artifact}
                                if args.plan_artifact else None),
-            ))
+                candidate_id=args.candidate,
+                candidate_fingerprint=args.candidate_fingerprint,
+            )
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            args.action.upper(), args.full, result)
         elif args.command == "review":
             review_summary = _load_json_file(args.review_file, "review file") if args.review_file else args.summary
             if review_summary is None:
@@ -3063,49 +4064,84 @@ def main(argv=None):
                     raise LiteError("replacement-file requires a structured rejected PLAN review")
                 if not args.project_root or not args.repository_key:
                     raise LiteError("replacement-file requires configured project identity")
-                _print(amend_plan_review(
+                result = amend_plan_review(
                     args.database, args.work_item_id, args.agent, args.replacement_file,
                     args.project_root, args.repository_key, review_summary,
                     args.request_id, usage_policy=args.usage_policy,
-                ))
+                )
             else:
-                _print(record_agent_review(
+                request_id = args.request_id or _id("review")
+                result = record_agent_review(
                     args.database, args.work_item_id, args.stage, args.agent,
-                    args.decision, review_summary, request_id=args.request_id,
+                    args.decision, review_summary, request_id=request_id,
                     usage_policy=args.usage_policy,
-                ))
+                )
+            request_id = args.request_id or request_id
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "AGENT_{0}_REVIEW".format(args.stage), args.full, result)
         elif args.command == "gate":
-            _print(record_human_gate(
+            request_id = args.request_id or _id("human")
+            result = record_human_gate(
                 args.database, args.work_item_id, args.stage, args.human,
-                args.decision, args.reason, usage_policy=args.usage_policy,
-            ))
+                args.decision, args.reason, request_id=request_id,
+                usage_policy=args.usage_policy,
+            )
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "HUMAN_{0}_GATE".format(args.stage), args.full, result)
         elif args.command in ("hold", "resume"):
-            _print(set_hold(args.database, args.work_item_id, args.human, args.command == "hold", args.reason))
+            request_id = args.request_id or _id("hold")
+            result = set_hold(args.database, args.work_item_id, args.human,
+                              args.command == "hold", args.reason, request_id)
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "WORK_ITEM_HELD" if args.command == "hold" else "WORK_ITEM_RESUMED",
+                            args.full, result)
         elif args.command == "unblock":
-            _print(unblock_task(args.database, args.work_item_id, args.task_id, args.human, args.reason))
+            request_id = args.request_id or _id("unblock")
+            result = unblock_task(args.database, args.work_item_id, args.task_id,
+                                  args.human, args.reason, request_id)
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "TASK_UNBLOCKED", args.full, result)
         elif args.command == "recover-review-task":
             result = recover_review_task(
                 args.database, args.work_item_id, args.task_id, args.human,
                 args.reason, args.request_id,
             )
-            _print(result)
+            if args.full:
+                _print(get_work_item(args.database, args.work_item_id))
+            elif result["status"] == "REFUSED":
+                _print(result)
+            else:
+                _print(mutation_receipt(args.database, args.work_item_id,
+                                        args.request_id, "REVIEW_TASK_RECOVERED"))
             if result["status"] == "REFUSED":
                 return 2
         elif args.command == "management-backfill":
-            _print(backfill_management(
+            request_id = args.request_id or _id("management-backfill")
+            result = backfill_management(
                 args.database, args.work_item_id, args.agent,
                 _load_json_file(args.management_file, "management file"), args.basis,
-            ))
+                request_id=request_id,
+            )
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "WORK_ITEM_MANAGEMENT_BACKFILLED", args.full, result)
         elif args.command == "management-amend":
-            _print(amend_management(
+            request_id = args.request_id or _id("management-amend")
+            result = amend_management(
                 args.database, args.work_item_id, args.human,
                 _load_json_file(args.management_file, "management file"), args.reason,
-            ))
+                request_id=request_id,
+            )
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "WORK_ITEM_MANAGEMENT_AMENDED", args.full, result)
         elif args.command == "plan-deviation":
-            _print(report_plan_deviation(
+            request_id = args.request_id or _id("plan-deviation")
+            result = report_plan_deviation(
                 args.database, args.work_item_id, args.task_id, args.agent,
                 _load_json_file(args.evidence_file, "evidence file"),
-            ))
+                request_id=request_id,
+            )
+            _mutation_print(args.database, args.work_item_id, request_id,
+                            "PLAN_DEVIATION", args.full, result)
         elif args.command == "serve":
             server = make_server(args.database, args.host, args.port)
             try:
@@ -3115,7 +4151,10 @@ def main(argv=None):
                 server.server_close()
         return 0
     except LiteError as exc:
-        print("error: {0}".format(exc))
+        work_item_id = getattr(args, "work_item_id", None)
+        operation = getattr(args, "command", "MUTATION").upper()
+        _print(mutation_error_receipt(args.database, work_item_id, operation, exc))
+        print("error: {0}".format(exc), file=sys.stderr)
         return 2
 
 

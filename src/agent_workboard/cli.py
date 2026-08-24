@@ -6,6 +6,7 @@ import os
 import sys
 
 from . import __version__
+from . import candidate
 from . import lite
 from . import orchestrator
 from . import usage
@@ -31,6 +32,120 @@ def _project_usage_policy(path):
     from .project import _load_config, _project_root
     config, unused_database = _load_config(_project_root(path))
     return config["usagePolicy"]
+
+
+def _project_identity(path):
+    from .project import _load_config, _project_root
+    root = _project_root(path)
+    config, database = _load_config(root)
+    return root, config, database
+
+
+def _workflow_command(args):
+    root, config, database = _project_identity(args.project)
+    if args.workflow_command == "check":
+        if bool(args.all) == bool(args.work_item):
+            raise lite.LiteError("workflow check requires exactly one WorkItem or --all")
+        result = lite.workflow_check(
+            database, root, None if args.all else args.work_item
+        )
+        _print(result)
+        return 2 if result.get("status") in ("VIOLATION", "WAITING_HUMAN") else 0
+    if args.workflow_command == "repair":
+        if not args.apply:
+            raise lite.LiteError("workflow repair is zero-write without --apply")
+        result = lite.workflow_repair(
+            database, root, args.work_item, args.action, args.fingerprint,
+            args.request_id, args.human,
+        )
+        _print(result)
+        return 2 if result.get("status") in ("REFUSED", "WAITING_HUMAN") else 0
+    common = (database, args.work_item, args.agent, args.role,
+              config["repositoryKey"], args.orchestrator_id,
+              args.orchestrator_generation, root)
+    if args.workflow_command == "status":
+        result = lite.workflow_status(*common)
+    else:
+        result = lite.workflow_advance(
+            database, root, args.work_item, args.agent, args.role,
+            config["repositoryKey"], args.expected_step,
+            args.expected_row_version, args.request_id,
+            args.orchestrator_id, args.orchestrator_generation, args.ttl,
+            args.plan_artifact, args.submission_file, args.quality_file,
+            args.review_file, args.decision, args.local_tests_passed,
+            args.candidate, args.candidate_fingerprint,
+        )
+    _print(result)
+    return 2 if result.get("status") in ("REFUSED", "WAITING_HUMAN") else 0
+
+
+def _candidate_command(args):
+    root, config, database = _project_identity(args.project)
+    name = args.candidate_command
+    if name == "status":
+        result = candidate.status(database, root, args.work_item, args.candidate)
+    elif name == "prepare":
+        result = candidate.prepare(
+            database, root, config["repositoryKey"], args.work_item,
+            args.candidate, args.source, args.base_file, args.target_file,
+            args.owner, args.request_id, args.orchestrator_id,
+            args.orchestrator_generation,
+        )
+    elif name == "freeze":
+        result = candidate.freeze(
+            database, root, config["repositoryKey"], args.work_item,
+            args.candidate, args.allowlist_file, args.owner, args.request_id,
+            args.orchestrator_id, args.orchestrator_generation,
+        )
+    elif name == "build":
+        result = candidate.build(
+            database, root, config["repositoryKey"], args.work_item,
+            args.candidate, args.toolchain_file, args.owner, args.request_id,
+            args.orchestrator_id, args.orchestrator_generation,
+        )
+    elif name == "quarantine":
+        result = candidate.quarantine(
+            database, root, config["repositoryKey"], args.work_item,
+            args.candidate, args.owner, args.request_id, args.restore,
+            args.orchestrator_id, args.orchestrator_generation,
+            args.quarantine_request_id,
+        )
+    else:
+        result = candidate.finalize(
+            database, root, config["repositoryKey"], args.work_item,
+            args.candidate, args.owner, args.request_id,
+            args.orchestrator_id, args.orchestrator_generation,
+        )
+    _print(result)
+    return 2 if result.get("status") in ("REFUSED", "WAITING_HUMAN") else 0
+
+
+def _publication_command(args):
+    root, unused_config, database = _project_identity(args.project)
+    name = args.publication_command
+    if name == "status":
+        result = candidate.publication_status(
+            database, root, args.work_item, args.evidence_file
+        )
+    elif name == "authorize":
+        result = candidate.publication_authorize(
+            database, root, args.work_item, args.human, args.candidate,
+            args.candidate_fingerprint, args.authorization_file,
+            args.request_id,
+        )
+    elif name == "postflight":
+        result = candidate.publication_postflight(
+            database, root, args.work_item, args.operator,
+            args.ready_fingerprint, args.authorization_request_id,
+            args.evidence_file, args.request_id,
+        )
+    else:
+        result = candidate.publication_retry(
+            database, root, args.work_item, args.human, args.ready_fingerprint,
+            args.retry_file, args.request_id,
+        )
+    _print(result)
+    return 2 if result.get("status") in ("REFUSED", "WAITING_HUMAN", "NOT_READY") else 0
 
 
 def _lite_args(args):
@@ -156,9 +271,14 @@ def _activity_command(args):
     elif args.activity_command == "show":
         result = orchestrator.show_activity(database, args.kind, args.resource_id)
     else:
+        try:
+            expected_activity = json.loads(args.expected_activity)
+        except (TypeError, ValueError):
+            raise lite.LiteError("expected activity must be exact JSON")
         result = orchestrator.reconcile_expired(
             database, args.work_item, args.kind, args.resource_id, args.owner,
-            args.generation, args.request_id,
+            args.generation, args.request_id, fingerprint=args.fingerprint,
+            expected_activity=expected_activity, not_after=args.not_after,
         )
     _print(result)
     return 2 if result["status"] in ("REFUSED", "CONFLICT") else 0
@@ -323,6 +443,99 @@ def main(argv=None):
     activity_reconcile.add_argument("--owner", required=True)
     activity_reconcile.add_argument("--generation", type=int, required=True)
     activity_reconcile.add_argument("--request-id", required=True)
+    activity_reconcile.add_argument("--fingerprint", required=True)
+    activity_reconcile.add_argument("--expected-activity", required=True)
+    activity_reconcile.add_argument("--not-after")
+    workflow = sub.add_parser("workflow")
+    workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
+    for workflow_name in ("status", "advance"):
+        command = workflow_sub.add_parser(workflow_name)
+        command.add_argument("work_item", metavar="work-item")
+        command.add_argument("--project", default=".")
+        command.add_argument("--agent", required=True)
+        command.add_argument("--role", required=True, choices=("PLANNER", "IMPLEMENTER", "REVIEWER"))
+        command.add_argument("--orchestrator-id")
+        command.add_argument("--orchestrator-generation", type=int)
+        if workflow_name == "advance":
+            command.add_argument("--expected-step", required=True)
+            command.add_argument("--expected-row-version", type=int, required=True)
+            command.add_argument("--request-id", required=True)
+            command.add_argument("--ttl", type=int, default=900)
+            command.add_argument("--plan-artifact")
+            command.add_argument("--submission-file")
+            command.add_argument("--quality-file")
+            command.add_argument("--review-file")
+            command.add_argument("--decision", choices=("APPROVED", "REJECTED"))
+            command.add_argument("--local-tests-passed", action="store_true")
+            command.add_argument("--candidate")
+            command.add_argument("--candidate-fingerprint")
+    workflow_check = workflow_sub.add_parser("check")
+    workflow_check.add_argument("work_item", metavar="work-item", nargs="?")
+    workflow_check.add_argument("--project", default=".")
+    workflow_check.add_argument("--all", action="store_true")
+    workflow_repair = workflow_sub.add_parser("repair")
+    workflow_repair.add_argument("work_item", metavar="work-item")
+    workflow_repair.add_argument("--project", default=".")
+    workflow_repair.add_argument("--apply", action="store_true")
+    workflow_repair.add_argument("--action", required=True)
+    workflow_repair.add_argument("--fingerprint", required=True)
+    workflow_repair.add_argument("--request-id", required=True)
+    workflow_repair.add_argument("--human", required=True)
+    candidate_parser = sub.add_parser("candidate")
+    candidate_sub = candidate_parser.add_subparsers(dest="candidate_command", required=True)
+    candidate_status = candidate_sub.add_parser("status")
+    candidate_status.add_argument("work_item", metavar="work-item")
+    candidate_status.add_argument("--project", default=".")
+    candidate_status.add_argument("--candidate", required=True)
+    for candidate_name in ("prepare", "freeze", "build", "quarantine", "finalize"):
+        command = candidate_sub.add_parser(candidate_name)
+        command.add_argument("work_item", metavar="work-item")
+        command.add_argument("--project", default=".")
+        command.add_argument("--candidate", required=True)
+        command.add_argument("--owner", required=True)
+        command.add_argument("--request-id", required=True)
+        command.add_argument("--orchestrator-id")
+        command.add_argument("--orchestrator-generation", type=int)
+        if candidate_name == "prepare":
+            command.add_argument("--source", required=True)
+            command.add_argument("--base-file", required=True)
+            command.add_argument("--target-file", required=True)
+        elif candidate_name == "freeze":
+            command.add_argument("--allowlist-file", required=True)
+        elif candidate_name == "build":
+            command.add_argument("--toolchain-file", required=True)
+        elif candidate_name == "quarantine":
+            command.add_argument("--restore", action="store_true")
+            command.add_argument("--quarantine-request-id")
+    publication = sub.add_parser("publication")
+    publication_sub = publication.add_subparsers(dest="publication_command", required=True)
+    publication_status = publication_sub.add_parser("status")
+    publication_status.add_argument("work_item", metavar="work-item")
+    publication_status.add_argument("--project", default=".")
+    publication_status.add_argument("--evidence-file")
+    publication_authorize = publication_sub.add_parser("authorize")
+    publication_authorize.add_argument("work_item", metavar="work-item")
+    publication_authorize.add_argument("--project", default=".")
+    publication_authorize.add_argument("--human", required=True)
+    publication_authorize.add_argument("--candidate", required=True)
+    publication_authorize.add_argument("--candidate-fingerprint", required=True)
+    publication_authorize.add_argument("--authorization-file", required=True)
+    publication_authorize.add_argument("--request-id", required=True)
+    publication_postflight = publication_sub.add_parser("postflight")
+    publication_postflight.add_argument("work_item", metavar="work-item")
+    publication_postflight.add_argument("--project", default=".")
+    publication_postflight.add_argument("--operator", required=True)
+    publication_postflight.add_argument("--ready-fingerprint", required=True)
+    publication_postflight.add_argument("--authorization-request-id", required=True)
+    publication_postflight.add_argument("--evidence-file", required=True)
+    publication_postflight.add_argument("--request-id", required=True)
+    publication_retry = publication_sub.add_parser("retry")
+    publication_retry.add_argument("work_item", metavar="work-item")
+    publication_retry.add_argument("--project", default=".")
+    publication_retry.add_argument("--human", required=True)
+    publication_retry.add_argument("--ready-fingerprint", required=True)
+    publication_retry.add_argument("--retry-file", required=True)
+    publication_retry.add_argument("--request-id", required=True)
     lite_parser = sub.add_parser("lite", help="compatibility access to MVP-LITE commands")
     lite_parser.add_argument("--project", default=".")
     lite_parser.add_argument("--database")
@@ -370,6 +583,12 @@ def main(argv=None):
             return _orchestrator_command(args)
         elif args.command == "activity":
             return _activity_command(args)
+        elif args.command == "workflow":
+            return _workflow_command(args)
+        elif args.command == "candidate":
+            return _candidate_command(args)
+        elif args.command == "publication":
+            return _publication_command(args)
         elif args.command == "serve":
             database = _lite_args(args)
             return lite.main(database + ["serve", "--host", args.host, "--port", str(args.port)])

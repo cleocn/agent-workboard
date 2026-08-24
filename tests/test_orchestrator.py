@@ -13,7 +13,8 @@ from agent_workboard.cli import main as cli_main
 from agent_workboard.lite import (LiteError, acquire_claim, acquire_repository_lock,
                                   create_work_item, initialize_database,
                                   open_database, release_claim,
-                                  release_repository_lock, set_task_status)
+                                  release_repository_lock, set_task_status,
+                                  workflow_check)
 from agent_workboard.orchestrator import (ORCHESTRATOR_SCHEMA_VERSION, claim,
                                           activity_snapshot, claim_next, list_activity,
                                           list_leases, reconcile_expired, recover,
@@ -79,6 +80,17 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             code = cli_main(["orchestrator"] + arguments + ["--project", "."])
         return code, json.loads(output.getvalue())
 
+    def reconcile_checked(self, work_item_id, kind, resource_id, owner,
+                          generation):
+        check = workflow_check(self.database, self.temporary.name, work_item_id)
+        proof = check["nextStep"]["arguments"]
+        return reconcile_expired(
+            self.database, work_item_id, kind, resource_id, owner, generation,
+            proof["requestId"], fingerprint=proof["fingerprint"],
+            expected_activity=proof["expectedActivity"],
+            not_after=proof["notAfter"],
+        )
+
     def test_register_claim_replay_conflict_and_parallel_work_items(self):
         self.create("AWB-101")
         self.create("AWB-102")
@@ -117,17 +129,26 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         self.assertEqual(before, "\n".join(connection.iterdump()))
         connection.close()
 
+        check = workflow_check(self.database, self.temporary.name, "AWB-103")
+        proof = check["nextStep"]["arguments"]
+
         wrong = reconcile_expired(
             self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
-            "wrong-owner", stale["generation"], "reconcile-wrong",
+            "wrong-owner", stale["generation"], proof["requestId"],
+            fingerprint=proof["fingerprint"],
+            expected_activity=proof["expectedActivity"],
+            not_after=proof["notAfter"],
         )
         self.assertEqual("WRONG_OWNER", wrong["reasonCode"])
-        with mock.patch.object(orchestrator_module, "_activity_event",
-                               side_effect=RuntimeError("event fault")):
-            with self.assertRaisesRegex(RuntimeError, "event fault"):
+        with mock.patch.object(orchestrator_module, "_activity_materialized",
+                               side_effect=RuntimeError("post-apply fault")):
+            with self.assertRaisesRegex(RuntimeError, "post-apply fault"):
                 reconcile_expired(
                     self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
-                    "old-owner", stale["generation"], "reconcile-fault",
+                    "old-owner", stale["generation"], proof["requestId"],
+                    fingerprint=proof["fingerprint"],
+                    expected_activity=proof["expectedActivity"],
+                    not_after=proof["notAfter"],
                 )
         connection = open_database(self.database)
         self.assertEqual("ACTIVE", connection.execute(
@@ -137,64 +158,83 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         connection.close()
         reconciled = reconcile_expired(
             self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
-            "old-owner", stale["generation"], "reconcile-exact",
+            "old-owner", stale["generation"], proof["requestId"],
+            fingerprint=proof["fingerprint"],
+            expected_activity=proof["expectedActivity"],
+            not_after=proof["notAfter"],
         )
         self.assertEqual("OK", reconciled["status"])
         replay = reconcile_expired(
             self.database, "AWB-103", "orchestrator-lease", stale["lease_id"],
-            "old-owner", stale["generation"], "reconcile-exact",
+            "old-owner", stale["generation"], proof["requestId"],
+            fingerprint=proof["fingerprint"],
+            expected_activity=proof["expectedActivity"],
+            not_after=proof["notAfter"],
         )
         self.assertEqual("NO_OP", replay["status"])
         connection = open_database(self.database)
         self.assertEqual(1, connection.execute(
-            "SELECT count(*) FROM events WHERE event_type='ACTIVITY_RECONCILED'"
+            "SELECT count(*) FROM events WHERE event_type='ACTIVITY_EXPIRED_AND_RECONCILED'"
         ).fetchone()[0])
         connection.close()
 
     def test_reconciliation_refuses_live_conflict_and_concurrent_mutation_has_one_winner(self):
         self.create("AWB-104")
-        active_claim = acquire_claim(
+        acquire_claim(
             self.database, "AWB-104", "AWB-104-T01", "planner", "PLANNER",
             self.agent_expiry(),
         )
-        stale = acquire_repository_lock(
-            self.database, "AWB-104", "repo", "planner", self.now(-30)
+        writer = acquire_repository_lock(
+            self.database, "AWB-104", "repo", "planner", self.agent_expiry()
         )
-        refused = reconcile_expired(
-            self.database, "AWB-104", "repository-writer", stale["lockId"],
-            "planner", stale["generation"], "reconcile-conflict",
-        )
-        self.assertEqual("CONFLICTING_LIVE_ACTIVITY", refused["reasonCode"])
-        release_repository_lock(self.database, "AWB-104", "repo", "planner")
-        release_claim(self.database, "AWB-104", "planner")
-        second_claim = acquire_claim(
-            self.database, "AWB-104", "AWB-104-T01", "planner", "PLANNER",
-            self.agent_expiry(),
-        )
-        stale = acquire_repository_lock(
-            self.database, "AWB-104", "repo", "planner", self.now(-30)
-        )
-        release_claim_before_race = False
-        release_repository_lock(self.database, "AWB-104", "repo", "planner")
-        # Recreate a stale persisted ACTIVE writer without a conflicting live claim.
         connection = open_database(self.database)
         connection.execute(
-            "UPDATE repository_locks SET status='ACTIVE',released_at=NULL WHERE lock_id=?",
-            (stale["lockId"],),
-        )
-        connection.execute(
-            "UPDATE claims SET status='RELEASED',released_at=? WHERE claim_id=?",
-            (self.now(), second_claim["claimId"]),
+            "UPDATE repository_locks SET expires_at=? WHERE lock_id=?",
+            (self.now(-30), writer["lockId"]),
         )
         connection.commit()
         connection.close()
+        proof = workflow_check(
+            self.database, self.temporary.name, "AWB-104"
+        )["nextStep"]["arguments"]
+        reconciled = reconcile_expired(
+            self.database, "AWB-104", "repository-writer", writer["lockId"],
+            "planner", writer["generation"], proof["requestId"],
+            fingerprint=proof["fingerprint"],
+            expected_activity=proof["expectedActivity"],
+            not_after=proof["notAfter"],
+        )
+        self.assertEqual("OK", reconciled["status"])
+        self.assertEqual("CLAIMED", self.snapshot("AWB-104")["item"][0])
+        release_claim(self.database, "AWB-104", "planner")
+        acquire_claim(
+            self.database, "AWB-104", "AWB-104-T01", "planner", "PLANNER",
+            self.agent_expiry(),
+        )
+        writer = acquire_repository_lock(
+            self.database, "AWB-104", "repo", "planner", self.agent_expiry()
+        )
+        release_repository_lock(self.database, "AWB-104", "repo", "planner")
+        release_claim(self.database, "AWB-104", "planner")
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE repository_locks SET status='ACTIVE',released_at=NULL,expires_at=? "
+            "WHERE lock_id=?", (self.now(-30), writer["lockId"]),
+        )
+        connection.commit(); connection.close()
+        proof = workflow_check(
+            self.database, self.temporary.name, "AWB-104"
+        )["nextStep"]["arguments"]
         barrier = threading.Barrier(2)
         results = []
         def compete(suffix):
             barrier.wait()
             results.append(reconcile_expired(
-                self.database, "AWB-104", "repository-writer", stale["lockId"],
-                "planner", stale["generation"], "race-" + suffix,
+                self.database, "AWB-104", "repository-writer", writer["lockId"],
+                "planner", writer["generation"], proof["requestId"],
+                fingerprint=proof["fingerprint"],
+                expected_activity=proof["expectedActivity"],
+                not_after=proof["notAfter"],
             ))
         threads = [threading.Thread(target=compete, args=(value,))
                    for value in ("a", "b")]
@@ -203,8 +243,73 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(1, sum(result["status"] == "OK" for result in results))
-        self.assertEqual(1, sum(result["reasonCode"] == "RESOURCE_NOT_STALE"
-                                for result in results))
+        self.assertEqual(1, sum(result["status"] == "NO_OP" for result in results))
+
+    def test_stale_agent_bundle_reconciles_without_releasing_live_orchestrator(self):
+        for with_writer in (False, True):
+            work_item_id = "AWB-LIVE-ORCH-{0}".format(int(with_writer))
+            self.create(work_item_id)
+            lease = claim(self.database, work_item_id, "live-orchestrator", 900,
+                          "live-orch-{0}".format(int(with_writer)))["lease"]
+            agent = acquire_claim(
+                self.database, work_item_id, work_item_id + "-T01", "planner",
+                "PLANNER", self.agent_expiry(),
+                orchestrator_id="live-orchestrator",
+                orchestrator_generation=lease["generation"],
+            )
+            writer = (acquire_repository_lock(
+                self.database, work_item_id, "repo-" + work_item_id,
+                "planner", self.agent_expiry()) if with_writer else None)
+            connection = open_database(self.database)
+            connection.execute(
+                "UPDATE claims SET expires_at=? WHERE claim_id=?",
+                (self.now(-30), agent["claimId"]),
+            )
+            if writer is not None:
+                connection.execute(
+                    "UPDATE repository_locks SET expires_at=? WHERE lock_id=?",
+                    (self.now(-30), writer["lockId"]),
+                )
+            connection.commit(); connection.close()
+            check = workflow_check(self.database, self.temporary.name, work_item_id)
+            self.assertEqual("VIOLATION", check["status"])
+            proof = check["nextStep"]["arguments"]
+            expected_kinds = {row["kind"] for row in proof["expectedActivity"]}
+            self.assertEqual(
+                ({"AGENT_CLAIM", "REPOSITORY_WRITER"} if with_writer else
+                 {"AGENT_CLAIM"}), expected_kinds,
+            )
+            self.assertNotIn("ORCHESTRATOR_LEASE", expected_kinds)
+            def reconcile_live_shape():
+                return reconcile_expired(
+                    self.database, work_item_id, "claim", agent["claimId"],
+                    "planner", agent["generation"], proof["requestId"],
+                    fingerprint=proof["fingerprint"],
+                    expected_activity=proof["expectedActivity"],
+                    not_after=proof["notAfter"],
+                )
+            if with_writer:
+                barrier = threading.Barrier(2)
+                results = []
+                def compete():
+                    barrier.wait(); results.append(reconcile_live_shape())
+                threads = [threading.Thread(target=compete) for unused in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+                self.assertEqual(["NO_OP", "OK"],
+                                 sorted(row["status"] for row in results))
+            else:
+                self.assertEqual("OK", reconcile_live_shape()["status"])
+            live = show(self.database, work_item_id)
+            projected = show_activity(
+                self.database, "orchestrator-lease", lease["lease_id"])
+            self.assertEqual(("ACTIVE", "LIVE"),
+                             (live["lease"]["status"],
+                              projected["resource"]["effectiveStatus"]))
+            replay = reconcile_live_shape()
+            self.assertEqual("NO_OP", replay["status"])
 
     def test_claim_next_stable_order_and_concurrent_single_winner(self):
         self.create("AWB-202", "P1")
@@ -353,6 +458,21 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             self.agent_expiry(), orchestrator_id="owner-old",
             orchestrator_generation=expired["lease"]["generation"],
         )
+        refused = recover(self.database, "AWB-302", "owner-new", 30,
+                          "recover-302-refused", self.now(31))
+        self.assertEqual("EXPIRED_ACTIVITY_RECONCILIATION_REQUIRED",
+                         refused["reasonCode"])
+        connection = open_database(self.database)
+        connection.execute(
+            "UPDATE orchestrator_leases SET expires_at=? WHERE lease_id=?",
+            (self.now(-1), expired["lease"]["lease_id"]),
+        )
+        connection.commit(); connection.close()
+        reconciled = self.reconcile_checked(
+            "AWB-302", "orchestrator-lease", expired["lease"]["lease_id"],
+            "owner-old", expired["lease"]["generation"],
+        )
+        self.assertEqual("OK", reconciled["status"])
         recovered = recover(self.database, "AWB-302", "owner-new", 30,
                             "recover-302", self.now(31))
         self.assertEqual("OK", recovered["status"])
@@ -392,7 +512,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         expired = claim(self.database, "AWB-311", "expired-owner", 1,
                         "claim-311", old)
         before = self.snapshot("AWB-311")
-        with self.assertRaisesRegex(LiteError, "stale or inactive"):
+        with self.assertRaisesRegex(LiteError, "WORKFLOW_INVARIANT_VIOLATION"):
             acquire_claim(
                 self.database, "AWB-311", "AWB-311-T01", "expired-agent", "PLANNER",
                 self.agent_expiry(), orchestrator_id="expired-owner",
@@ -477,6 +597,16 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         recovered = recover(
             self.database, "AWB-303", "new-owner", 30, "recover-303",
             "2025-01-01T00:00:02+00:00",
+        )
+        self.assertEqual("EXPIRED_ACTIVITY_RECONCILIATION_REQUIRED",
+                         recovered["reasonCode"])
+        reconciled = self.reconcile_checked(
+            "AWB-303", "orchestrator-lease", acquired["lease"]["lease_id"],
+            "expired-owner", acquired["lease"]["generation"],
+        )
+        self.assertEqual("OK", reconciled["status"])
+        recovered = recover(
+            self.database, "AWB-303", "new-owner", 30, "recover-303-after-check",
         )
         self.assertEqual("OK", recovered["status"])
         self.assertEqual(acquired["lease"]["generation"] + 1,
@@ -644,6 +774,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         self.assertEqual(0, code)
         self.assert_envelope(value, "CLAIM_NEXT")
         recovered_work_item = value["lease"]["work_item_id"]
+        expired_lease = dict(value["lease"])
         connection = open_database(self.database)
         connection.execute(
             "UPDATE orchestrator_leases SET expires_at=? WHERE lease_id=?",
@@ -654,6 +785,18 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         code, value = self.cli([
             "recover", recovered_work_item, "--orchestrator", "cli-c", "--ttl", "30",
             "--request-id", "cli-recover",
+        ])
+        self.assertEqual(2, code)
+        self.assert_envelope(value, "RECOVER")
+        self.assertEqual("EXPIRED_ACTIVITY_RECONCILIATION_REQUIRED",
+                         value["reasonCode"])
+        self.assertEqual("OK", self.reconcile_checked(
+            recovered_work_item, "orchestrator-lease",
+            expired_lease["lease_id"], "cli-b", expired_lease["generation"],
+        )["status"])
+        code, value = self.cli([
+            "recover", recovered_work_item, "--orchestrator", "cli-c",
+            "--ttl", "30", "--request-id", "cli-recover-after-check",
         ])
         self.assertEqual(0, code)
         self.assert_envelope(value, "RECOVER")
