@@ -7,6 +7,7 @@ transactional SQLite coordination primitives and stable JSON results.
 import datetime
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -414,7 +415,8 @@ def _reconcile_result(status, reason=None, resource=None, next_action="NONE"):
 
 def reconcile_expired(database, work_item_id, kind, resource_id, owner,
                       generation, request_id, now=None, fingerprint=None,
-                      expected_activity=None, not_after=None):
+                      expected_activity=None, not_after=None,
+                      project_root=None):
     """Apply one exact, fingerprinted stale activity bundle atomically."""
     if kind not in _ACTIVITY_KINDS:
         raise LiteError("activity kind is invalid")
@@ -423,6 +425,20 @@ def reconcile_expired(database, work_item_id, kind, resource_id, owner,
         _validate_id(value, field)
     if type(generation) is not int or generation < 1:
         raise LiteError("generation must be positive")
+    if (not isinstance(project_root, str) or
+            project_root != os.path.abspath(os.path.normpath(project_root)) or
+            project_root != os.path.realpath(project_root)):
+        return _reconcile_result("REFUSED", "PROJECT_ROOT_MISMATCH", None,
+                                 "RUN_WORKFLOW_CHECK")
+    try:
+        from .project import _load_config
+        unused_config, configured_database = _load_config(project_root)
+    except LiteError:
+        return _reconcile_result("REFUSED", "PROJECT_ROOT_MISMATCH", None,
+                                 "RUN_WORKFLOW_CHECK")
+    if os.path.realpath(database) != configured_database:
+        return _reconcile_result("REFUSED", "PROJECT_ROOT_MISMATCH", None,
+                                 "RUN_WORKFLOW_CHECK")
     request = {"operation": "EXPIRE_AND_RECONCILE_ACTIVITY",
                "workItemId": work_item_id,
                "kind": kind, "resourceId": resource_id, "owner": owner,
@@ -466,9 +482,10 @@ def reconcile_expired(database, work_item_id, kind, resource_id, owner,
         from . import lite
         from . import workflow as workflow_kernel
         snapshot = lite._kernel_snapshot(
-            connection, work_item_id, evaluation_time=current
+            connection, work_item_id, project_root=project_root,
+            evaluation_time=current
         )
-        check = lite._check_one(connection, None, work_item_id,
+        check = lite._check_one(connection, project_root, work_item_id,
                                 evaluation_time=current)
         arguments = check.get("nextStep", {}).get("arguments", {})
         if (check.get("repairability") != "DETERMINISTIC" or

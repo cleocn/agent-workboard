@@ -19,6 +19,7 @@ import tarfile
 import zipfile
 
 from . import lite
+from . import verify
 from . import workflow as workflow_kernel
 
 
@@ -35,19 +36,6 @@ _ALLOWED_ACTIONS = sorted((
     "CREATE_IMMUTABLE_PRERELEASE", "PUSH_EXACT_NON_FORCE_REFS",
     "UPLOAD_EXACT_THREE_ASSETS",
 ))
-_FORBIDDEN_CONTENT = (
-    b"BEGIN " + b"RSA", b"BEGIN " + b"OPENSSH PRIVATE KEY",
-    b"-----BEGIN " + b"PRIVATE KEY-----",
-)
-_FORBIDDEN_PATTERNS = (
-    re.compile(br"gh" + br"[opsu]_[A-Za-z0-9_]{20,}"),
-    re.compile(br"(?i)(password|secret|api[_-]?key|access[_-]?token)\s*[:=]\s*[^\s]{8,}"),
-    re.compile(br"-----BEGIN (?:[A-Z0-9]+ )+PRIVATE KEY-----"),
-)
-_FORBIDDEN_LOCAL_PATH_PATTERNS = (
-    re.compile(br"(?i)(?:^|[\s=:'\"(]|file://)/(?:Users|private|home|root|tmp|var/(?:folders|tmp))/"),
-    re.compile(br"(?i)(?:^|[\s=:'\"(])[A-Z]:[\\/](?:Users|Documents and Settings|Temp|tmp|work|workspace)[\\/]"),
-)
 
 
 def _json(value):
@@ -791,65 +779,7 @@ def freeze(database, project_root, repository_key, work_item_id, candidate_id,
     return result
 
 
-def _safe_member(name):
-    if (not name or "\\" in name or name.startswith("/") or
-            any(part in ("", ".", "..") for part in name.rstrip("/").split("/"))):
-        raise lite.LiteError("artifact contains an unsafe member path")
-
-
-def _scan_raw(name, raw):
-    packaged_test_source = "/tests/" in "/" + name and name.endswith(".py")
-    if (any(marker in raw for marker in _FORBIDDEN_CONTENT) or
-            any(pattern.search(raw) for pattern in _FORBIDDEN_PATTERNS) or
-            not packaged_test_source and any(
-                pattern.search(raw) for pattern in _FORBIDDEN_LOCAL_PATH_PATTERNS
-            )):
-        raise lite.LiteError("forbidden content in artifact member: " + name)
-    return {"path": name, "sha256": _sha(raw), "size": len(raw)}
-
-
-def scan_artifact(path):
-    path = os.path.realpath(os.path.abspath(path))
-    if not os.path.isfile(path) or os.path.islink(path):
-        raise lite.LiteError("artifact must be a regular non-symlink file")
-    members = []
-    if path.endswith(".whl"):
-        with zipfile.ZipFile(path) as archive:
-            seen = set()
-            for info in archive.infolist():
-                _safe_member(info.filename)
-                if info.filename in seen:
-                    raise lite.LiteError("artifact contains duplicate members")
-                seen.add(info.filename)
-                mode = (info.external_attr >> 16) & 0xFFFF
-                if info.is_dir():
-                    continue
-                if stat.S_IFMT(mode) and not stat.S_ISREG(mode):
-                    raise lite.LiteError("artifact contains a non-regular member")
-                members.append(_scan_raw(info.filename, archive.read(info)))
-    elif path.endswith((".tar.gz", ".tgz")):
-        with tarfile.open(path, "r:gz") as archive:
-            seen = set()
-            for info in archive.getmembers():
-                _safe_member(info.name)
-                if info.name in seen:
-                    raise lite.LiteError("artifact contains duplicate members")
-                seen.add(info.name)
-                if info.isdir():
-                    continue
-                if not info.isfile():
-                    raise lite.LiteError("artifact contains a non-regular member")
-                handle = archive.extractfile(info)
-                if handle is None:
-                    raise lite.LiteError("artifact member cannot be read")
-                members.append(_scan_raw(info.name, handle.read()))
-    else:
-        raise lite.LiteError("artifact type must be wheel or gzipped sdist")
-    if not members:
-        raise lite.LiteError("artifact contains no regular members")
-    return {"artifact": os.path.basename(path), "sha256": _file_sha(path),
-            "memberCount": len(members), "members": sorted(members, key=lambda row: row["path"]),
-            "privacy": "ALLOWLIST_ONLY"}
+scan_artifact = verify.scan_artifact
 
 
 def _artifact_build_identities(wheel_path, sdist_path):
@@ -893,9 +823,38 @@ def build(database, project_root, repository_key, work_item_id, candidate_id,
         raise lite.LiteError("toolchain contract is invalid")
     _slug(toolchain["toolchainId"], "toolchainId")
     toolchain_fingerprint = _sha(_json(toolchain))
+    executable = os.path.realpath(python["canonicalExecutable"])
+    root, managed, manifest_path = _candidate_manifest(
+        project_root, work_item_id, candidate_id
+    )
+    manifest = _load_json(manifest_path, CANDIDATE_PROTOCOL)
+    staging = os.path.join(managed, "staging", candidate_id, request_id)
+    target = os.path.join(managed, "active", candidate_id, "builds", request_id)
+    quarantine = os.path.join(managed, "quarantine", candidate_id, request_id)
+    source = os.path.join(staging, "source")
+    assets = os.path.realpath(os.path.join(staging, "assets"))
+    if (assets != os.path.join(staging, "assets") or
+            os.path.commonpath((managed, assets)) != managed):
+        raise lite.LiteError("managed build assets path is invalid")
+    frozen_identity = manifest.get("frozen")
+    commit_epoch = (_git(
+        os.path.join(os.path.dirname(manifest_path), "source"),
+        "show", "-s", "--format=%ct", frozen_identity["headCommit"],
+    ) if isinstance(frozen_identity, dict) else "UNFROZEN")
+    env = {key: value for key, value in os.environ.items()
+           if not (key.upper().startswith("PIP_") or "PROXY" in key.upper() or
+                   "TOKEN" in key.upper() or "SECRET" in key.upper() or
+                   "PASSWORD" in key.upper())}
+    env.update({"TZ": "UTC", "LC_ALL": "C", "SOURCE_DATE_EPOCH": commit_epoch})
+    build_command = [
+        executable, "setup.py", "bdist_wheel", "--dist-dir", assets,
+        "sdist", "--dist-dir", assets,
+    ]
     request_fingerprint = _sha(_json({
         "candidateId": candidate_id, "owner": owner,
         "toolchainFingerprint": toolchain_fingerprint,
+        "argv": build_command, "cwd": source, "environment": env,
+        "assetsPath": assets,
     }))
     replay_connection = lite.open_database(database)
     try:
@@ -914,7 +873,6 @@ def build(database, project_root, repository_key, work_item_id, candidate_id,
             return payload["resultReceipt"]
     finally:
         replay_connection.close()
-    executable = os.path.realpath(python["canonicalExecutable"])
     if not os.path.isfile(executable) or os.path.islink(python["canonicalExecutable"]):
         raise lite.LiteError("TOOLCHAIN_NOT_READY")
     if _file_sha(executable) != python["executableSha256"]:
@@ -925,13 +883,8 @@ def build(database, project_root, repository_key, work_item_id, candidate_id,
     actual = json.loads(probe)
     if actual != [python["implementation"], python["version"], packages["setuptools"], packages["wheel"]]:
         raise lite.LiteError("TOOLCHAIN_NOT_READY")
-    root, managed, manifest_path = _candidate_manifest(project_root, work_item_id, candidate_id)
-    manifest = _load_json(manifest_path, CANDIDATE_PROTOCOL)
     if manifest.get("lifecycle") != "FROZEN" or manifest.get("ownerAgentId") != owner:
         raise lite.LiteError("build requires an owned FROZEN candidate")
-    staging = os.path.join(managed, "staging", candidate_id, request_id)
-    target = os.path.join(managed, "active", candidate_id, "builds", request_id)
-    quarantine = os.path.join(managed, "quarantine", candidate_id, request_id)
     if any(os.path.lexists(path) for path in (staging, target, quarantine)):
         raise lite.LiteError("build destination already exists")
     connection = lite.open_database(database)
@@ -941,7 +894,6 @@ def build(database, project_root, repository_key, work_item_id, candidate_id,
     finally:
         connection.close()
     os.makedirs(staging)
-    source = os.path.join(staging, "source")
     subprocess.check_call(["git", "clone", "--no-hardlinks", "--no-checkout",
                            os.path.join(os.path.dirname(manifest_path), "source"), source])
     subprocess.check_call(["git", "checkout", "--detach", manifest["frozen"]["headCommit"]], cwd=source)
@@ -958,17 +910,18 @@ def build(database, project_root, repository_key, work_item_id, candidate_id,
                                      manifest["frozen"]["parentCommit"], "HEAD").splitlines())) !=
             manifest["frozen"]["changedPaths"]):
         raise lite.LiteError("locked build source drifted from frozen identity")
-    assets = os.path.join(staging, "assets")
     os.makedirs(assets)
-    env = {key: value for key, value in os.environ.items()
-           if not (key.upper().startswith("PIP_") or "PROXY" in key.upper() or
-                   "TOKEN" in key.upper() or "SECRET" in key.upper() or
-                   "PASSWORD" in key.upper())}
-    commit_epoch = _git(source, "show", "-s", "--format=%ct", manifest["frozen"]["headCommit"])
-    env.update({"TZ": "UTC", "LC_ALL": "C", "SOURCE_DATE_EPOCH": commit_epoch})
     try:
-        subprocess.check_call([executable, "setup.py", "bdist_wheel", "sdist",
-                               "--dist-dir", assets], cwd=source, env=env)
+        subprocess.check_call(build_command, cwd=source, env=env)
+        unexpected = []
+        for directory, unused_subdirectories, files in os.walk(staging):
+            if os.path.commonpath((assets, directory)) == assets:
+                continue
+            for name in files:
+                if name.endswith((".whl", ".tar.gz")):
+                    unexpected.append(os.path.join(directory, name))
+        if os.path.lexists(os.path.join(source, "dist")) or unexpected:
+            raise lite.LiteError("locked build produced artifacts outside managed assets")
         names = sorted(os.listdir(assets))
         if len(names) != 2 or sum(name.endswith(".whl") for name in names) != 1 or sum(name.endswith(".tar.gz") for name in names) != 1:
             raise lite.LiteError("locked build must produce exactly wheel and sdist")
@@ -1414,7 +1367,9 @@ def _verify_current_build(project_root, work_item_id, built):
         project_root, work_item_id, built["candidateId"]
     )
     manifest = _load_json(manifest_path, CANDIDATE_PROTOCOL)
-    if (manifest.get("lifecycle") != "BUILT" or
+    if (manifest.get("lifecycle") not in ("BUILT", "FINALIZED") or
+            (manifest.get("lifecycle") == "FINALIZED" and
+             manifest.get("bytesRetained") is not True) or
             manifest.get("candidateFingerprint") != built.get("candidateFingerprint") or
             manifest.get("buildFingerprint") != built.get("buildFingerprint")):
         raise lite.LiteError("managed candidate manifest drifted from runtime")
@@ -1451,6 +1406,91 @@ def _verify_current_build(project_root, work_item_id, built):
     if actual != expected:
         raise lite.LiteError("managed build asset bytes drifted")
     return manifest, actual
+
+
+def _executing_wheel():
+    """Return the exact wheel supplying this module, never an ambient source."""
+    marker = ".whl" + os.sep
+    module_path = os.path.abspath(__file__)
+    position = module_path.find(marker)
+    if position >= 0:
+        path = module_path[:position + 4]
+        return path if os.path.isfile(path) and not os.path.islink(path) else None
+    try:
+        from .project import _direct_wheel
+        direct = _direct_wheel()
+    except Exception:
+        direct = None
+    if (not isinstance(direct, tuple) or not direct or
+            not os.path.isfile(direct[0]) or os.path.islink(direct[0])):
+        return None
+    if direct[1] is not None and _file_sha(direct[0]) != direct[1]:
+        return None
+    return os.path.realpath(direct[0])
+
+
+def assert_self_host_operation(connection, project_root, work_item_id, operation,
+                               candidate_id=None):
+    """Enforce the exact b8-on-b7 bootstrap closed set at library boundaries."""
+    from . import __version__
+    from ._build import BUILD_IDENTITY
+    root = _project(project_root)
+    config_path = os.path.join(root, ".awb", "config.json")
+    if not os.path.exists(config_path):
+        return "UNMANAGED"
+    config = _load_json(config_path)
+    if config.get("runtimeMode") == "development":
+        return "DEVELOPMENT"
+    if config.get("requiredPackageVersion") == __version__:
+        return "INSTALLED"
+    exact_b7 = {
+        "requiredPackageVersion": "0.3.1b7",
+        "requiredSourceCommit": "c7380024f9b0efcd3167cebcd9915b2f1d85d13a",
+        "requiredSourceTree": "102cc5ef820b9f7d42166012c67dfd8708e61419",
+        "requiredSourceTag": "v0.3.1b7",
+    }
+    if (__version__ != "0.3.1b8" or
+            any(config.get(key) != value for key, value in exact_b7.items()) or
+            config.get("usagePolicy") != "OFF" or
+            config.get("projectId") !=
+            "project-372e08efb9354d13bbc57fb2f3405e94" or
+            config.get("repositoryKey") != "agent-workboard-ops" or
+            config.get("database") != ".awb/workboard.db" or
+            work_item_id != "AWB-027"):
+        raise lite.LiteError("SELF_HOST_BOOTSTRAP_REFUSED")
+    databases = connection.execute("PRAGMA database_list").fetchall()
+    main_paths = [os.path.realpath(row[2]) for row in databases if row[1] == "main"]
+    if main_paths != [os.path.realpath(os.path.join(root, config["database"]))]:
+        raise lite.LiteError("SELF_HOST_BOOTSTRAP_REFUSED")
+    try:
+        workflow_kernel.assert_self_host_bootstrap_operation(operation)
+    except ValueError:
+        raise lite.LiteError("SELF_HOST_BOOTSTRAP_REFUSED")
+    built = release_submission_candidate(connection, work_item_id)
+    if built is None or (candidate_id is not None and
+                         built.get("candidateId") != candidate_id):
+        raise lite.LiteError("SELF_HOST_BOOTSTRAP_REFUSED")
+    manifest, assets = _verify_current_build(project_root, work_item_id, built)
+    frozen = manifest.get("frozen", {})
+    target = manifest.get("target", {})
+    if (target.get("version") != "0.3.1b8" or
+            target.get("tag") != "v0.3.1b8" or
+            BUILD_IDENTITY != {
+                "packageVersion": "0.3.1b8",
+                "sourceCommit": frozen.get("headCommit"),
+                "sourceTree": frozen.get("headTree"),
+                "sourceTag": frozen.get("tag"),
+            }):
+        raise lite.LiteError("SELF_HOST_BOOTSTRAP_REFUSED")
+    wheels = [row for row in assets if row["name"].endswith(".whl")]
+    executing = _executing_wheel()
+    if (len(wheels) != 1 or executing is None or
+            os.path.basename(executing) != wheels[0]["name"] or
+            os.path.getsize(executing) != wheels[0]["size"] or
+            _file_sha(executing) != wheels[0]["sha256"]):
+        raise lite.LiteError("SELF_HOST_BOOTSTRAP_REFUSED")
+    return ("PUBLIC" if operation == "PUBLICATION_POSTFLIGHT" else
+            "CANDIDATE")
 
 
 def publication_authorize(database, project_root, work_item_id, human_id,
@@ -1666,7 +1706,7 @@ def publication_status(database, project_root, work_item_id, evidence_file=None)
                     "workItemId": work_item_id, "rowVersion": item["row_version"],
                     "nextStep": {"action": "HUMAN_INSPECT_PARTIAL_PUBLICATION",
                                  "arguments": {}}}
-        next_action = "SUBMIT_EXACT_PUBLICATION_POSTFLIGHT"
+        next_action = "RUN_POST_PUBLICATION_VERIFY"
         risk_class = "LOCAL_SAFE"
     return {"protocolVersion": "AWB-PUBLICATION-v1", "status": "READY",
             "reasonCode": None, "workItemId": work_item_id, "rowVersion": item["row_version"],
@@ -1674,15 +1714,60 @@ def publication_status(database, project_root, work_item_id, evidence_file=None)
                          "riskClass": risk_class, "arguments": {
                              "readyFingerprint": ready["readyFingerprint"],
                              "authorizationRequestId": auth_row["request_id"],
-                             "candidateFingerprint": fingerprint,
-                             "evidenceFile": evidence_file}}}
+                             "candidateFingerprint": fingerprint}}}
+
+
+def _public_postflight_context(connection, project_root, work_item_id,
+                               ready_fingerprint, authorization_request_id,
+                               evidence):
+    item = lite._item(connection, work_item_id)
+    ready_row, ready = _latest_event(connection, work_item_id, "PUBLICATION_READY")
+    auth_row = connection.execute(
+        "SELECT * FROM events WHERE request_id=?", (authorization_request_id,)
+    ).fetchone()
+    if (not ready_row or ready.get("readyFingerprint") != ready_fingerprint or
+            not auth_row or auth_row["event_type"] != "PUBLICATION_AUTHORIZED"):
+        raise lite.LiteError("PUBLIC_POSTFLIGHT_REFUSED")
+    auth = json.loads(auth_row["payload_json"])
+    if not _postflight_bindings_are_exact(evidence, ready, auth_row, auth):
+        raise lite.LiteError("PUBLIC_POSTFLIGHT_REFUSED")
+    expected = auth["authorization"]
+    manifest, current_assets = _verify_current_build(project_root, work_item_id, {
+        "candidateId": ready["candidateId"],
+        "candidateFingerprint": ready["candidateFingerprint"],
+        "buildFingerprint": ready["buildFingerprint"],
+    })
+    frozen = manifest["frozen"]
+    assets = evidence.get("assets")
+    if (evidence["partialState"] != "NONE" or
+            evidence.get("remoteStatus") != "EXACT_ALREADY_PUBLISHED" or
+            evidence["repository"] != expected["repository"] or
+            evidence["version"] != expected["version"] or
+            evidence["tag"] != expected["tag"] or
+            evidence.get("release", {}).get("immutable") is not True or
+            evidence.get("release", {}).get("draft") is not False or
+            evidence.get("release", {}).get("prerelease") is not True or
+            evidence.get("release", {}).get("version") != expected["version"] or
+            evidence.get("release", {}).get("tag") != expected["tag"] or
+            evidence.get("release", {}).get("title") != expected["title"] or
+            evidence.get("refs") != {"branchOid": frozen["headCommit"],
+                                     "tagObject": frozen["tagObject"],
+                                     "tagPeel": frozen["tagPeel"]} or
+            sorted(assets or [], key=lambda row: row["name"]) != current_assets or
+            current_assets != sorted(expected["assets"],
+                                     key=lambda row: row["name"])):
+        raise lite.LiteError("PUBLIC_POSTFLIGHT_REFUSED")
+    return item, ready_row, ready, auth_row, auth, manifest, current_assets
 
 
 def publication_postflight(database, project_root, work_item_id, operator,
                            ready_fingerprint, authorization_request_id,
-                           evidence_file, request_id):
-    evidence_file = _project_file(project_root, evidence_file, "postflight evidence file")
-    evidence = _load_json(evidence_file, POSTFLIGHT_PROTOCOL)
+                           remote_facts, request_id):
+    if not isinstance(remote_facts, dict):
+        raise lite.LiteError("publication postflight requires structured remote facts")
+    evidence = json.loads(_json(remote_facts))
+    if evidence.get("protocolVersion") != POSTFLIGHT_PROTOCOL:
+        raise lite.LiteError("publication postflight remote facts protocol is invalid")
     required = {"protocolVersion", "repository", "version", "tag", "refs",
                 "release", "assets", "partialState", "evidenceCore",
                 "evidenceCoreSha256", "formalReview", "ready", "authorization",
@@ -1708,6 +1793,19 @@ def publication_postflight(database, project_root, work_item_id, operator,
     outcome_candidate_fingerprint = None
     connection = lite.open_database(database)
     try:
+        unused_ready_row, guarded_ready = _latest_event(
+            connection, work_item_id, "PUBLICATION_READY"
+        )
+        lane = assert_self_host_operation(
+            connection, project_root, work_item_id,
+            "PUBLICATION_POSTFLIGHT",
+            guarded_ready.get("candidateId") if guarded_ready else None,
+        )
+        if lane == "PUBLIC":
+            _public_postflight_context(
+                connection, project_root, work_item_id, ready_fingerprint,
+                authorization_request_id, evidence,
+            )
         replay = connection.execute(
             "SELECT * FROM events WHERE request_id=?", (request_id,)
         ).fetchone()
@@ -1726,47 +1824,17 @@ def publication_postflight(database, project_root, work_item_id, operator,
                 raise lite.LiteError("request_id was already used with different content")
             return receipt
         connection.execute("BEGIN IMMEDIATE")
-        item = lite._item(connection, work_item_id)
+        item, ready_row, ready, auth_row, auth, manifest, current_assets = \
+            _public_postflight_context(
+                connection, project_root, work_item_id, ready_fingerprint,
+                authorization_request_id, evidence,
+            )
         now = lite._now()
         snapshot = lite._kernel_assert(
             connection, work_item_id, project_root, phase="pre",
             evaluation_time=now,
         )
-        ready_row, ready = _latest_event(connection, work_item_id, "PUBLICATION_READY")
-        auth_row = connection.execute("SELECT * FROM events WHERE request_id=?", (authorization_request_id,)).fetchone()
-        if not ready_row or ready.get("readyFingerprint") != ready_fingerprint or not auth_row or auth_row["event_type"] != "PUBLICATION_AUTHORIZED":
-            raise lite.LiteError("publication ready or authorization identity is stale")
-        auth = json.loads(auth_row["payload_json"])
-        if not _postflight_bindings_are_exact(evidence, ready, auth_row, auth):
-            raise lite.LiteError("publication postflight bindings are invalid")
         expected = auth["authorization"]
-        manifest, current_assets = _verify_current_build(project_root, work_item_id, {
-            "candidateId": ready["candidateId"],
-            "candidateFingerprint": ready["candidateFingerprint"],
-            "buildFingerprint": ready["buildFingerprint"],
-        })
-        frozen = manifest["frozen"]
-        assets = evidence.get("assets")
-        if (evidence["partialState"] != "NONE" or evidence["repository"] != expected["repository"] or
-                evidence["version"] != expected["version"] or evidence["tag"] != expected["tag"] or
-                evidence.get("release", {}).get("immutable") is not True or
-                evidence.get("release", {}).get("prerelease") is not True or
-                evidence.get("release", {}).get("version") != expected["version"] or
-                evidence.get("release", {}).get("tag") != expected["tag"] or
-                evidence.get("release", {}).get("title") != expected["title"] or
-                evidence.get("refs") != {"branchOid": frozen["headCommit"],
-                                         "tagObject": frozen["tagObject"],
-                                         "tagPeel": frozen["tagPeel"]} or
-                sorted(assets, key=lambda row: row["name"]) != current_assets or
-                current_assets != sorted(expected["assets"], key=lambda row: row["name"])):
-            failure = _sha(_json({"ready": ready_fingerprint, "auth": authorization_request_id,
-                                  "evidence": evidence}))
-            connection.rollback()
-            return {"protocolVersion": "AWB-PUBLICATION-v1", "operation": "POSTFLIGHT",
-                    "status": "REFUSED", "reasonCode": "PUBLICATION_POSTFLIGHT_MISMATCH",
-                    "partialState": evidence["partialState"], "failureFingerprint": failure,
-                    "workItemId": work_item_id, "rowVersion": item["row_version"],
-                    "nextStep": {"action": ("HUMAN_REJECT_PUBLICATION_AND_RETRY" if evidence["partialState"] == "NONE" else "HUMAN_AMEND_MANAGEMENT_FOR_PARTIAL_PUBLICATION"), "arguments": {"failureFingerprint": failure}}}
         unused_root, unused_managed, manifest_path = _candidate_manifest(
             project_root, work_item_id, ready["candidateId"]
         )
@@ -1778,6 +1846,16 @@ def publication_postflight(database, project_root, work_item_id, operator,
                                    "publicationPostflightRequestId": request_id})
         _replace_json(manifest_path, finalized_manifest,
                       "postflight-" + _sha(request_id)[:16])
+        verify_request_id = request_id + "-verify-extension"
+        post_checks = [{
+            "checkId": "publication-remote-facts", "phase": "POST_PUBLICATION",
+            "result": "PASS", "resultDigest": evidence_fingerprint,
+            "covers": ["HC-4", "HC-5", "VP-2"],
+        }]
+        extended_receipt = verify.extend_current_receipt(
+            connection, project_root, work_item_id, "POST_PUBLICATION",
+            verify_request_id, post_checks, now,
+        )
         event = connection.execute(
             "SELECT coalesce(max(event_id),0)+1 FROM events"
         ).fetchone()[0]
@@ -1799,8 +1877,26 @@ def publication_postflight(database, project_root, work_item_id, operator,
         events = [{"requestId": request_id, "eventId": event,
                    "eventType": "PUBLICATION_POSTFLIGHT_ACCEPTED",
                    "payload": payload},
+                  {"requestId": verify_request_id,
+                   "eventId": event + 1,
+                   "eventType": "VERIFY_RECEIPT_EXTENDED",
+                   "payload": {
+                       "receipt": extended_receipt,
+                       "requestFingerprint": _sha(_json({
+                           "workItemId": work_item_id,
+                           "candidateFingerprint": ready["candidateFingerprint"],
+                           "phase": "POST_PUBLICATION",
+                           "evidenceFingerprint": evidence_fingerprint,
+                       })),
+                       "resultReceipt": {
+                           "protocolVersion": verify.RECEIPT_PROTOCOL,
+                           "operation": "RUN", "phase": "POST_PUBLICATION",
+                           "status": "PASS", "workItemId": work_item_id,
+                           "receipt": extended_receipt,
+                       },
+                   }},
                   {"requestId": request_id + "-candidate-finalized",
-                   "eventId": event + 1, "eventType": "CANDIDATE_FINALIZED",
+                   "eventId": event + 2, "eventType": "CANDIDATE_FINALIZED",
                    "actorKind": "SYSTEM", "actorId": "publication-gate",
                    "payload": {
                        "protocolVersion": CANDIDATE_PROTOCOL,
@@ -1819,7 +1915,7 @@ def publication_postflight(database, project_root, work_item_id, operator,
             resources = lite._terminal_resource_projection(snapshot, reviewer_claim)
             auto_events.append({
                 "requestId": request_id + "-terminal-activity",
-                "eventId": event + 2,
+                "eventId": event + 3,
                 "eventType": "TERMINAL_ACTIVITY_RECONCILED",
                 "actorKind": "SYSTEM", "actorId": "terminal-reconciler",
                 "payload": {"triggerRequestId": request_id + "-terminal-activity",
@@ -1833,7 +1929,7 @@ def publication_postflight(database, project_root, work_item_id, operator,
             auto.update(lite._auto_gate_context(connection, work_item_id))
             auto_events.append({
                 "requestId": "auto-gate-" + _sha(request_id + ":FINAL"),
-                "eventId": event + 3, "eventType": "AUTO_GATE_APPROVED",
+                "eventId": event + 4, "eventType": "AUTO_GATE_APPROVED",
                 "actorKind": "SYSTEM", "actorId": "auto-gate",
                 "payload": auto,
             })

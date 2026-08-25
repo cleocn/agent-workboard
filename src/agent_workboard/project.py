@@ -67,9 +67,16 @@ RELEASE_0_3_1B6_IDENTITY = {
     "sourceTree": "64fc91284f11ec7f1b84c9d7072182101fb16260",
     "sourceTag": "v0.3.1b6",
 }
+RELEASE_0_3_1B7_IDENTITY = {
+    "packageVersion": "0.3.1b7",
+    "sourceCommit": "c7380024f9b0efcd3167cebcd9915b2f1d85d13a",
+    "sourceTree": "102cc5ef820b9f7d42166012c67dfd8708e61419",
+    "sourceTag": "v0.3.1b7",
+}
 SUPPORTED_UPGRADE_SOURCES = (
     RELEASE_0_3_1B3_IDENTITY, RELEASE_0_3_1B4_IDENTITY,
     RELEASE_0_3_1B5_IDENTITY, RELEASE_0_3_1B6_IDENTITY,
+    RELEASE_0_3_1B7_IDENTITY,
 )
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
 
@@ -117,9 +124,18 @@ def _migration_graph():
             {
                 "edgeId": "B6_TO_B7_STATE_RELIABILITY",
                 "from": dict(RELEASE_0_3_1B6_IDENTITY),
-                "to": dict(BUILD_IDENTITY),
+                "to": dict(RELEASE_0_3_1B7_IDENTITY),
                 "preconditionId": "EXACT_B6_PROJECT",
                 "transformId": "STATE_RELIABILITY",
+                "schemaAction": "NO_DDL",
+                "rollback": "BOUND_BACKUP_RESTORE",
+            },
+            {
+                "edgeId": "B7_TO_B8_VERIFY_POLICY",
+                "from": dict(RELEASE_0_3_1B7_IDENTITY),
+                "to": dict(BUILD_IDENTITY),
+                "preconditionId": "EXACT_B7_PROJECT",
+                "transformId": "VERIFY_POLICY",
                 "schemaAction": "NO_DDL",
                 "rollback": "BOUND_BACKUP_RESTORE",
             },
@@ -538,7 +554,7 @@ def _validate_project_contract(root):
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
                   for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1",
                               "v0.3.1b2", "v0.3.1b3", "v0.3.1b4", "v0.3.1b5",
-                              "v0.3.1b6", "v0.3.1b7"))):
+                 "v0.3.1b6", "v0.3.1b7", "v0.3.1b8"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -1124,9 +1140,9 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.1b7" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b7"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.1b7 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b8" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b8"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b8 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
@@ -1136,7 +1152,7 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
             if (database_status["usageSchemaState"] != "INSTALLED" or
                     database_status["orchestratorSchemaState"] != "INSTALLED" or
                     database_status["gatePolicySchemaState"] != "INSTALLED"):
-                raise LiteError("same-identity 0.3.1b7 project is missing a required schema extension")
+                raise LiteError("same-identity 0.3.1b8 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -1444,7 +1460,7 @@ def _write_upgrade(plan):
                     human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("0.3.1b7 no-DDL extension validation failed")
+                raise LiteError("0.3.1b8 no-DDL extension validation failed")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1931,7 +1947,7 @@ def _write_rollback(plan):
 def upgrade_project(path, wheel_path=None, with_codex=False, check=False,
                     rollback_manifest=None, expected_stale_activity=None,
                     reconciliation_request_id=None):
-    """Check, execute, or exactly roll back a bounded graph upgrade to 0.3.1b7."""
+    """Check, execute, or exactly roll back a bounded graph upgrade to 0.3.1b8."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",

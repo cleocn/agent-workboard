@@ -50,14 +50,29 @@ from agent_workboard.project import transfer_export, transfer_import
 from agent_workboard import workflow as workflow_kernel
 from agent_workboard import candidate as candidate_module
 from agent_workboard import orchestrator as orchestrator_module
+from agent_workboard import verify as verify_module
 import agent_workboard.lite as lite_module
 
 
 class LiteWorkboardTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        self.project_root = os.path.realpath(self.temporary.name)
         self.database = os.path.join(self.temporary.name, "workboard.db")
+        os.makedirs(os.path.join(self.temporary.name, ".awb"))
+        with open(os.path.join(self.temporary.name, ".awb", "config.json"),
+                  "w", encoding="utf-8") as handle:
+            json.dump({
+                "configVersion": 1, "projectId": "lite-test",
+                "repositoryKey": "test-repository", "database": "workboard.db",
+                "runtimeMode": "development", "usagePolicy": "OFF",
+                "requiredPackageVersion": "0.3.1b8",
+                "requiredSourceCommit": "test", "requiredSourceTree": "test",
+                "requiredSourceTag": "test",
+            }, handle)
         initialize_database(self.database)
+        self.receipts = {}
+        self.receipt_sequence = 0
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -127,8 +142,41 @@ class LiteWorkboardTest(unittest.TestCase):
             "closureEvidence": [{"id": "CL-001", "evidence": "test evidence"}],
         }
 
+    def verify_receipt(self, work_item_id, agent_id, addressed=None):
+        self.receipt_sequence += 1
+        relative = "verify-source-" + work_item_id.lower()
+        source = os.path.join(self.temporary.name, relative)
+        os.makedirs(source, exist_ok=True)
+        path = os.path.join(source, "value.py")
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+        checks = [{
+            "checkId": "registered-unittest-final", "phase": "FINAL",
+            "result": "PASS", "resultDigest": "a" * 64,
+            "covers": ["HC-1", "HC-5", "VP-1", "VP-2"],
+        }]
+        with mock.patch.object(verify_module, "_run_registered_checks",
+                               return_value=checks), mock.patch(
+                                   "agent_workboard.candidate._runtime_guard"):
+            result = verify_module.run(
+                self.database, self.temporary.name, "repo", work_item_id,
+                relative, agent_id, "FINAL",
+                "test-final-verify-{0}".format(self.receipt_sequence),
+                addressed_finding_ids=addressed,
+            )
+        receipt = result["receipt"]
+        binding = {
+            "receiptId": receipt["receiptId"],
+            "coreFingerprint": receipt["coreFingerprint"],
+            "receiptFingerprint": receipt["projection"]["receiptFingerprint"],
+            "candidate": receipt["candidate"],
+        }
+        self.receipts[work_item_id] = binding
+        return receipt["receiptId"]
+
     def revise_review(self, stage, finding_id):
-        return {
+        review = {
             "result": "REVISE", "reviewerMode": "ORDINARY", "summary": "fix required",
             "findings": [{
                 "id": finding_id, "stage": stage, "violatedContract": "AC-001",
@@ -138,14 +186,20 @@ class LiteWorkboardTest(unittest.TestCase):
             }],
             "resolvedFindingIds": [], "nonBlockingSuggestions": [],
         }
+        if stage == "IMPLEMENTATION" and self.receipts:
+            review["reviewedReceipt"] = list(self.receipts.values())[-1]
+        return review
 
     def structured_review(self, stage, result, mode="ORDINARY", findings=None,
                           resolved=None, suggestions=None):
-        return {
+        review = {
             "result": result, "reviewerMode": mode, "summary": result,
             "findings": findings or [], "resolvedFindingIds": resolved or [],
             "nonBlockingSuggestions": suggestions or [],
         }
+        if stage == "IMPLEMENTATION" and self.receipts:
+            review["reviewedReceipt"] = list(self.receipts.values())[-1]
+        return review
 
     def finding(self, stage, finding_id="PLAN-F001", origin="INITIAL",
                 prior="not applicable"):
@@ -275,7 +329,6 @@ class LiteWorkboardTest(unittest.TestCase):
                 self.complete(work_item_id, 1, planner)
                 transition(
                     self.database, work_item_id, "submit_plan", planner,
-                    submission={"addressedFindingIds": ["PLAN-F001"], "complexityChanges": []},
                 )
 
     def after_convergence_revision(self, work_item_id):
@@ -294,7 +347,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete(work_item_id, 1, planner)
         transition(
             self.database, work_item_id, "submit_plan", planner,
-            submission={"addressedFindingIds": ["PLAN-F001"], "complexityChanges": []},
         )
 
     def test_clean_init_and_repeat_init_rejected(self):
@@ -699,7 +751,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-001", 1, "planner-2")
         transition(
             self.database, "TI-001", "submit_plan", "planner-2",
-            submission={"addressedFindingIds": ["PLAN-F001"], "complexityChanges": []},
         )
         self.claim("TI-001", 3, "reviewer-2", "REVIEWER")
         unrelated = self.finding("PLAN", "PLAN-F002")
@@ -725,7 +776,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-001", 1, "planner-2")
         transition(
             self.database, "TI-001", "submit_plan", "planner-2",
-            submission={"addressedFindingIds": ["PLAN-F001"], "complexityChanges": []},
         )
         self.claim("TI-001", 3, "reviewer-2", "REVIEWER")
         with self.assertRaisesRegex(LiteError, "open blocking Finding"):
@@ -755,8 +805,9 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-001", 2, "implementer-2")
         transition(
             self.database, "TI-001", "submit_implementation", "implementer-2",
-            local_tests_passed=True,
-            quality_baseline=self.quality(addressed=["IMPLEMENTATION-F001"]),
+            verify_receipt=self.verify_receipt(
+                "TI-001", "implementer-2", ["IMPLEMENTATION-F001"]),
+            project_root=self.temporary.name,
         )
         self.claim("TI-001", 3, "reviewer-2", "REVIEWER")
         with self.assertRaisesRegex(LiteError, "open blocking Finding"):
@@ -819,7 +870,7 @@ class LiteWorkboardTest(unittest.TestCase):
         connection.close()
         with self.assertRaisesRegex(LiteError, "IN_PROGRESS_WITHOUT_LIVE_CLAIM"):
             self.claim("TI-001", 1, "planner-b", "PLANNER")
-        check = workflow_check(self.database, self.temporary.name, "TI-001")
+        check = workflow_check(self.database, self.project_root, "TI-001")
         arguments = check["nextStep"]["arguments"]
         target = arguments["expectedActivity"][0]
         reconciled = reconcile_expired(
@@ -827,7 +878,7 @@ class LiteWorkboardTest(unittest.TestCase):
             target["ownerId"], target["generation"], arguments["requestId"],
             fingerprint=arguments["fingerprint"],
             expected_activity=arguments["expectedActivity"],
-            not_after=arguments["notAfter"],
+            not_after=arguments["notAfter"], project_root=self.project_root,
         )
         self.assertEqual("OK", reconciled["status"])
         second = self.claim("TI-001", 1, "planner-b", "PLANNER")
@@ -1112,7 +1163,8 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-030", 2, "implementer-auto")
         transition(
             self.database, "TI-030", "submit_implementation", "implementer-auto",
-            local_tests_passed=True, quality_baseline=self.quality(),
+            verify_receipt=self.verify_receipt("TI-030", "implementer-auto"),
+            project_root=self.temporary.name,
         )
         self.claim("TI-030", 3, "final-reviewer", "REVIEWER")
         connection = open_database(self.database)
@@ -1195,7 +1247,8 @@ class LiteWorkboardTest(unittest.TestCase):
         self._through_implementation_submission()
         self.claim("TI-001", 3, "manual-reviewer", "REVIEWER")
         record_agent_review(
-            self.database, "TI-001", "FINAL", "manual-reviewer", "APPROVED", "ok",
+            self.database, "TI-001", "FINAL", "manual-reviewer", "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
             request_id="manual-final-review",
         )
         connection = open_database(self.database)
@@ -1231,7 +1284,8 @@ class LiteWorkboardTest(unittest.TestCase):
         self._through_implementation_submission()
         self.claim("TI-001", 3, "legacy-reviewer", "REVIEWER")
         record_agent_review(
-            self.database, "TI-001", "FINAL", "legacy-reviewer", "APPROVED", "ok",
+            self.database, "TI-001", "FINAL", "legacy-reviewer", "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
             request_id="legacy-final-review",
         )
         connection = open_database(self.database)
@@ -1261,7 +1315,8 @@ class LiteWorkboardTest(unittest.TestCase):
         self._through_implementation_submission()
         self.claim("TI-001", 3, "legacy-reviewer", "REVIEWER")
         record_agent_review(
-            self.database, "TI-001", "FINAL", "legacy-reviewer", "APPROVED", "ok",
+            self.database, "TI-001", "FINAL", "legacy-reviewer", "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
             request_id="legacy-ambiguous-review",
         )
         connection = open_database(self.database)
@@ -1300,7 +1355,7 @@ class LiteWorkboardTest(unittest.TestCase):
         self.assertEqual(before, "\n".join(connection.iterdump()))
         connection.close()
 
-    def test_auto_final_quality_drift_fails_closed_without_auto_event(self):
+    def test_auto_final_receipt_drift_fails_closed_without_review_event(self):
         create_work_item(
             self.database, "TI-031", "TI", "auto fail closed",
             management=self.management("TI-031"),
@@ -1318,15 +1373,16 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-031", 2, "implementer-auto")
         transition(
             self.database, "TI-031", "submit_implementation", "implementer-auto",
-            local_tests_passed=True, quality_baseline=self.quality(),
+            verify_receipt=self.verify_receipt("TI-031", "implementer-auto"),
+            project_root=self.temporary.name,
         )
         connection = open_database(self.database)
         row = connection.execute(
             "SELECT event_id,payload_json FROM events WHERE work_item_id='TI-031' "
-            "AND event_type='SUBMIT_IMPLEMENTATION'"
+            "AND event_type='VERIFY_RECEIPT_RECORDED'"
         ).fetchone()
         payload = json.loads(row["payload_json"])
-        payload["qualityBaseline"]["tests"][0]["result"] = "FAIL"
+        payload["receipt"]["core"]["checks"][0]["result"] = "FAIL"
         connection.execute(
             "UPDATE events SET payload_json=? WHERE event_id=?",
             (json.dumps(payload, sort_keys=True, separators=(",", ":")), row["event_id"]),
@@ -1334,17 +1390,16 @@ class LiteWorkboardTest(unittest.TestCase):
         connection.commit()
         connection.close()
         self.claim("TI-031", 3, "final-reviewer", "REVIEWER")
-        reviewed = record_agent_review(
-            self.database, "TI-031", "FINAL", "final-reviewer", "APPROVED",
-            self.structured_review("IMPLEMENTATION", "PASS"),
-        )
-        self.assertEqual(("IMPLEMENTATION_COMPLETED", "WAITING_HUMAN"), (
-            reviewed["state"], reviewed["queue_state"]
-        ))
+        with self.assertRaisesRegex(LiteError, "VERIFY_FINAL_PHASE_REQUIRED"):
+            record_agent_review(
+                self.database, "TI-031", "FINAL", "final-reviewer", "APPROVED",
+                self.structured_review("IMPLEMENTATION", "PASS"),
+            )
         events = timeline(self.database, "TI-031")
-        self.assertEqual(1, sum(row["event_type"] == "AUTO_GATE_APPROVED" for row in events))
-        final_review = [row for row in events if row["event_type"] == "AGENT_FINAL_REVIEW"][0]
-        self.assertEqual("FAIL_CLOSED", json.loads(final_review["payload_json"])["autoGate"]["status"])
+        self.assertFalse(any(row["event_type"] == "AGENT_FINAL_REVIEW"
+                             for row in events))
+        self.assertEqual(1, sum(row["event_type"] == "AUTO_GATE_APPROVED"
+                                for row in events))
 
     def test_human_plan_rejection_returns_draft(self):
         self.create()
@@ -1368,13 +1423,79 @@ class LiteWorkboardTest(unittest.TestCase):
         with self.assertRaises(LiteError):
             transition(
                 self.database, "TI-001", "submit_implementation", "implementer",
-                local_tests_passed=False, quality_baseline=self.quality(),
+                project_root=self.temporary.name,
             )
         item = transition(
             self.database, "TI-001", "submit_implementation", "implementer",
-            local_tests_passed=True, quality_baseline=self.quality(),
+            verify_receipt=self.verify_receipt("TI-001", "implementer"),
+            project_root=self.temporary.name,
         )
         self.assertEqual("IMPLEMENTATION_COMPLETED", item["state"])
+
+    def test_management_risk_drift_refuses_submission_review_and_final_zero_write(self):
+        def begin(work_item_id):
+            self.through_plan_approval(work_item_id)
+            implementer = work_item_id + "-implementer"
+            self.claim(work_item_id, 2, implementer, "IMPLEMENTER")
+            transition(self.database, work_item_id, "start_implementation", implementer)
+            return implementer, self.verify_receipt(work_item_id, implementer)
+
+        def amend_risk(work_item_id, suffix):
+            management = self.management(work_item_id)
+            management["scope"] = [
+                "cross-version migration and rollback implementation"
+            ]
+            amend_management(
+                self.database, work_item_id, "human", management,
+                "risk scope changed", request_id="risk-drift-" + suffix,
+            )
+
+        implementer, receipt_id = begin("TI-DRIFT-SUBMIT")
+        amend_risk("TI-DRIFT-SUBMIT", "submit")
+        before = self.database_snapshot()
+        with self.assertRaisesRegex(LiteError, "VERIFY_CLASSIFIER_DRIFT"):
+            transition(
+                self.database, "TI-DRIFT-SUBMIT", "submit_implementation",
+                implementer, verify_receipt=receipt_id,
+                project_root=self.temporary.name,
+            )
+        self.assertEqual(before, self.database_snapshot())
+
+        implementer, receipt_id = begin("TI-DRIFT-REVIEW")
+        transition(
+            self.database, "TI-DRIFT-REVIEW", "submit_implementation",
+            implementer, verify_receipt=receipt_id,
+            project_root=self.temporary.name,
+        )
+        self.claim("TI-DRIFT-REVIEW", 3, "drift-reviewer", "REVIEWER")
+        amend_risk("TI-DRIFT-REVIEW", "review")
+        before = self.database_snapshot()
+        with self.assertRaisesRegex(LiteError, "VERIFY_CLASSIFIER_DRIFT"):
+            record_agent_review(
+                self.database, "TI-DRIFT-REVIEW", "FINAL", "drift-reviewer",
+                "APPROVED", self.structured_review("IMPLEMENTATION", "PASS"),
+            )
+        self.assertEqual(before, self.database_snapshot())
+
+        implementer, receipt_id = begin("TI-DRIFT-FINAL")
+        transition(
+            self.database, "TI-DRIFT-FINAL", "submit_implementation",
+            implementer, verify_receipt=receipt_id,
+            project_root=self.temporary.name,
+        )
+        self.claim("TI-DRIFT-FINAL", 3, "final-reviewer", "REVIEWER")
+        record_agent_review(
+            self.database, "TI-DRIFT-FINAL", "FINAL", "final-reviewer",
+            "APPROVED", self.structured_review("IMPLEMENTATION", "PASS"),
+        )
+        amend_risk("TI-DRIFT-FINAL", "final")
+        before = self.database_snapshot()
+        with self.assertRaisesRegex(LiteError, "VERIFY_CLASSIFIER_DRIFT"):
+            record_human_gate(
+                self.database, "TI-DRIFT-FINAL", "FINAL", "human",
+                "APPROVED", "stale receipt must fail",
+            )
+        self.assertEqual(before, self.database_snapshot())
 
     def test_standard_public_api_end_to_end(self):
         self.through_plan_approval()
@@ -1383,10 +1504,14 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-001", 2, "implementer")
         transition(
             self.database, "TI-001", "submit_implementation", "implementer",
-            local_tests_passed=True, quality_baseline=self.quality(),
+            verify_receipt=self.verify_receipt("TI-001", "implementer"),
+            project_root=self.temporary.name,
         )
         self.claim("TI-001", 3, "reviewer", "REVIEWER")
-        reviewed = record_agent_review(self.database, "TI-001", "FINAL", "reviewer", "APPROVED", "accepted")
+        reviewed = record_agent_review(
+            self.database, "TI-001", "FINAL", "reviewer", "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
+        )
         self.assertEqual("WAITING_HUMAN", reviewed["queue_state"])
         done = record_human_gate(self.database, "TI-001", "FINAL", "human", "APPROVED", "accepted")
         self.assertEqual(("FINAL_ACCEPTANCE_APPROVED", "HELD", "TERMINAL_STATE"),
@@ -1401,7 +1526,8 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-001", 2, implementer)
         transition(
             self.database, "TI-001", "submit_implementation", implementer,
-            local_tests_passed=True, quality_baseline=self.quality(),
+            verify_receipt=self.verify_receipt("TI-001", implementer),
+            project_root=self.temporary.name,
         )
 
     def test_final_agent_rejection_returns_implementing(self):
@@ -1417,12 +1543,18 @@ class LiteWorkboardTest(unittest.TestCase):
         self._through_implementation_submission(implementer="same-agent")
         self.claim("TI-001", 3, "same-agent", "REVIEWER")
         with self.assertRaises(LiteError):
-            record_agent_review(self.database, "TI-001", "FINAL", "same-agent", "APPROVED", "bad")
+            record_agent_review(
+                self.database, "TI-001", "FINAL", "same-agent", "APPROVED",
+                self.structured_review("IMPLEMENTATION", "PASS"),
+            )
 
     def test_human_final_rejection_returns_implementing(self):
         self._through_implementation_submission()
         self.claim("TI-001", 3, "reviewer", "REVIEWER")
-        record_agent_review(self.database, "TI-001", "FINAL", "reviewer", "APPROVED", "ok")
+        record_agent_review(
+            self.database, "TI-001", "FINAL", "reviewer", "APPROVED",
+            self.structured_review("IMPLEMENTATION", "PASS"),
+        )
         item = record_human_gate(self.database, "TI-001", "FINAL", "human", "REJECTED", "fix")
         self.assertEqual(("IMPLEMENTING", "IMPLEMENTER"), (item["state"], item["current_role"]))
 
@@ -1444,7 +1576,6 @@ class LiteWorkboardTest(unittest.TestCase):
                 self.complete("TI-001", 1, planner)
                 transition(
                     self.database, "TI-001", "submit_plan", planner,
-                    submission={"addressedFindingIds": ["PLAN-F001"], "complexityChanges": []},
                 )
         self.assertEqual(("REVIEWER", "CLAIMABLE"), (item["current_role"], item["queue_state"]))
         self.claim("TI-001", 3, "convergence", "REVIEWER")
@@ -1459,7 +1590,6 @@ class LiteWorkboardTest(unittest.TestCase):
         self.complete("TI-001", 1, "planner-final")
         transition(
             self.database, "TI-001", "submit_plan", "planner-final",
-            submission={"addressedFindingIds": ["PLAN-F001"], "complexityChanges": []},
         )
         self.claim("TI-001", 3, "reviewer-5", "REVIEWER")
         exhausted = record_agent_review(
@@ -1533,26 +1663,6 @@ class LiteWorkboardTest(unittest.TestCase):
             item["reviewConvergence"]["PLAN"]["totalRoundsUsed"],
             item["reviewConvergence"]["IMPLEMENTATION"]["totalRoundsUsed"],
         ))
-
-    def test_quality_ratchet_rejects_weakened_tests_and_regression(self):
-        self.through_plan_approval()
-        self.claim("TI-001", 2, "implementer", "IMPLEMENTER")
-        transition(self.database, "TI-001", "start_implementation", "implementer")
-        self.complete("TI-001", 2, "implementer")
-        weakened = self.quality()
-        weakened["testsWeakened"] = True
-        with self.assertRaises(LiteError):
-            transition(
-                self.database, "TI-001", "submit_implementation", "implementer",
-                local_tests_passed=True, quality_baseline=weakened,
-            )
-        regressed = self.quality()
-        regressed["regressions"] = ["existing behavior failed"]
-        with self.assertRaises(LiteError):
-            transition(
-                self.database, "TI-001", "submit_implementation", "implementer",
-                local_tests_passed=True, quality_baseline=regressed,
-            )
 
     def test_plan_deviation_blocks_and_returns_authority_to_planner_without_reset(self):
         self.through_plan_approval()
@@ -1871,14 +1981,14 @@ class LiteWorkboardTest(unittest.TestCase):
         connection.execute("UPDATE repository_locks SET expires_at=? WHERE lock_id=?",
                            (past, writer["lockId"]))
         connection.commit(); connection.close()
-        check = workflow_check(self.database, self.temporary.name, work_item_id)
+        check = workflow_check(self.database, self.project_root, work_item_id)
         proof = check["nextStep"]["arguments"]
         result = reconcile_expired(
             self.database, work_item_id, "claim", claim["claimId"], "planner",
             claim["generation"], proof["requestId"],
             fingerprint=proof["fingerprint"],
             expected_activity=proof["expectedActivity"],
-            not_after=proof["notAfter"],
+            not_after=proof["notAfter"], project_root=self.project_root,
         )
         self.assertEqual("OK", result["status"])
         item = get_work_item(self.database, work_item_id)
@@ -2347,7 +2457,6 @@ class LiteWorkboardTest(unittest.TestCase):
         risk_file = self.json_file("fe-risk.json", {
             "protocolVersion": "AWB-CREATION-RISK-v1", "signals": []
         })
-        quality_file = self.json_file("fe-quality.json", self.quality())
         self.cli("create", "FE-99", "--type", "FE", "--title", "CLI trial",
                  "--management-file", management_file, "--risk-file", risk_file,
                  "--human-review", "manual")
@@ -2362,10 +2471,15 @@ class LiteWorkboardTest(unittest.TestCase):
         self.cli("claim", "FE-99", "FE-99-T02", "--agent", "implementer", "--role", "IMPLEMENTER")
         self.cli("transition", "FE-99", "start_implementation", "--agent", "implementer")
         self.cli("task", "FE-99", "FE-99-T02", "--agent", "implementer", "--status", "IN_PROGRESS")
+        receipt_id = self.verify_receipt("FE-99", "implementer")
         self.cli("transition", "FE-99", "submit_implementation", "--agent", "implementer",
-                 "--local-tests-passed", "--quality-file", quality_file)
+                 "--verify-receipt", receipt_id)
         self.cli("claim", "FE-99", "FE-99-T03", "--agent", "reviewer", "--role", "REVIEWER")
-        self.cli("review", "FE-99", "--stage", "FINAL", "--agent", "reviewer", "--decision", "APPROVED", "--summary", "ok")
+        final_review = self.json_file(
+            "fe-final-review.json", self.structured_review("IMPLEMENTATION", "PASS")
+        )
+        self.cli("review", "FE-99", "--stage", "FINAL", "--agent", "reviewer",
+                 "--decision", "APPROVED", "--review-file", final_review)
         done = self.cli("gate", "FE-99", "--stage", "FINAL", "--human", "human", "--decision", "APPROVED", "--reason", "ok")
         self.assertEqual("FINAL_ACCEPTANCE_APPROVED", done["state"])
         self.assertGreater(len(self.cli("timeline", "FE-99")), 10)
@@ -2496,12 +2610,10 @@ class LiteWorkboardTest(unittest.TestCase):
         self.assertEqual("BEGIN_IMPLEMENTATION", advance(
             "implementer", "IMPLEMENTER", "eight-begin-implementation"
         )["operation"])
-        with open(os.path.join(self.temporary.name, "quality.json"), "w",
-                  encoding="utf-8") as handle:
-            json.dump(self.quality(), handle)
+        receipt_id = self.verify_receipt(work_item_id, "implementer")
         self.assertEqual("SUBMIT_IMPLEMENTATION", advance(
             "implementer", "IMPLEMENTER", "eight-submit-implementation",
-            quality_file="quality.json", local_tests_passed=True,
+            verify_receipt=receipt_id,
         )["operation"])
         self.assertEqual("BEGIN_IMPLEMENTATION_REVIEW", advance(
             "implementation-reviewer", "REVIEWER", "eight-begin-final-review"

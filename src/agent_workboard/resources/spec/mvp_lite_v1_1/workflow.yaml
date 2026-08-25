@@ -36,7 +36,7 @@ humanGatePolicy:
               active_independent_reviewer_claim, management_envelope_present,
               latest_independent_final_review_PASS, open_implementation_findings_zero,
               held_reason_absent, blocked_reason_absent, required_tasks_completed,
-              implementation_quality_baseline_PASS]
+              current_verify_receipt_floor_PASS]
     autoEvent: {type: AUTO_GATE_APPROVED, actorKind: SYSTEM, actorId: auto-gate}
     neverGrants: [remote_write, publish, deploy, delete, destructive_action]
   READ_ONLY_DIAGNOSIS: {policy: MANUAL, plan: optional, final: not_applicable}
@@ -88,7 +88,7 @@ transitions:
     from: IMPLEMENTING
     to: IMPLEMENTATION_COMPLETED
     actor: IMPLEMENTER
-    requires: [implementation_tasks_completed, local_tests_passed]
+    requires: [implementation_tasks_completed, current_verify_receipt_floor_PASS]
   agent_approve_final:
     from: IMPLEMENTATION_COMPLETED
     to: {AUTO_ON_PASS: FINAL_ACCEPTANCE_APPROVED, MANUAL: IMPLEMENTATION_COMPLETED}
@@ -98,7 +98,7 @@ transitions:
                      management_envelope_present, latest_independent_final_review_PASS,
                      open_implementation_findings_zero, held_reason_absent,
                      blocked_reason_absent, required_tasks_completed,
-                     implementation_quality_baseline_PASS]
+                     current_verify_receipt_floor_PASS]
     autoEvent: {type: AUTO_GATE_APPROVED, actorKind: SYSTEM, actorId: auto-gate, stage: FINAL}
     queueAfter: {AUTO_ON_PASS: HELD, MANUAL: WAITING_HUMAN}
   agent_reject_final:
@@ -191,14 +191,10 @@ usagePolicy:
 evidencePolicy:
   runtimeEventsAuthoritative: true
   normalFinalArtifact: implementation_summary
-  releaseFinalArtifact: release_postflight
-  previewRequired: [one_clean_build, one_full_test, one_fresh_install,
-                    exact_path_allowlist, artifact_secret_scan,
-                    three_asset_sha256, remote_drift, independent_review]
-  previewNotRequired: [per_round_submission_json, per_round_quality_hash,
-                       duplicate_postflight, release_body_hash,
-                       per_file_manifest_sha, double_clean_reproducibility,
-                       no_git_rebuild, reachable_object_closure]
+  verificationProtocol: AWB-VERIFY-RECEIPT-v1
+  verificationPolicyAuthority: agent_workboard.verify
+  finalRequires: [current_candidate_bound_floor_PASS_receipt,
+                  independent_implementation_review]
 
 activityPolicy:
   protocol: AWB-ACTIVITY-v1
@@ -212,12 +208,14 @@ activityPolicy:
   finalReviewerClaimBinding: {status: RELEASED, effective: INACTIVE,
                               legacy: UNIQUE_ACTOR_TASK_RELEASE_TIME}
   migrationGraph: AWB-MIGRATION-GRAPH-v1
-  upgradeSources: [exact_0_3_1b3, exact_0_3_1b4, exact_0_3_1b5, exact_0_3_1b6]
-  upgradeTarget: exact_0_3_1b7
+  upgradeSources: [exact_0_3_1b3, exact_0_3_1b4, exact_0_3_1b5, exact_0_3_1b6,
+                   exact_0_3_1b7]
+  upgradeTarget: exact_0_3_1b8
   upgradeEdges: [B3_TO_B4_CONFIG_CANONICALIZATION,
                  B4_TO_B5_ACTIVITY_RECOVERY,
                  B5_TO_B6_FINDING_CORRECTION,
-                 B6_TO_B7_STATE_RELIABILITY]
+                 B6_TO_B7_STATE_RELIABILITY,
+                 B7_TO_B8_VERIFY_POLICY]
   staleOnlyNextStep: EXECUTE_UPGRADE_WITH_RECONCILIATION
   liveOrMixedNextStep: STOP_LIVE_ACTIVITY_OWNER_AND_RECHECK
 
@@ -251,12 +249,11 @@ workflowReliabilityPolicy:
   expiryEdge: EXPIRE_AND_RECONCILE_ACTIVITY
   legacyRecoverReviewTask: REFUSED_USE_WORKFLOW_CHECK_AND_EXACT_REPAIR
 
-implementationQualityPolicy:
-  baselineFields: [passedAcceptance, tests, modifiedScope, knownNonBlockingIssues,
-                   addressedFindingIds, complexityChanges, regressions]
-  stopOn: [acceptance_regression, test_weakening, same_or_worse_defect,
-           material_scope_expansion, plan_invalid]
-  planDeviation: {state: DRAFT, queue: BLOCKED, role: PLANNER, resetReviewRounds: false}
+verificationPolicy:
+  protocol: AWB-VERIFY-RECEIPT-v1
+  authority: agent_workboard.verify
+  workflowInput: --verify-receipt
+  hardContracts: [HC-1, HC-2, HC-3, HC-4, HC-5]
 
 workflowAdvancePolicy:
   protocol: AWB-WORKFLOW-ADVANCE-v1

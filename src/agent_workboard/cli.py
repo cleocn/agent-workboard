@@ -10,6 +10,7 @@ from . import candidate
 from . import lite
 from . import orchestrator
 from . import usage
+from . import verify
 from .project import (backup, bootstrap, codex_check, codex_install, doctor,
                       init_project, migrate, transfer_export, transfer_import,
                       upgrade_project, usage_policy, set_usage_policy)
@@ -39,6 +40,54 @@ def _project_identity(path):
     root = _project_root(path)
     config, database = _load_config(root)
     return root, config, database
+
+
+def _guard_self_host_dispatch(args):
+    """Deny b8-on-b7 mutations before a write transaction is opened."""
+    if not hasattr(args, "project") or args.command == "init":
+        return
+    root, config, database = _project_identity(args.project)
+    if (config.get("runtimeMode") == "development" or
+            config.get("requiredPackageVersion") == __version__):
+        return
+    readonly = (
+        args.command == "doctor" or
+        args.command == "codex" and args.codex_command == "check" or
+        args.command == "activity" and args.activity_command in ("list", "show") or
+        args.command == "orchestrator" and args.orchestrator_command in ("list", "show") or
+        args.command == "workflow" and args.workflow_command in ("status", "check") or
+        args.command == "verify" and args.verify_command == "status" or
+        args.command == "candidate" and args.candidate_command == "status" or
+        args.command == "publication" and args.publication_command == "status"
+    )
+    if readonly:
+        return
+    if args.command == "upgrade":
+        return
+    operation = candidate_id = work_item = None
+    if (args.command == "verify" and args.verify_command == "run" and
+            args.phase == "FINAL"):
+        operation = "VERIFY_FINAL_RECORD"
+        candidate_id, work_item = args.candidate, args.work_item
+    elif args.command == "workflow" and args.workflow_command == "advance":
+        work_item, candidate_id = args.work_item, args.candidate
+        if args.role == "IMPLEMENTER" and args.verify_receipt:
+            operation = "SUBMIT_IMPLEMENTATION_WITH_RECEIPT"
+        elif args.role == "REVIEWER" and args.review_file:
+            operation = "FORMAL_IMPLEMENTATION_REVIEW"
+    elif (args.command == "verify" and args.verify_command == "run" and
+          args.phase == "POST_PUBLICATION"):
+        operation = "PUBLICATION_POSTFLIGHT"
+        candidate_id, work_item = args.candidate, args.work_item
+    if operation is None or candidate_id is None:
+        raise lite.LiteError("SELF_HOST_BOOTSTRAP_REFUSED")
+    connection = lite.open_database(database)
+    try:
+        candidate.assert_self_host_operation(
+            connection, root, work_item, operation, candidate_id
+        )
+    finally:
+        connection.close()
 
 
 def _workflow_command(args):
@@ -71,9 +120,91 @@ def _workflow_command(args):
             config["repositoryKey"], args.expected_step,
             args.expected_row_version, args.request_id,
             args.orchestrator_id, args.orchestrator_generation, args.ttl,
-            args.plan_artifact, args.submission_file, args.quality_file,
-            args.review_file, args.decision, args.local_tests_passed,
-            args.candidate, args.candidate_fingerprint,
+            args.plan_artifact,
+            args.review_file, args.decision,
+            args.candidate, args.candidate_fingerprint, args.verify_receipt,
+        )
+    _print(result)
+    return 2 if result.get("status") in ("REFUSED", "WAITING_HUMAN") else 0
+
+
+def _verify_policy(args):
+    mapping = {
+        "database": getattr(args, "database_policy", None),
+        "revision": getattr(args, "revision_policy", None),
+        "final": getattr(args, "final_policy", None),
+        "profile": getattr(args, "profile", None),
+        "rebuild": getattr(args, "rebuild", None),
+        "compatibility": getattr(args, "compatibility", None),
+        "identityEvidence": getattr(args, "identity_evidence", None),
+        "previewCost": getattr(args, "preview_cost", None),
+    }
+    result = {key: value for key, value in mapping.items() if value is not None}
+    runs = getattr(args, "runs", None)
+    if runs:
+        parsed = {}
+        for value in runs:
+            check_id, separator, count = value.partition("=")
+            if not separator or not check_id:
+                raise lite.LiteError("--runs requires CHECK=COUNT")
+            try:
+                parsed[check_id] = int(count)
+            except ValueError:
+                raise lite.LiteError("--runs COUNT must be an integer")
+        result["runs"] = parsed
+    return result
+
+
+def _verify_command(args):
+    root, config, database = _project_identity(args.project)
+    if args.verify_command == "status":
+        result = verify.status(
+            database, root, args.work_item, args.source, args.candidate
+        )
+    elif args.verify_command == "override":
+        result = verify.grant_override(
+            database, root, args.work_item, args.human,
+            args.candidate_fingerprint, args.scope, args.reason,
+            args.expires_at, args.request_id, _verify_policy(args),
+        )
+    elif args.phase == "POST_PUBLICATION":
+        if (not args.candidate or not args.ready_fingerprint or
+                not args.authorization_request_id):
+            raise lite.LiteError(
+                "POST_PUBLICATION requires managed candidate and publication bindings"
+            )
+        try:
+            remote_facts = json.load(sys.stdin)
+        except (TypeError, ValueError) as exc:
+            raise lite.LiteError(
+                "POST_PUBLICATION stdin is invalid JSON: {0}".format(exc)
+            )
+        publication = candidate.publication_postflight(
+            database, root, args.work_item, args.agent,
+            args.ready_fingerprint, args.authorization_request_id,
+            remote_facts, args.request_id,
+        )
+        connection = lite.open_database(database)
+        try:
+            receipt = verify.validate_current_receipt(
+                connection, root, args.work_item, require_final=True
+            )
+        finally:
+            connection.close()
+        result = {
+            "protocolVersion": verify.RECEIPT_PROTOCOL, "operation": "RUN",
+            "phase": "POST_PUBLICATION", "status": "PASS",
+            "workItemId": args.work_item, "receipt": receipt,
+            "publicationReceipt": publication,
+            "nextStep": {"action": "NONE", "arguments": {}},
+        }
+    else:
+        result = verify.run(
+            database, root, config["repositoryKey"], args.work_item,
+            args.source, args.agent, args.phase, args.request_id,
+            args.orchestrator_id, args.orchestrator_generation,
+            _verify_policy(args), args.human_override_request_id,
+            args.addressed_finding, args.known_issue, args.candidate,
         )
     _print(result)
     return 2 if result.get("status") in ("REFUSED", "WAITING_HUMAN") else 0
@@ -132,12 +263,6 @@ def _publication_command(args):
             database, root, args.work_item, args.human, args.candidate,
             args.candidate_fingerprint, args.authorization_file,
             args.request_id,
-        )
-    elif name == "postflight":
-        result = candidate.publication_postflight(
-            database, root, args.work_item, args.operator,
-            args.ready_fingerprint, args.authorization_request_id,
-            args.evidence_file, args.request_id,
         )
     else:
         result = candidate.publication_retry(
@@ -263,7 +388,11 @@ def _orchestrator_command(args):
 
 
 def _activity_command(args):
-    database = _project_database(args.project)
+    supplied_root = os.path.abspath(os.path.normpath(args.project))
+    if (args.activity_command == "reconcile-expired" and
+            supplied_root != os.path.realpath(supplied_root)):
+        raise lite.LiteError("activity reconciliation requires canonical project root")
+    root, unused_config, database = _project_identity(args.project)
     if args.activity_command == "list":
         result = orchestrator.list_activity(
             database, args.work_item, args.effective_status
@@ -279,6 +408,7 @@ def _activity_command(args):
             database, args.work_item, args.kind, args.resource_id, args.owner,
             args.generation, args.request_id, fingerprint=args.fingerprint,
             expected_activity=expected_activity, not_after=args.not_after,
+            project_root=root,
         )
     _print(result)
     return 2 if result["status"] in ("REFUSED", "CONFLICT") else 0
@@ -462,13 +592,11 @@ def main(argv=None):
             command.add_argument("--request-id", required=True)
             command.add_argument("--ttl", type=int, default=900)
             command.add_argument("--plan-artifact")
-            command.add_argument("--submission-file")
-            command.add_argument("--quality-file")
             command.add_argument("--review-file")
             command.add_argument("--decision", choices=("APPROVED", "REJECTED"))
-            command.add_argument("--local-tests-passed", action="store_true")
             command.add_argument("--candidate")
             command.add_argument("--candidate-fingerprint")
+            command.add_argument("--verify-receipt")
     workflow_check = workflow_sub.add_parser("check")
     workflow_check.add_argument("work_item", metavar="work-item", nargs="?")
     workflow_check.add_argument("--project", default=".")
@@ -481,6 +609,53 @@ def main(argv=None):
     workflow_repair.add_argument("--fingerprint", required=True)
     workflow_repair.add_argument("--request-id", required=True)
     workflow_repair.add_argument("--human", required=True)
+    verify_parser = sub.add_parser("verify")
+    verify_sub = verify_parser.add_subparsers(dest="verify_command", required=True)
+    verify_status = verify_sub.add_parser("status")
+    verify_status.add_argument("work_item", metavar="work-item")
+    verify_status.add_argument("--project", default=".")
+    verify_status.add_argument("--source", required=True)
+    verify_status.add_argument("--candidate")
+
+    def add_verify_policy(command):
+        command.add_argument("--database-policy", choices=verify.POLICY_ORDER["database"])
+        command.add_argument("--revision-policy", choices=verify.POLICY_ORDER["revision"])
+        command.add_argument("--final-policy", choices=verify.POLICY_ORDER["final"])
+        command.add_argument("--profile", choices=("AUTO",) + verify.POLICY_ORDER["profile"])
+        command.add_argument("--runs", action="append")
+        command.add_argument("--rebuild", choices=verify.POLICY_ORDER["rebuild"])
+        command.add_argument("--compatibility", choices=verify.POLICY_ORDER["compatibility"])
+        command.add_argument("--identity-evidence", choices=verify.POLICY_ORDER["identityEvidence"])
+        command.add_argument("--preview-cost", choices=verify.POLICY_ORDER["previewCost"])
+
+    verify_run = verify_sub.add_parser("run")
+    verify_run.add_argument("work_item", metavar="work-item")
+    verify_run.add_argument("--project", default=".")
+    verify_run.add_argument("--source", required=True)
+    verify_run.add_argument("--candidate")
+    verify_run.add_argument("--agent", required=True)
+    verify_run.add_argument("--phase", required=True,
+                            choices=("REVISION", "FINAL", "POST_PUBLICATION"))
+    verify_run.add_argument("--request-id", required=True)
+    verify_run.add_argument("--orchestrator-id")
+    verify_run.add_argument("--orchestrator-generation", type=int)
+    verify_run.add_argument("--human-override-request-id")
+    verify_run.add_argument("--addressed-finding", action="append", default=[])
+    verify_run.add_argument("--known-issue", action="append", default=[])
+    verify_run.add_argument("--ready-fingerprint")
+    verify_run.add_argument("--authorization-request-id")
+    add_verify_policy(verify_run)
+    verify_override = verify_sub.add_parser("override")
+    verify_override.add_argument("work_item", metavar="work-item")
+    verify_override.add_argument("--project", default=".")
+    verify_override.add_argument("--human", required=True)
+    verify_override.add_argument("--candidate-fingerprint", required=True)
+    verify_override.add_argument("--scope", required=True,
+                                 choices=("REVISION", "FINAL", "POST_PUBLICATION"))
+    verify_override.add_argument("--reason", required=True)
+    verify_override.add_argument("--expires-at", required=True)
+    verify_override.add_argument("--request-id", required=True)
+    add_verify_policy(verify_override)
     candidate_parser = sub.add_parser("candidate")
     candidate_sub = candidate_parser.add_subparsers(dest="candidate_command", required=True)
     candidate_status = candidate_sub.add_parser("status")
@@ -521,14 +696,6 @@ def main(argv=None):
     publication_authorize.add_argument("--candidate-fingerprint", required=True)
     publication_authorize.add_argument("--authorization-file", required=True)
     publication_authorize.add_argument("--request-id", required=True)
-    publication_postflight = publication_sub.add_parser("postflight")
-    publication_postflight.add_argument("work_item", metavar="work-item")
-    publication_postflight.add_argument("--project", default=".")
-    publication_postflight.add_argument("--operator", required=True)
-    publication_postflight.add_argument("--ready-fingerprint", required=True)
-    publication_postflight.add_argument("--authorization-request-id", required=True)
-    publication_postflight.add_argument("--evidence-file", required=True)
-    publication_postflight.add_argument("--request-id", required=True)
     publication_retry = publication_sub.add_parser("retry")
     publication_retry.add_argument("work_item", metavar="work-item")
     publication_retry.add_argument("--project", default=".")
@@ -549,6 +716,7 @@ def main(argv=None):
     serve.add_argument("--port", type=int, default=8787)
     args = parser.parse_args(argv)
     try:
+        _guard_self_host_dispatch(args)
         if args.command == "init":
             _print(init_project(args.project, args.with_codex, args.development, args.wheel))
         elif args.command == "bootstrap":
@@ -585,6 +753,8 @@ def main(argv=None):
             return _activity_command(args)
         elif args.command == "workflow":
             return _workflow_command(args)
+        elif args.command == "verify":
+            return _verify_command(args)
         elif args.command == "candidate":
             return _candidate_command(args)
         elif args.command == "publication":

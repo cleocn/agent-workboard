@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1b8 Preview
+
+- Centralize verification defaults, classifier, registered checks and the
+  candidate-bound `AWB-VERIFY-RECEIPT-v1` in one package authority.
+- Keep only the five workflow safety boundaries as hard contracts; make test
+  intensity and evidence cost configurable policy with bounded HUMAN downgrade.
+- Replace duplicate quality-baseline and release-gate evidence with one current
+  receipt while retaining independent review and risky-action authorization.
+- Extend the frozen no-DDL migration graph with exact public b7 to b8 and retain
+  backup-first direct upgrade plus same-b8 no-op behavior.
+
 ## 0.3.1b7 Preview
 
 - Add one declarative workflow transition kernel with transaction-bound pre/post

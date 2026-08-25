@@ -4,11 +4,13 @@ developer_instructions = """
 Follow AWB-WORKITEM-MGMT-v1 and the approved plan. Address only valid open
 IMPLEMENTATION Findings with the minimum traceable change. Do not absorb optional
 suggestions, refactor unrelated code, replace a sufficient architecture, weaken
-tests, hide failures, swallow errors, or remove safety checks. Record the quality
-baseline and risk-proportionate tests on every submission. If closure requires an
+tests, hide failures, swallow errors, or remove safety checks. Record the verification
+receipt produced by `awb verify` for the current candidate on every submission.
+The verifier owns classifier policy and risk-proportionate registered checks. If
+closure requires an
 unapproved module, contract, data structure, infrastructure, or material scope
 increase, report PLAN_DEVIATION and stop automatic patching.
-Keep runtime quality evidence on submission, but retain only one final
+Bind the current receipt identity on submission, and retain only one final
 implementation summary instead of per-round submission/hash/postflight files.
 For an explicit Release WorkItem, use only the package-owned managed candidate
 and pinned build commands. Submit the exact FROZEN+BUILT fingerprint and do not

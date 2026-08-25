@@ -146,14 +146,17 @@ macOS 上主 Agent 可用一个前台工具会话持有 `caffeinate -di`，并�
 
 `submit_plan` 和 `submit_implementation` 都要求提交者持有活动 claim；二者在成功 transition 内原子释放该 claim。若存在活动 repository writer lock，必须先释放该 lock。不得先 release WorkItem claim 再提交。
 
-每次实施提交还必须记录已通过 acceptance、测试命令/结果、实际修改范围、已知非阻断问题、关闭 Finding、复杂度变化和回归。删测、跳测、放宽断言、已有验收倒退或新同级缺陷会停止自动提交。修复需要未批准模块、契约、数据结构、基础设施或显著扩项时使用 `plan-deviation`，实现 task 进入 BLOCKED、回到 Planner，既有复审轮次不重置。
+每次实施提交必须绑定由 `awb verify` 为当前候选生成的有效
+`AWB-VERIFY-RECEIPT-v1`。classifier、policy、注册检查、Finding trace 和已知问题只由
+verifier 写入 runtime receipt；删测、跳测、放宽断言或验收倒退不会产生 PASS receipt。
+修复需要未批准模块、契约、数据结构、基础设施或显著扩项时使用 `plan-deviation`，
+实现 task 进入 BLOCKED、回到 Planner，既有复审轮次不重置。
 
-过程审计以 runtime events 为权威；不强制每轮 submission JSON、quality hash、重复
-postflight 或 Release body hash。普通 WorkItem 只保留一份最终 implementation summary；
-发布 WorkItem 只保留一份 release postflight。Preview 仅执行一次 clean build/full test/
-fresh install、exact path allowlist、artifact member/secret scan、三资产 SHA、remote drift 和
-独立 Implementation review，不要求 per-file manifest SHA、double/no-Git reproducibility 或
-reachable-object/history closure。
+过程审计以 runtime events 和当前 verify receipt 为权威；不强制每轮 submission JSON、
+quality hash、重复 postflight 或 Release body hash，只保留一份最终 implementation summary。
+验证成本、profile 和检查组合只引用 verifier 的默认与 classifier；状态原子一致、活动资源
+exact ownership/fence、独立 Review、风险动作 HUMAN authority、当前候选 floor PASS receipt
+是仅有五类不可豁免硬契约。
 
 任务只能沿已定义边推进，同一 WorkItem 最多一个 IN_PROGRESS；BLOCKED、WAITING_ACCEPTANCE、COMPLETED 或 CANCELLED 必须有证据。`show` 与 HTTP detail 投影 management、任务板、进度、currentTask、唯一 nextStep 和两阶段 review counters；board/list 只显示进度与 nextStep 摘要。
 

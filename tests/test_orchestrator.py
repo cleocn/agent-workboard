@@ -26,7 +26,19 @@ import agent_workboard.orchestrator as orchestrator_module
 class OrchestratorCoordinationTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        self.project_root = os.path.realpath(self.temporary.name)
         self.database = os.path.join(self.temporary.name, "workboard.db")
+        os.makedirs(os.path.join(self.temporary.name, ".awb"))
+        with open(os.path.join(self.temporary.name, ".awb", "config.json"),
+                  "w", encoding="utf-8") as handle:
+            json.dump({
+                "configVersion": 1, "projectId": "orchestrator-test",
+                "repositoryKey": "test-repository", "database": "workboard.db",
+                "runtimeMode": "stable", "usagePolicy": "OFF",
+                "requiredPackageVersion": "0.3.1b8",
+                "requiredSourceCommit": "test", "requiredSourceTree": "test",
+                "requiredSourceTag": "test",
+            }, handle)
         initialize_database(self.database)
 
     def tearDown(self):
@@ -75,20 +87,29 @@ class OrchestratorCoordinationTest(unittest.TestCase):
 
     def cli(self, arguments):
         output = io.StringIO()
-        with mock.patch("agent_workboard.cli._project_database", return_value=self.database), \
-                redirect_stdout(output):
-            code = cli_main(["orchestrator"] + arguments + ["--project", "."])
+        with mock.patch("agent_workboard.cli._project_database",
+                        return_value=self.database), mock.patch(
+                            "agent_workboard.cli._guard_self_host_dispatch"
+                        ), redirect_stdout(output):
+            code = cli_main(["orchestrator"] + arguments +
+                            ["--project", self.project_root])
+        return code, json.loads(output.getvalue())
+
+    def awb_cli(self, arguments):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = cli_main(arguments)
         return code, json.loads(output.getvalue())
 
     def reconcile_checked(self, work_item_id, kind, resource_id, owner,
                           generation):
-        check = workflow_check(self.database, self.temporary.name, work_item_id)
+        check = workflow_check(self.database, self.project_root, work_item_id)
         proof = check["nextStep"]["arguments"]
         return reconcile_expired(
             self.database, work_item_id, kind, resource_id, owner, generation,
             proof["requestId"], fingerprint=proof["fingerprint"],
             expected_activity=proof["expectedActivity"],
-            not_after=proof["notAfter"],
+            not_after=proof["notAfter"], project_root=self.project_root,
         )
 
     def test_register_claim_replay_conflict_and_parallel_work_items(self):
@@ -129,7 +150,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         self.assertEqual(before, "\n".join(connection.iterdump()))
         connection.close()
 
-        check = workflow_check(self.database, self.temporary.name, "AWB-103")
+        check = workflow_check(self.database, self.project_root, "AWB-103")
         proof = check["nextStep"]["arguments"]
 
         wrong = reconcile_expired(
@@ -137,7 +158,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             "wrong-owner", stale["generation"], proof["requestId"],
             fingerprint=proof["fingerprint"],
             expected_activity=proof["expectedActivity"],
-            not_after=proof["notAfter"],
+            not_after=proof["notAfter"], project_root=self.project_root,
         )
         self.assertEqual("WRONG_OWNER", wrong["reasonCode"])
         with mock.patch.object(orchestrator_module, "_activity_materialized",
@@ -148,7 +169,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
                     "old-owner", stale["generation"], proof["requestId"],
                     fingerprint=proof["fingerprint"],
                     expected_activity=proof["expectedActivity"],
-                    not_after=proof["notAfter"],
+                    not_after=proof["notAfter"], project_root=self.project_root,
                 )
         connection = open_database(self.database)
         self.assertEqual("ACTIVE", connection.execute(
@@ -161,7 +182,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             "old-owner", stale["generation"], proof["requestId"],
             fingerprint=proof["fingerprint"],
             expected_activity=proof["expectedActivity"],
-            not_after=proof["notAfter"],
+            not_after=proof["notAfter"], project_root=self.project_root,
         )
         self.assertEqual("OK", reconciled["status"])
         replay = reconcile_expired(
@@ -169,13 +190,103 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             "old-owner", stale["generation"], proof["requestId"],
             fingerprint=proof["fingerprint"],
             expected_activity=proof["expectedActivity"],
-            not_after=proof["notAfter"],
+            not_after=proof["notAfter"], project_root=self.project_root,
         )
         self.assertEqual("NO_OP", replay["status"])
         connection = open_database(self.database)
         self.assertEqual(1, connection.execute(
             "SELECT count(*) FROM events WHERE event_type='ACTIVITY_EXPIRED_AND_RECONCILED'"
         ).fetchone()[0])
+        connection.close()
+
+    def test_public_check_proof_consumes_whole_bundle_with_same_canonical_root(self):
+        self.create("AWB-ROOT")
+        lease = claim(self.database, "AWB-ROOT", "root-orchestrator", 900,
+                      "root-orchestrator-claim")["lease"]
+        agent = acquire_claim(
+            self.database, "AWB-ROOT", "AWB-ROOT-T01", "planner", "PLANNER",
+            self.agent_expiry(), orchestrator_id="root-orchestrator",
+            orchestrator_generation=lease["generation"],
+        )
+        writer = acquire_repository_lock(
+            self.database, "AWB-ROOT", "root-repository", "planner",
+            self.agent_expiry(),
+        )
+        connection = open_database(self.database)
+        expired = self.now(-30)
+        connection.execute("UPDATE claims SET expires_at=? WHERE claim_id=?",
+                           (expired, agent["claimId"]))
+        connection.execute(
+            "UPDATE repository_locks SET expires_at=? WHERE lock_id=?",
+            (expired, writer["lockId"]),
+        )
+        connection.execute(
+            "UPDATE orchestrator_leases SET expires_at=? WHERE lease_id=?",
+            (expired, lease["lease_id"]),
+        )
+        connection.commit(); connection.close()
+
+        code, checked = self.awb_cli([
+            "workflow", "check", "AWB-ROOT", "--project", self.project_root,
+        ])
+        self.assertEqual((2, "DETERMINISTIC", "EXPIRE_AND_RECONCILE_ACTIVITY"),
+                         (code, checked["repairability"],
+                          checked["nextStep"]["action"]))
+        proof = checked["nextStep"]["arguments"]
+        self.assertEqual({"AGENT_CLAIM", "REPOSITORY_WRITER",
+                          "ORCHESTRATOR_LEASE"},
+                         {row["kind"] for row in proof["expectedActivity"]})
+        code, reconciled = self.awb_cli([
+            "activity", "reconcile-expired", "--project", self.project_root,
+            "--work-item", "AWB-ROOT", "--kind", "claim",
+            "--resource-id", agent["claimId"], "--owner", "planner",
+            "--generation", str(agent["generation"]), "--request-id",
+            proof["requestId"], "--fingerprint", proof["fingerprint"],
+            "--expected-activity", json.dumps(
+                proof["expectedActivity"], sort_keys=True, separators=(",", ":")
+            ),
+        ])
+        self.assertEqual((0, "OK"), (code, reconciled["status"]))
+        projected = list_activity(self.database, "AWB-ROOT")
+        expired_resources = [row for row in projected["resources"]
+                             if row["persistedStatus"] == "EXPIRED"]
+        self.assertEqual(3, len(expired_resources))
+        self.assertEqual("PASS", workflow_check(
+            self.database, self.project_root, "AWB-ROOT")["status"])
+
+    def test_reconciliation_rejects_missing_wrong_and_alias_root_without_db_write(self):
+        self.create("AWB-ROOT-DENY")
+        stale = claim(self.database, "AWB-ROOT-DENY", "old-owner", 10,
+                      "root-deny-claim", self.now(-30))["lease"]
+        proof = workflow_check(
+            self.database, self.project_root, "AWB-ROOT-DENY"
+        )["nextStep"]["arguments"]
+        connection = open_database(self.database)
+        before = "\n".join(connection.iterdump())
+        connection.close()
+
+        for root in (None, os.path.join(self.temporary.name, "missing")):
+            refused = reconcile_expired(
+                self.database, "AWB-ROOT-DENY", "orchestrator-lease",
+                stale["lease_id"], "old-owner", stale["generation"],
+                proof["requestId"], fingerprint=proof["fingerprint"],
+                expected_activity=proof["expectedActivity"],
+                not_after=proof["notAfter"], project_root=root,
+            )
+            self.assertEqual(("REFUSED", "PROJECT_ROOT_MISMATCH"),
+                             (refused["status"], refused["reasonCode"]))
+        alias = os.path.join(self.temporary.name, "project-alias")
+        os.symlink(self.project_root, alias)
+        refused = reconcile_expired(
+            self.database, "AWB-ROOT-DENY", "orchestrator-lease",
+            stale["lease_id"], "old-owner", stale["generation"],
+            proof["requestId"], fingerprint=proof["fingerprint"],
+            expected_activity=proof["expectedActivity"],
+            not_after=proof["notAfter"], project_root=alias,
+        )
+        self.assertEqual("PROJECT_ROOT_MISMATCH", refused["reasonCode"])
+        connection = open_database(self.database)
+        self.assertEqual(before, "\n".join(connection.iterdump()))
         connection.close()
 
     def test_reconciliation_refuses_live_conflict_and_concurrent_mutation_has_one_winner(self):
@@ -195,14 +306,14 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         connection.commit()
         connection.close()
         proof = workflow_check(
-            self.database, self.temporary.name, "AWB-104"
+            self.database, self.project_root, "AWB-104"
         )["nextStep"]["arguments"]
         reconciled = reconcile_expired(
             self.database, "AWB-104", "repository-writer", writer["lockId"],
             "planner", writer["generation"], proof["requestId"],
             fingerprint=proof["fingerprint"],
             expected_activity=proof["expectedActivity"],
-            not_after=proof["notAfter"],
+            not_after=proof["notAfter"], project_root=self.project_root,
         )
         self.assertEqual("OK", reconciled["status"])
         self.assertEqual("CLAIMED", self.snapshot("AWB-104")["item"][0])
@@ -223,7 +334,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         )
         connection.commit(); connection.close()
         proof = workflow_check(
-            self.database, self.temporary.name, "AWB-104"
+            self.database, self.project_root, "AWB-104"
         )["nextStep"]["arguments"]
         barrier = threading.Barrier(2)
         results = []
@@ -234,7 +345,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
                 "planner", writer["generation"], proof["requestId"],
                 fingerprint=proof["fingerprint"],
                 expected_activity=proof["expectedActivity"],
-                not_after=proof["notAfter"],
+                not_after=proof["notAfter"], project_root=self.project_root,
             ))
         threads = [threading.Thread(target=compete, args=(value,))
                    for value in ("a", "b")]
@@ -271,7 +382,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
                     (self.now(-30), writer["lockId"]),
                 )
             connection.commit(); connection.close()
-            check = workflow_check(self.database, self.temporary.name, work_item_id)
+            check = workflow_check(self.database, self.project_root, work_item_id)
             self.assertEqual("VIOLATION", check["status"])
             proof = check["nextStep"]["arguments"]
             expected_kinds = {row["kind"] for row in proof["expectedActivity"]}
@@ -286,7 +397,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
                     "planner", agent["generation"], proof["requestId"],
                     fingerprint=proof["fingerprint"],
                     expected_activity=proof["expectedActivity"],
-                    not_after=proof["notAfter"],
+                    not_after=proof["notAfter"], project_root=self.project_root,
                 )
             if with_writer:
                 barrier = threading.Barrier(2)
@@ -709,7 +820,8 @@ class OrchestratorCoordinationTest(unittest.TestCase):
         with mock.patch("agent_workboard.cli._project_database", return_value=self.database):
             output = io.StringIO()
             with redirect_stdout(output):
-                code = cli_main(["orchestrator", "show", "AWB-501", "--project", "."])
+                code = cli_main(["orchestrator", "show", "AWB-501", "--project",
+                                 self.project_root])
         self.assertEqual(0, code)
         self.assertEqual(ORCHESTRATOR_SCHEMA_VERSION,
                          json.loads(output.getvalue())["protocolVersion"])
@@ -717,7 +829,7 @@ class OrchestratorCoordinationTest(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 code = cli_main([
-                    "orchestrator", "claim", "AWB-501", "--project", ".",
+                    "orchestrator", "claim", "AWB-501", "--project", self.project_root,
                     "--orchestrator", "bad id", "--ttl", "0",
                     "--request-id", "bad-request",
                 ])

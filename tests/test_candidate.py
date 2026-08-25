@@ -15,6 +15,7 @@ import zipfile
 from unittest import mock
 
 from agent_workboard import candidate
+from agent_workboard import verify
 from agent_workboard.lite import (
     LiteError, acquire_claim, acquire_repository_lock, create_work_item,
     initialize_database, record_agent_review, set_task_status, transition,
@@ -618,7 +619,17 @@ class ManagedCandidateTest(unittest.TestCase):
 
         def check_call(command, **kwargs):
             if command and command[0] == executable and "bdist_wheel" in command:
-                assets = command[command.index("--dist-dir") + 1]
+                indexes = [index for index, value in enumerate(command)
+                           if value == "--dist-dir"]
+                self.assertEqual(2, len(indexes))
+                assets = command[indexes[0] + 1]
+                self.assertEqual([assets, assets],
+                                 [command[index + 1] for index in indexes])
+                self.assertEqual([
+                    executable, "setup.py", "bdist_wheel", "--dist-dir", assets,
+                    "sdist", "--dist-dir", assets,
+                ], command)
+                self.assertEqual(os.path.realpath(assets), assets)
                 if not os.path.isabs(assets):
                     assets = os.path.join(kwargs["cwd"], assets)
                 os.makedirs(assets, exist_ok=True)
@@ -695,6 +706,40 @@ class ManagedCandidateTest(unittest.TestCase):
                 )
         self.assertTrue(os.path.isfile(os.path.join(target, "intruder.txt")))
 
+    def test_build_rejects_artifact_outside_canonical_managed_assets(self):
+        unused_toolchain, toolchain_file, check_output, check_call = self._build_fixture()
+
+        def out_of_bounds(command, **kwargs):
+            result = check_call(command, **kwargs)
+            if command and command[0] == os.path.realpath(os.sys.executable) and \
+                    "bdist_wheel" in command:
+                directory = os.path.join(kwargs["cwd"], "dist")
+                os.makedirs(directory)
+                with open(os.path.join(directory, "unexpected.whl"), "wb") as handle:
+                    handle.write(b"unexpected")
+            return result
+
+        with mock.patch.object(candidate.subprocess, "check_output",
+                               side_effect=check_output), mock.patch.object(
+                                   candidate.subprocess, "check_call",
+                                   side_effect=out_of_bounds):
+            with self.assertRaisesRegex(
+                    LiteError, "artifacts outside managed assets"):
+                candidate.build(
+                    self.database, self.root, "repo", self.work_item, "candidate-1",
+                    toolchain_file, "implementer", "build-out-of-bounds",
+                )
+        manifest = candidate._load_json(candidate._candidate_manifest(
+            self.root, self.work_item, "candidate-1"
+        )[2])
+        self.assertEqual("FROZEN", manifest["lifecycle"])
+        journal_path = os.path.join(
+            self.root, ".awb", "release-candidates", self.work_item, "managed",
+            "journal", "candidate-1", "build-out-of-bounds.json",
+        )
+        self.assertEqual("RECOVERY_REQUIRED",
+                         candidate._load_json(journal_path)["status"])
+
     def test_build_compensation_race_never_overwrites_staging(self):
         unused_toolchain, toolchain_file, check_output, check_call = self._build_fixture()
         managed = os.path.join(
@@ -748,6 +793,15 @@ class ManagedCandidateTest(unittest.TestCase):
                 toolchain_file, "implementer", "build-good",
             )
         self.assertEqual(3, len(built["artifacts"]))
+        build_root = os.path.join(
+            self.root, ".awb", "release-candidates", self.work_item,
+            "managed", "active", "candidate-1", "builds", "build-good",
+        )
+        self.assertFalse(os.path.lexists(os.path.join(build_root, "source", "dist")))
+        self.assertEqual(
+            ["SHA256SUMS", "package.tar.gz", "package.whl"],
+            sorted(os.listdir(os.path.join(build_root, "assets"))),
+        )
         with mock.patch.object(candidate.subprocess, "check_output", side_effect=check_output):
             self.assertEqual(built, candidate.build(
                 self.database, self.root, "repo", self.work_item, "candidate-1",
@@ -771,19 +825,27 @@ class ManagedCandidateTest(unittest.TestCase):
             )
         self.assertEqual(built_timeline,
                          candidate.lite.timeline(self.database, self.work_item))
-        quality = {
-            "passedAcceptance": [{"id": "AC-001", "evidence": "release fixture"}],
-            "tests": [{"command": "fixture", "result": "PASS"}],
-            "modifiedScope": ["release.txt"], "knownNonBlockingIssues": [],
-            "addressedFindingIds": [], "complexityChanges": [], "regressions": [],
-            "acceptanceRegressions": [], "testsWeakened": False,
-            "planDeviation": False,
-            "closureEvidence": [{"id": "CL-001", "evidence": "release fixture"}],
-        }
+        managed_source = os.path.relpath(os.path.join(
+            self.root, ".awb", "release-candidates", self.work_item,
+            "managed", "active", "candidate-1", "source",
+        ), self.root)
+        def passing_checks(unused_root, unused_database, unused_source, phase, policy):
+            return [{
+                "checkId": entry["checkId"], "phase": phase,
+                "result": "PASS", "resultDigest": "a" * 64,
+                "covers": ["HC-1", "HC-5", "VP-1", "VP-2"],
+            } for entry in verify._registered_check_plan(phase, policy)]
+        with mock.patch.object(verify, "_run_registered_checks",
+                               side_effect=passing_checks):
+            verified = verify.run(
+                self.database, self.root, "repo", self.work_item,
+                managed_source, "implementer", "FINAL", "verify-release",
+                candidate_id="candidate-1",
+            )["receipt"]
         from agent_workboard.lite import open_database, get_work_item
         transition(
             self.database, self.work_item, "submit_implementation", "implementer",
-            local_tests_passed=True, quality_baseline=quality,
+            verify_receipt=verified["receiptId"], project_root=self.root,
             candidate_id="candidate-1",
             candidate_fingerprint=built["candidateFingerprint"],
         )
@@ -798,7 +860,13 @@ class ManagedCandidateTest(unittest.TestCase):
                       "implementation-reviewer", "REVIEWER", expires)
         review = {"result": "PASS", "reviewerMode": "ORDINARY", "summary": "pass",
                   "findings": [], "resolvedFindingIds": [],
-                  "nonBlockingSuggestions": [], "reviewedCandidate": reviewed}
+                  "nonBlockingSuggestions": [], "reviewedCandidate": reviewed,
+                  "reviewedReceipt": {
+                      "receiptId": verified["receiptId"],
+                      "coreFingerprint": verified["coreFingerprint"],
+                      "receiptFingerprint": verified["projection"]["receiptFingerprint"],
+                      "candidate": verified["candidate"],
+                  }}
         record_agent_review(self.database, self.work_item, "FINAL",
                             "implementation-reviewer", "APPROVED", review,
                             request_id="release-review")
@@ -927,7 +995,7 @@ class ManagedCandidateTest(unittest.TestCase):
             "refs": {"branchOid": frozen_identity["headCommit"],
                      "tagObject": frozen_identity["tagObject"],
                      "tagPeel": frozen_identity["tagPeel"]},
-            "release": {"immutable": True, "prerelease": True,
+            "release": {"immutable": True, "draft": False, "prerelease": True,
                         "version": "0.3.1b7", "tag": "v-next", "title": "Preview"},
             "assets": built["artifacts"], "partialState": "NONE",
             "evidenceCore": evidence_core,
@@ -949,7 +1017,7 @@ class ManagedCandidateTest(unittest.TestCase):
         exact_status = candidate.publication_status(
             self.database, self.root, self.work_item, postflight_file
         )
-        self.assertEqual("SUBMIT_EXACT_PUBLICATION_POSTFLIGHT",
+        self.assertEqual("RUN_POST_PUBLICATION_VERIFY",
                          exact_status["nextStep"]["action"])
 
         with tempfile.TemporaryDirectory() as manual_parent:
@@ -968,14 +1036,14 @@ class ManagedCandidateTest(unittest.TestCase):
             manual_accepted = candidate.publication_postflight(
                 manual_database, manual_root, self.work_item, "manual-operator",
                 ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                postflight_file, "manual-postflight",
+                postflight, "manual-postflight",
             )
             self.assertEqual("WAITING_HUMAN",
                              get_work_item(manual_database, self.work_item)["queue_state"])
             self.assertEqual(manual_accepted, candidate.publication_postflight(
                 manual_database, manual_root, self.work_item, "manual-operator",
                 ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                postflight_file, "manual-postflight",
+                postflight, "manual-postflight",
             ))
 
         with tempfile.TemporaryDirectory() as fault_parent:
@@ -995,7 +1063,7 @@ class ManagedCandidateTest(unittest.TestCase):
                     candidate.publication_postflight(
                         fault_database, fault_root, self.work_item, "fault-operator",
                         ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                        postflight_file, "fault-postflight",
+                        postflight, "fault-postflight",
                     )
             fault_manifest = candidate._load_json(candidate._candidate_manifest(
                 fault_root, self.work_item, "candidate-1"
@@ -1004,45 +1072,56 @@ class ManagedCandidateTest(unittest.TestCase):
             fault_accepted = candidate.publication_postflight(
                 fault_database, fault_root, self.work_item, "fault-operator",
                 ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                postflight_file, "fault-postflight",
+                postflight, "fault-postflight",
             )
             self.assertEqual(fault_accepted, candidate.publication_postflight(
                 fault_database, fault_root, self.work_item, "fault-operator",
                 ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                postflight_file, "fault-postflight",
+                postflight, "fault-postflight",
             ))
 
         with self.commit_then_raise():
             accepted = candidate.publication_postflight(
                 self.database, self.root, self.work_item, "operator",
                 ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                postflight_file, "postflight-1",
+                postflight, "postflight-1",
             )
         self.assertEqual("OK", accepted["status"])
         accepted_replay = candidate.publication_postflight(
             self.database, self.root, self.work_item, "operator",
             ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-            postflight_file, "postflight-1",
+            postflight, "postflight-1",
         )
         self.assertEqual(accepted, accepted_replay)
         postflight_timeline = timeline(self.database, self.work_item)
+        connection = open_database(self.database)
+        try:
+            extension = connection.execute(
+                "SELECT payload_json FROM events WHERE work_item_id=? AND "
+                "event_type='VERIFY_RECEIPT_EXTENDED' ORDER BY event_id DESC LIMIT 1",
+                (self.work_item,),
+            ).fetchone()
+        finally:
+            connection.close()
+        extended = json.loads(extension[0])["receipt"]
+        self.assertEqual((verified["receiptId"], verified["coreFingerprint"]),
+                         (extended["receiptId"], extended["coreFingerprint"]))
+        self.assertNotEqual(verified["projection"]["receiptFingerprint"],
+                            extended["projection"]["receiptFingerprint"])
         with self.assertRaisesRegex(LiteError, "different content"):
             candidate.publication_postflight(
                 self.database, self.root, self.work_item, "other-operator",
                 ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                postflight_file, "postflight-1",
+                postflight, "postflight-1",
             )
         changed_postflight = dict(postflight)
         changed_postflight["release"] = dict(postflight["release"])
         changed_postflight["release"]["title"] = "Different Preview"
-        changed_postflight_file = self.json_file(
-            "postflight-changed.json", changed_postflight
-        )
         with self.assertRaisesRegex(LiteError, "different content"):
             candidate.publication_postflight(
                 self.database, self.root, self.work_item, "operator",
                 ready["nextStep"]["arguments"]["readyFingerprint"], "authorize-1",
-                changed_postflight_file, "postflight-1",
+                changed_postflight, "postflight-1",
             )
         self.assertEqual(postflight_timeline, timeline(self.database, self.work_item))
         self.assertEqual("FINAL_ACCEPTANCE_APPROVED",

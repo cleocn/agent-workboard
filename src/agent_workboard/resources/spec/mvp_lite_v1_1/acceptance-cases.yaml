@@ -62,9 +62,9 @@ cases:
   - {id: AWB-020-AC-005, priority: P0, title: PLAN_AMEND exact writer lock 文件 event head release 事务与补偿}
   - {id: AWB-020-AC-006, priority: P0, title: PLAN 每轮 fresh Reviewer 自审拒绝与 replay 并发 fail closed}
   - {id: AWB-020-AC-007, priority: P0, title: PLAN R1-3 R4 R5 无 R6 且 material change 返 Planner}
-  - {id: AWB-020-AC-008, priority: P0, title: Implementation Reviewer 只读与既有质量复审完全不变}
-  - {id: AWB-020-AC-009, priority: P0, title: runtime 单一过程审计和最终 summary/postflight 精简}
-  - {id: AWB-020-AC-010, priority: P0, title: Preview one clean full fresh allowlist secret asset hash drift 底线}
+  - {id: AWB-020-AC-008, priority: P0, title: Implementation Reviewer 只读并绑定当前 verify receipt}
+  - {id: AWB-020-AC-009, priority: P0, title: runtime 单一过程审计和最终 summary 精简}
+  - {id: AWB-020-AC-010, priority: P0, title: Preview 验证只消费单一 verifier classifier 和 policy}
   - {id: AWB-022-AC-001, priority: P0, title: 三类活动共享单时钟 LIVE STALE INACTIVE 投影且读操作零写}
   - {id: AWB-022-AC-002, priority: P0, title: true FINAL 同事务关闭活动而暂停阻塞状态不误清}
   - {id: AWB-022-AC-003, priority: P0, title: public reconcile exact 幂等审计并发 fault 拒绝均安全}

@@ -38,8 +38,8 @@ class ReleaseBuildTest(unittest.TestCase):
                 path = os.path.join(base, name)
                 with open(path, "rb") as handle:
                     files[os.path.relpath(path, build).replace(os.sep, "/")] = handle.read()
-        prefix = "agent_workboard-0.3.1b7.dist-info"
-        files[prefix + "/METADATA"] = b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b7\n\n"
+        prefix = "agent_workboard-0.3.1b8.dist-info"
+        files[prefix + "/METADATA"] = b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b8\n\n"
         files[prefix + "/WHEEL"] = b"Wheel-Version: 1.0\nGenerator: awb-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
         files[prefix + "/entry_points.txt"] = b"[console_scripts]\nawb = agent_workboard.cli:main\n"
         records = []
@@ -66,7 +66,8 @@ class ReleaseBuildTest(unittest.TestCase):
         self.assertIn("awb upgrade --check --project", text)
         self.assertIn("awb upgrade --project <project> --rollback", text)
         for identity in ("`0.3.1b3/v0.3.1b3`", "`0.3.1b4/v0.3.1b4`",
-                         "`0.3.1b5/v0.3.1b5`", "`0.3.1b6/v0.3.1b6`"):
+                         "`0.3.1b5/v0.3.1b5`", "`0.3.1b6/v0.3.1b6`",
+                         "`0.3.1b7/v0.3.1b7`"):
             self.assertIn(identity, text)
         self.assertIn("database pre/post SHA-256", text)
         self.assertIn("usageSchemaVersion=AWB-USAGE-v1", text)
@@ -85,13 +86,13 @@ class ReleaseBuildTest(unittest.TestCase):
         subprocess.check_call(["git", "config", "user.email", "release-test@example.invalid"], cwd=repository)
         subprocess.check_call(["git", "add", "--", ".codex", ".gitignore", "CHANGELOG.md",
                                "CONTRIBUTING.md", "LICENSE", "README.md", "docs", "manifest.json",
-                               "pyproject.toml", "setup.py", "src", "tests", "tools"], cwd=repository)
+                               "pyproject.toml", "setup.py", "src", "tests"], cwd=repository)
         environment = dict(os.environ)
         environment.update({"GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
                             "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"})
         subprocess.check_call(["git", "commit", "-m", "release test"], cwd=repository,
                               env=environment, stdout=subprocess.DEVNULL)
-        subprocess.check_call(["git", "tag", "-a", "v0.3.1b7", "-m", "preview"], cwd=repository)
+        subprocess.check_call(["git", "tag", "-a", "v0.3.1b8", "-m", "preview"], cwd=repository)
         return repository
 
     def _identity(self, path):
@@ -106,8 +107,10 @@ class ReleaseBuildTest(unittest.TestCase):
         self.assertNotIn("files", manifest)
         for path in manifest["requiredPaths"]:
             self.assertTrue(os.path.exists(os.path.join(repository, path)))
-        self.assertIn("ARTIFACT_SECRET_SCAN", manifest["releasePolicy"]["requiredGates"])
-        self.assertIn("REACHABLE_OBJECT_CLOSURE", manifest["releasePolicy"]["notRequired"])
+        self.assertEqual("AWB-VERIFY-RECEIPT-v1",
+                         manifest["verificationProtocol"])
+        self.assertIn("src/agent_workboard/verify.py",
+                      manifest["requiredPaths"])
 
         spec_root = os.path.join(repository, "src", "agent_workboard", "resources", "spec",
                                  "mvp_lite_v1_1")
@@ -141,7 +144,7 @@ class ReleaseBuildTest(unittest.TestCase):
                 "management_envelope_present", "latest_independent_final_review_PASS",
                 "open_implementation_findings_zero", "held_reason_absent",
                 "blocked_reason_absent", "required_tasks_completed",
-                "implementation_quality_baseline_PASS"):
+                "current_verify_receipt_floor_PASS"):
             self.assertIn(prerequisite, final)
         self.assertIn("stage: FINAL", final)
 
@@ -153,8 +156,8 @@ class ReleaseBuildTest(unittest.TestCase):
             subprocess.check_call([sys.executable, "setup.py", "build_py"], cwd=repository, env=environment,
                                   stdout=subprocess.DEVNULL)
             direct_identity = self._identity(os.path.join(repository, "build", "lib", "agent_workboard", "_build.py"))
-            self.assertEqual("0.3.1b7", direct_identity["packageVersion"])
-            self.assertEqual("v0.3.1b7", direct_identity["sourceTag"])
+            self.assertEqual("0.3.1b8", direct_identity["packageVersion"])
+            self.assertEqual("v0.3.1b8", direct_identity["sourceTag"])
             for name in TEMPLATES:
                 with open(os.path.join(repository, "docs", "work-item-templates", name), "rb") as source:
                     expected = source.read()
@@ -187,7 +190,7 @@ class ReleaseBuildTest(unittest.TestCase):
                           "not a product\nrunner"):
                 self.assertIn(token, route)
 
-            wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b7-py3-none-any.whl")
+            wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b8-py3-none-any.whl")
             os.makedirs(os.path.dirname(wheel), exist_ok=True)
             self._wheel_from_build(repository, wheel)
             with zipfile.ZipFile(wheel) as archive:

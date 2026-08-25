@@ -1162,7 +1162,7 @@ def _active_claim(connection, work_item_id, role, agent_id):
     return row
 
 
-def _latest_submission_baseline(connection, work_item_id):
+def _latest_submission_receipt(connection, work_item_id):
     rows = connection.execute(
         "SELECT payload_json FROM events WHERE work_item_id=? AND event_type='SUBMIT_IMPLEMENTATION' "
         "ORDER BY event_id DESC", (work_item_id,),
@@ -1172,93 +1172,53 @@ def _latest_submission_baseline(connection, work_item_id):
             payload = json.loads(row[0])
         except (TypeError, ValueError):
             continue
-        if isinstance(payload.get("qualityBaseline"), dict):
-            return payload["qualityBaseline"]
+        if isinstance(payload.get("verifyReceipt"), dict):
+            return payload["verifyReceipt"]
     return None
 
 
-def _validate_quality_baseline(connection, work_item_id, baseline):
-    if not isinstance(baseline, dict):
-        raise LiteError("submit_implementation requires a quality baseline")
-    list_fields = (
-        "passedAcceptance", "tests", "modifiedScope", "knownNonBlockingIssues",
-        "addressedFindingIds", "complexityChanges", "regressions", "acceptanceRegressions",
-        "closureEvidence",
+def _database_project_root(connection):
+    path = connection.execute("PRAGMA database_list").fetchone()[2]
+    parent = os.path.dirname(os.path.realpath(path))
+    return os.path.dirname(parent) if os.path.basename(parent) == ".awb" else parent
+
+
+def _verified_submission_receipt(connection, work_item_id, project_root=None):
+    binding = _latest_submission_receipt(connection, work_item_id)
+    if not isinstance(binding, dict):
+        raise LiteError("RUN_VERIFY_FOR_CURRENT_CANDIDATE")
+    from . import verify
+    receipt = verify.validate_current_receipt(
+        connection, project_root or _database_project_root(connection),
+        work_item_id, binding.get("receiptId"), require_final=True,
     )
-    if any(not isinstance(baseline.get(field), list) for field in list_fields):
-        raise LiteError("quality baseline list fields are incomplete")
-    if not baseline["passedAcceptance"] or not baseline["tests"] or not baseline["modifiedScope"]:
-        raise LiteError("quality baseline requires passed acceptance, tests and modified scope")
-    if baseline.get("testsWeakened") is not False:
-        raise LiteError("tests must not be deleted, skipped, relaxed or weakened")
-    if baseline["regressions"] or baseline["acceptanceRegressions"]:
-        raise LiteError("quality regression stops automatic implementation")
-    if baseline.get("planDeviation"):
-        raise LiteError("plan deviation must be reported instead of submitted")
-    tests = baseline["tests"]
-    if any(not isinstance(test, dict) or not test.get("command") or test.get("result") != "PASS"
-           for test in tests):
-        raise LiteError("all recorded tests must have a command and PASS result")
-    acceptance_evidence = {}
-    for entry in baseline["passedAcceptance"]:
-        if not isinstance(entry, dict) or not entry.get("id") or not entry.get("evidence"):
-            raise LiteError("passedAcceptance requires id and evidence")
-        acceptance_evidence[entry["id"]] = entry["evidence"]
-    closure_evidence = {}
-    for entry in baseline["closureEvidence"]:
-        if not isinstance(entry, dict) or not entry.get("id") or not entry.get("evidence"):
-            raise LiteError("closureEvidence requires id and evidence")
-        closure_evidence[entry["id"]] = entry["evidence"]
-    management = _management_from_events(connection, work_item_id)
-    required_acceptance = {entry["id"] for entry in management["acceptance"]}
-    required_closure = {entry["id"] for entry in management["closure"]}
-    if not required_acceptance.issubset(acceptance_evidence):
-        raise LiteError("quality baseline does not cover WorkItem acceptance")
-    if not required_closure.issubset(closure_evidence):
-        raise LiteError("quality baseline does not cover WorkItem closure evidence")
-    open_ids = {
-        finding["id"] for finding in _review_projection(connection, work_item_id)["IMPLEMENTATION"]["openFindings"]
+    exact = {
+        "receiptId": receipt["receiptId"],
+        "coreFingerprint": receipt["coreFingerprint"],
+        "receiptFingerprint": receipt["projection"]["receiptFingerprint"],
+        "candidate": receipt["candidate"],
     }
-    addressed = set(baseline["addressedFindingIds"])
-    if not addressed.issubset(open_ids):
-        raise LiteError("addressedFindingIds may only reference open implementation Findings")
-    if open_ids and not addressed:
-        raise LiteError("implementation revision must identify addressed open Findings")
-    valid_trace = required_acceptance | open_ids
-    for change in baseline["complexityChanges"]:
-        if not isinstance(change, dict) or not change.get("kind") or not change.get("name"):
-            raise LiteError("complexity change requires kind and name")
-        traces = change.get("traceTo")
-        traces = [traces] if isinstance(traces, str) else traces
-        if not isinstance(traces, list) or not traces or not set(traces).intersection(valid_trace):
-            raise LiteError("complexity change is not traceable to acceptance or an open Finding")
-    previous = _latest_submission_baseline(connection, work_item_id)
-    if previous:
-        previous_ids = {entry["id"] for entry in previous["passedAcceptance"]}
-        if not previous_ids.issubset(acceptance_evidence):
-            raise LiteError("previously passed acceptance regressed")
-    normalized = dict(baseline)
-    normalized["passedAcceptance"] = baseline["passedAcceptance"]
-    return normalized
-
-
-def _validate_revision_submission(connection, work_item_id, stage, submission):
-    projection = _review_projection(connection, work_item_id)[stage]
-    open_ids = {finding["id"] for finding in projection["openFindings"]}
-    if not open_ids:
-        if submission and submission.get("complexityChanges"):
-            raise LiteError("new complexity requires acceptance or an open Finding")
-        return
-    if not isinstance(submission, dict):
-        raise LiteError("revision submission must identify addressed Findings")
-    addressed = submission.get("addressedFindingIds", [])
-    if not isinstance(addressed, list) or not set(addressed).issubset(open_ids) or not addressed:
-        raise LiteError("revision may only address open Findings")
-    for change in submission.get("complexityChanges", []):
-        traces = change.get("traceTo", []) if isinstance(change, dict) else []
-        traces = [traces] if isinstance(traces, str) else traces
-        if not set(traces).intersection(open_ids):
-            raise LiteError("revision complexity must trace to an open Finding")
+    if any(binding.get(key) != exact[key] for key in (
+            "receiptId", "coreFingerprint", "candidate")):
+        raise LiteError("VERIFY_SUBMISSION_RECEIPT_MISMATCH")
+    if binding.get("receiptFingerprint") != exact["receiptFingerprint"]:
+        historical = False
+        rows = connection.execute(
+            "SELECT payload_json FROM events WHERE work_item_id=? AND "
+            "event_type IN ('VERIFY_RECEIPT_RECORDED','VERIFY_RECEIPT_EXTENDED')",
+            (work_item_id,),
+        ).fetchall()
+        for row in rows:
+            prior = _event_payload({"payload_json": row[0]}).get("receipt", {})
+            if (prior.get("receiptId") == binding.get("receiptId") and
+                    prior.get("coreFingerprint") == binding.get("coreFingerprint") and
+                    prior.get("projection", {}).get("receiptFingerprint") ==
+                    binding.get("receiptFingerprint")):
+                historical = True
+                break
+        if not historical:
+            raise LiteError("VERIFY_SUBMISSION_RECEIPT_MISMATCH")
+    return receipt
 
 
 def _plan_artifact_head(connection, work_item_id):
@@ -1330,9 +1290,9 @@ def _next_plan_artifact(connection, work_item_id, agent_id, artifact):
 
 
 def transition(database, work_item_id, action, agent_id, request_id=None,
-               local_tests_passed=False, submission=None, quality_baseline=None,
                usage_policy="BEST_EFFORT", plan_artifact=None,
-               candidate_id=None, candidate_fingerprint=None):
+               candidate_id=None, candidate_fingerprint=None,
+               verify_receipt=None, project_root=None):
     _usage_sync_boundary(database, work_item_id, usage_policy)
     request_id = request_id or _id(action)
     connection = open_database(database)
@@ -1356,7 +1316,6 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
             ).fetchone()[0]
             if pending:
                 raise LiteError("planning tasks are incomplete")
-            _validate_revision_submission(connection, work_item_id, "PLAN", submission)
             artifact_head = _plan_artifact_head(connection, work_item_id)
             if artifact_head is not None and plan_artifact is None:
                 raise LiteError("opt-in plan revisions require --plan-artifact")
@@ -1380,10 +1339,12 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
                 "AND required=1 AND status NOT IN ('IN_PROGRESS','COMPLETED')",
                 (work_item_id,),
             ).fetchone()[0]
-            if pending or not local_tests_passed:
-                raise LiteError("implementation tasks and local tests must pass")
-            quality_baseline = _validate_quality_baseline(
-                connection, work_item_id, quality_baseline
+            if pending:
+                raise LiteError("implementation tasks are incomplete")
+            from . import verify
+            verified = verify.validate_current_receipt(
+                connection, project_root or os.path.dirname(os.path.abspath(database)),
+                work_item_id, verify_receipt, require_final=True,
             )
             from .candidate import release_submission_candidate
             release_candidate = release_submission_candidate(connection, work_item_id)
@@ -1391,9 +1352,12 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
                 if (candidate_id != release_candidate["candidateId"] or
                         candidate_fingerprint != release_candidate["candidateFingerprint"]):
                     raise LiteError("Release submission requires the exact FROZEN+BUILT candidate")
-                modified = sorted(quality_baseline.get("modifiedScope", []))
-                if modified != sorted(release_candidate["changedPaths"]):
-                    raise LiteError("Release quality modifiedScope must equal the frozen allowlist")
+                candidate = verified["candidate"]
+                if (candidate.get("kind") != "MANAGED_RELEASE" or
+                        candidate.get("candidateId") != candidate_id or
+                        candidate.get("candidateFingerprint") != candidate_fingerprint or
+                        candidate.get("buildFingerprint") != release_candidate["buildFingerprint"]):
+                    raise LiteError("Release verify receipt candidate drift")
             elif candidate_id is not None or candidate_fingerprint is not None:
                 raise LiteError("ordinary WorkItem must not provide candidate flags")
             new_state, queue, role = "IMPLEMENTATION_COMPLETED", "CLAIMABLE", "REVIEWER"
@@ -1401,10 +1365,13 @@ def transition(database, work_item_id, action, agent_id, request_id=None,
         else:
             raise LiteError("unknown transition")
         payload = {"from": item["state"], "to": new_state}
-        if submission is not None:
-            payload["submission"] = submission
-        if quality_baseline is not None:
-            payload["qualityBaseline"] = quality_baseline
+        if action == "submit_implementation":
+            payload["verifyReceipt"] = {
+                "receiptId": verified["receiptId"],
+                "coreFingerprint": verified["coreFingerprint"],
+                "receiptFingerprint": verified["projection"]["receiptFingerprint"],
+                "candidate": verified["candidate"],
+            }
         if action == "submit_implementation" and release_candidate is not None:
             payload["reviewedCandidate"] = release_candidate
         if artifact_event is not None:
@@ -1652,15 +1619,23 @@ def _normalize_review(connection, work_item_id, stage, decision, summary):
         normalized["reviewedArtifact"] = expected_artifact
         normalized["amendments"] = []
     if stage == "FINAL":
+        _verified_submission_receipt(connection, work_item_id)
         submission = connection.execute(
             "SELECT payload_json FROM events WHERE work_item_id=? "
             "AND event_type='SUBMIT_IMPLEMENTATION' ORDER BY event_id DESC LIMIT 1",
             (work_item_id,),
         ).fetchone()
         try:
-            reviewed_candidate = json.loads(submission[0]).get("reviewedCandidate") if submission else None
+            submission_payload = json.loads(submission[0]) if submission else {}
+            reviewed_candidate = submission_payload.get("reviewedCandidate")
+            reviewed_receipt = submission_payload.get("verifyReceipt")
         except (TypeError, ValueError):
             reviewed_candidate = None
+            reviewed_receipt = None
+        if not isinstance(reviewed_receipt, dict) or incoming.get(
+                "reviewedReceipt") != reviewed_receipt:
+            raise LiteError("Implementation review must identify the exact verify receipt")
+        normalized["reviewedReceipt"] = reviewed_receipt
         if reviewed_candidate is not None:
             if incoming.get("reviewedCandidate") != reviewed_candidate:
                 raise LiteError("Release review must identify the exact submitted candidate")
@@ -1675,38 +1650,9 @@ def _review_request_fingerprint(work_item_id, stage, reviewer_agent_id, decision
     }))
 
 
-def _quality_baseline_is_auto_safe(baseline, management):
-    if not isinstance(baseline, dict):
-        return False
-    list_fields = (
-        "passedAcceptance", "tests", "modifiedScope", "regressions",
-        "acceptanceRegressions", "closureEvidence",
-    )
-    if any(not isinstance(baseline.get(field), list) for field in list_fields):
-        return False
-    acceptance = {
-        entry.get("id") for entry in baseline["passedAcceptance"]
-        if isinstance(entry, dict) and entry.get("id") and entry.get("evidence")
-    }
-    closure = {
-        entry.get("id") for entry in baseline["closureEvidence"]
-        if isinstance(entry, dict) and entry.get("id") and entry.get("evidence")
-    }
-    required_acceptance = {entry["id"] for entry in management.get("acceptance", [])}
-    required_closure = {entry["id"] for entry in management.get("closure", [])}
-    return bool(
-        baseline["passedAcceptance"] and baseline["tests"] and
-        baseline["modifiedScope"] and baseline["closureEvidence"] and
-        required_acceptance.issubset(acceptance) and required_closure.issubset(closure) and
-        baseline.get("testsWeakened") is False and not baseline.get("planDeviation") and
-        not baseline["regressions"] and not baseline["acceptanceRegressions"] and
-        all(isinstance(test, dict) and test.get("command") and test.get("result") == "PASS"
-            for test in baseline["tests"])
-    )
-
-
 def _approved_gate_preconditions(connection, item, stage,
-                                 pending_publication_postflight=False):
+                                 pending_publication_postflight=False,
+                                 project_root=None):
     expected = "PLAN_REVIEW_PENDING" if stage == "PLAN" else "IMPLEMENTATION_COMPLETED"
     if item["mode"] != "STANDARD" or item["state"] != expected:
         raise LiteError("gate stage is invalid")
@@ -1750,10 +1696,9 @@ def _approved_gate_preconditions(connection, item, stage,
         ).fetchone()[0]
         if pending:
             raise LiteError("final approval requires all required tasks completed")
-        baseline = _latest_submission_baseline(connection, item["work_item_id"])
-        management = _management_from_events(connection, item["work_item_id"])
-        if not _quality_baseline_is_auto_safe(baseline, management or {}):
-            raise LiteError("final approval requires passing implementation quality evidence")
+        _verified_submission_receipt(
+            connection, item["work_item_id"], project_root=project_root
+        )
     return review
 
 
@@ -1953,16 +1898,19 @@ def record_agent_review(database, work_item_id, stage, reviewer_agent_id, decisi
                 item["held_reason"] is None and item["blocked_reason"] is None and
                 not release_review):
             if stage == "FINAL":
-                baseline = _latest_submission_baseline(connection, work_item_id)
-                management = _management_from_events(connection, work_item_id) or {}
                 pending = connection.execute(
                     "SELECT count(*) FROM tasks WHERE work_item_id=? AND required=1 "
                     "AND owner_role<>'REVIEWER' AND status<>'COMPLETED'",
                     (work_item_id,),
                 ).fetchone()[0]
-                if pending or not _quality_baseline_is_auto_safe(baseline, management):
+                try:
+                    _verified_submission_receipt(connection, work_item_id)
+                    receipt_safe = True
+                except LiteError:
+                    receipt_safe = False
+                if pending or not receipt_safe:
                     auto_gate_failure = (
-                        "final approval requires passing implementation quality evidence")
+                        "final approval requires the current verify receipt")
                 else:
                     auto_approved = True
             else:
@@ -2668,8 +2616,6 @@ def _workflow_snapshot(connection, work_item_id, agent_id, role, repository_key,
         if state == "DRAFT" and role == "PLANNER":
             action = "SUBMIT_PLAN" if active else "BEGIN_PLANNING"
             required = ["--plan-artifact"] if active else []
-            if active and _review_stage_projection(_review_history(connection, work_item_id, "PLAN"))["openFindings"]:
-                required.append("--submission-file")
         elif state == "PLAN_REVIEW_PENDING" and role == "REVIEWER":
             action = "SUBMIT_PLAN_REVIEW" if active else "BEGIN_PLAN_REVIEW"
             required = ["--review-file", "--decision"] if active else []
@@ -2678,7 +2624,7 @@ def _workflow_snapshot(connection, work_item_id, agent_id, role, repository_key,
         elif state == "IMPLEMENTING" and role == "IMPLEMENTER":
             action = "SUBMIT_IMPLEMENTATION" if active else "BEGIN_IMPLEMENTATION"
             if active:
-                required = ["--quality-file", "--local-tests-passed"]
+                required = ["--verify-receipt"]
                 from .candidate import release_submission_candidate
                 if release_submission_candidate(connection, work_item_id) is not None:
                     required += ["--candidate", "--candidate-fingerprint"]
@@ -2764,14 +2710,15 @@ def _workflow_input(project_root, relative, label):
 def workflow_advance(database, project_root, work_item_id, agent_id, role,
                      repository_key, expected_step, expected_row_version, request_id,
                      orchestrator_id=None, orchestrator_generation=None, ttl=900,
-                     plan_artifact=None, submission_file=None, quality_file=None,
-                     review_file=None, decision=None, local_tests_passed=False,
-                     candidate_id=None, candidate_fingerprint=None):
+                     plan_artifact=None,
+                     review_file=None, decision=None,
+                     candidate_id=None, candidate_fingerprint=None,
+                     verify_receipt=None):
     if ttl < 1 or not request_id:
         raise LiteError("workflow advance requires positive ttl and request-id")
     file_inputs = {}
-    for name, value in (("planArtifact", plan_artifact), ("submissionFile", submission_file),
-                        ("qualityFile", quality_file), ("reviewFile", review_file)):
+    for name, value in (("planArtifact", plan_artifact),
+                        ("reviewFile", review_file)):
         if value:
             path, raw, digest = _workflow_input(project_root, value, name)
             try:
@@ -2793,11 +2740,12 @@ def workflow_advance(database, project_root, work_item_id, agent_id, role,
                                   "role": role, "expectedStep": expected_step,
                                   "expectedRowVersion": expected_row_version,
                                   "files": {key: value["sha256"] for key, value in file_inputs.items()},
-                                  "decision": decision, "localTestsPassed": local_tests_passed,
+                                  "decision": decision,
                                   "ttl": ttl, "orchestratorId": orchestrator_id,
                                   "orchestratorGeneration": orchestrator_generation,
                                   "candidateId": candidate_id,
-                                  "candidateFingerprint": candidate_fingerprint}))
+                                  "candidateFingerprint": candidate_fingerprint,
+                                  "verifyReceipt": verify_receipt}))
         replay = connection.execute("SELECT * FROM events WHERE request_id=?", (request_id,)).fetchone()
         if replay:
             payload = json.loads(replay["payload_json"])
@@ -2825,22 +2773,27 @@ def workflow_advance(database, project_root, work_item_id, agent_id, role,
         expected_flags = set(step.get("requiredInputs", []))
         provided_flags = set()
         if plan_artifact: provided_flags.add("--plan-artifact")
-        if submission_file: provided_flags.add("--submission-file")
-        if quality_file: provided_flags.add("--quality-file")
         if review_file: provided_flags.add("--review-file")
         if decision: provided_flags.add("--decision")
-        if local_tests_passed: provided_flags.add("--local-tests-passed")
         if candidate_id: provided_flags.add("--candidate")
         if candidate_fingerprint: provided_flags.add("--candidate-fingerprint")
+        if verify_receipt: provided_flags.add("--verify-receipt")
         allowed_flags = set(expected_flags)
-        if step["action"] == "SUBMIT_PLAN" and "--submission-file" not in expected_flags:
-            allowed_flags.add("--submission-file")
         if not expected_flags.issubset(provided_flags) or not provided_flags.issubset(allowed_flags):
             raise LiteError("UNEXPECTED_ADVANCE_INPUT")
         now = _now()
         expires_at = (datetime.datetime.now(datetime.timezone.utc) +
                       datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat()
         action = step["action"]
+        from . import candidate as candidate_module
+        self_host_operation = {
+            "SUBMIT_IMPLEMENTATION": "SUBMIT_IMPLEMENTATION_WITH_RECEIPT",
+            "SUBMIT_IMPLEMENTATION_REVIEW": "FORMAL_IMPLEMENTATION_REVIEW",
+        }.get(action, "DENY")
+        candidate_module.assert_self_host_operation(
+            connection, project_root, work_item_id, self_host_operation,
+            candidate_id,
+        )
         operation_event = action
         receipt = None
         if action.startswith("BEGIN_"):
@@ -2913,25 +2866,33 @@ def workflow_advance(database, project_root, work_item_id, agent_id, role,
                 artifact = _next_plan_artifact(connection, work_item_id, agent_id,
                                                {"projectRoot": project_root,
                                                 "path": plan_artifact})
-                _validate_revision_submission(connection, work_item_id, "PLAN",
-                                              file_inputs.get("submissionFile", {}).get("value"))
                 state, next_role = "PLAN_REVIEW_PENDING", "REVIEWER"
                 payload.update({"to": state, "planArtifact": artifact})
             else:
-                if not local_tests_passed:
-                    raise LiteError("implementation local tests must pass")
-                quality = _validate_quality_baseline(connection, work_item_id,
-                                                     file_inputs["qualityFile"]["value"])
+                from . import verify
+                verified = verify.validate_current_receipt(
+                    connection, project_root, work_item_id, verify_receipt,
+                    require_final=True,
+                )
                 from .candidate import release_submission_candidate
                 release_candidate = release_submission_candidate(connection, work_item_id)
                 if release_candidate:
                     if candidate_id != release_candidate["candidateId"] or candidate_fingerprint != release_candidate["candidateFingerprint"]:
                         raise LiteError("Release submission candidate drift")
-                    if sorted(quality.get("modifiedScope", [])) != sorted(release_candidate["changedPaths"]):
-                        raise LiteError("Release modifiedScope drift")
+                    candidate = verified["candidate"]
+                    if (candidate.get("kind") != "MANAGED_RELEASE" or
+                            candidate.get("candidateId") != candidate_id or
+                            candidate.get("candidateFingerprint") != candidate_fingerprint or
+                            candidate.get("buildFingerprint") != release_candidate["buildFingerprint"]):
+                        raise LiteError("Release verify receipt candidate drift")
                     payload["reviewedCandidate"] = release_candidate
                 state, next_role = "IMPLEMENTATION_COMPLETED", "REVIEWER"
-                payload.update({"to": state, "qualityBaseline": quality})
+                payload.update({"to": state, "verifyReceipt": {
+                    "receiptId": verified["receiptId"],
+                    "coreFingerprint": verified["coreFingerprint"],
+                    "receiptFingerprint": verified["projection"]["receiptFingerprint"],
+                    "candidate": verified["candidate"],
+                }})
             snapshot = _kernel_snapshot(connection, work_item_id, project_root,
                                         evaluation_time=now)
             next_event_id = connection.execute(
@@ -3004,15 +2965,20 @@ def workflow_advance(database, project_root, work_item_id, agent_id, role,
             if (result == "PASS" and item["mode"] == "STANDARD" and
                     policy == "AUTO_ON_PASS" and not release_review):
                 if stage == "FINAL":
-                    baseline = _latest_submission_baseline(connection, work_item_id)
-                    management = _management_from_events(connection, work_item_id) or {}
                     pending = connection.execute(
                         "SELECT count(*) FROM tasks WHERE work_item_id=? AND required=1 "
                         "AND owner_role<>'REVIEWER' AND status<>'COMPLETED'",
                         (work_item_id,),
                     ).fetchone()[0]
-                    if pending or not _quality_baseline_is_auto_safe(baseline, management):
-                        auto_failure = "final approval requires passing implementation quality evidence"
+                    try:
+                        _verified_submission_receipt(
+                            connection, work_item_id, project_root=project_root
+                        )
+                        receipt_safe = True
+                    except LiteError:
+                        receipt_safe = False
+                    if pending or not receipt_safe:
+                        auto_failure = "final approval requires the current verify receipt"
                     else:
                         auto_approved = True
                 else:
@@ -3208,6 +3174,7 @@ def _kernel_snapshot(connection, work_item_id, project_root=None,
     gate_events = []
     artifact_at_event = None
     candidate_at_event = None
+    receipt_at_event = None
     for event in events:
         payload = _event_payload(event)
         if event["event_type"] == "PLAN_ARTIFACT_HEAD":
@@ -3215,6 +3182,7 @@ def _kernel_snapshot(connection, work_item_id, project_root=None,
             continue
         if event["event_type"] == "SUBMIT_IMPLEMENTATION":
             candidate_at_event = payload.get("reviewedCandidate")
+            receipt_at_event = payload.get("verifyReceipt")
         if event["event_type"] in ("AGENT_PLAN_REVIEW", "AGENT_FINAL_REVIEW"):
             payload_keys = set(payload)
             native_required = {
@@ -3265,6 +3233,7 @@ def _kernel_snapshot(connection, work_item_id, project_root=None,
                 "rawSummary": payload.get("summary"),
                 "artifactAtReview": artifact_at_event,
                 "candidateAtReview": candidate_at_event,
+                "receiptAtReview": receipt_at_event,
             })
         elif event["event_type"] in (
                 "HUMAN_PLAN_GATE", "HUMAN_FINAL_GATE", "AUTO_GATE_APPROVED"):
@@ -3897,9 +3866,7 @@ def main(argv=None):
     transition_parser.add_argument("work_item_id")
     transition_parser.add_argument("action", choices=("submit_plan", "start_implementation", "submit_implementation"))
     transition_parser.add_argument("--agent", required=True)
-    transition_parser.add_argument("--local-tests-passed", action="store_true")
-    transition_parser.add_argument("--submission-file")
-    transition_parser.add_argument("--quality-file")
+    transition_parser.add_argument("--verify-receipt")
     transition_parser.add_argument("--plan-artifact")
     transition_parser.add_argument("--request-id")
     transition_parser.add_argument("--candidate")
@@ -4042,9 +4009,6 @@ def main(argv=None):
             request_id = args.request_id or _id(args.action)
             result = transition(
                 args.database, args.work_item_id, args.action, args.agent,
-                local_tests_passed=args.local_tests_passed,
-                submission=_load_json_file(args.submission_file, "submission file"),
-                quality_baseline=_load_json_file(args.quality_file, "quality file"),
                 usage_policy=args.usage_policy,
                 request_id=request_id,
                 plan_artifact=({"projectRoot": args.project_root,
@@ -4052,6 +4016,8 @@ def main(argv=None):
                                if args.plan_artifact else None),
                 candidate_id=args.candidate,
                 candidate_fingerprint=args.candidate_fingerprint,
+                verify_receipt=args.verify_receipt,
+                project_root=args.project_root,
             )
             _mutation_print(args.database, args.work_item_id, request_id,
                             args.action.upper(), args.full, result)

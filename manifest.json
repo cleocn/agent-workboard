@@ -1,28 +1,12 @@
 {
   "manifestVersion": "AWB-LEAN-PREVIEW-v1",
-  "releasePolicy": {
-    "preview": "ONE_CLEAN_BUILD_FULL_TEST_FRESH_INSTALL",
-    "requiredGates": [
-      "EXACT_PATH_ALLOWLIST",
-      "ARTIFACT_SECRET_SCAN",
-      "THREE_ASSET_SHA256",
-      "REMOTE_DRIFT_CHECK",
-      "INDEPENDENT_IMPLEMENTATION_REVIEW"
-    ],
-    "notRequired": [
-      "PER_FILE_MANIFEST_SHA256",
-      "DOUBLE_CLEAN_REPRODUCIBILITY",
-      "NO_GIT_REBUILD",
-      "REACHABLE_OBJECT_CLOSURE",
-      "RELEASE_BODY_HASH"
-    ]
-  },
+  "verificationProtocol": "AWB-VERIFY-RECEIPT-v1",
   "requiredPaths": [
     "src/agent_workboard",
+    "src/agent_workboard/verify.py",
     "src/agent_workboard/candidate.py",
     "src/agent_workboard/workflow.py",
     "src/agent_workboard/resources/spec/mvp_lite_v1_1",
-    ".codex/skills/awb-orchestrator/SKILL.md",
-    "tools/release_gate.py"
+    ".codex/skills/awb-orchestrator/SKILL.md"
   ]
 }

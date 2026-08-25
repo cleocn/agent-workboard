@@ -98,25 +98,25 @@ projection. LIVE resources must be released by their exact owner. STALE rows
 remain visible history and may be reconciled only through the exact public
 request-id/owner/generation command. A true FINAL transition closes all activity
 atomically; BLOCKED, WAITING_HUMAN and nonterminal HELD never imply cleanup.
-For exact b3/b4/b5/b6 upgrades, consume the single recovery-aware b7 nextStep unchanged;
+For exact b3/b4/b5/b6/b7 upgrades, consume the single recovery-aware b8 nextStep unchanged;
 never ask the user to edit SQLite or perform a separate stale cleanup first.
-The b7 target owns the frozen `AWB-MIGRATION-GRAPH-v1`; never infer a route from
+The b8 target owns the frozen `AWB-MIGRATION-GRAPH-v1`; never infer a route from
 version ordering or install intermediate releases.
 
-Runtime events are the process audit authority.  Do not require per-round
-submission JSON, per-round quality hashes, duplicate postflight files, or a
-Release body hash.  A normal WorkItem retains one final implementation summary;
-a release WorkItem retains one final release postflight.  A Preview gate runs
-one clean build, one full test, one fresh wheel install, exact changed-path
-allowlist, wheel/sdist secret and member scan, three-asset SHA-256, remote drift
-check, and independent Implementation review.  Preview does not require a
-second reproducibility build, a no-Git rebuild, per-file manifest hashes, or Git
-reachable-object/history closure.  Remote/destructive authority is unchanged.
+Runtime events and the current `AWB-VERIFY-RECEIPT-v1` are the process audit and
+verification authority. Do not require per-round submission JSON, quality hashes,
+duplicate postflight files, or a Release body hash. Retain one final implementation
+summary. `awb verify` alone owns verification defaults, classifier, floor and
+registered checks; workflow submission and independent Review bind its current
+receipt. The five hard contracts remain atomic workflow state, exact activity
+ownership/fencing, independent Review, HUMAN risky-action authority, and a current
+candidate-bound PASS receipt at the classifier floor. Remote/destructive authority
+is unchanged.
 
 For an explicit Release WorkItem, prepare, freeze and build only through `awb
 candidate`.  Independent IMPLEMENTATION PASS/open0 produces
 `PUBLICATION_READY` instead of FINAL; exact HUMAN candidate authorization and
-accepted publication postflight are still required before FINAL.  A failed
+accepted post-publication receipt extension is still required before FINAL. A failed
 publication with proven `partialState=NONE` may use the HUMAN retry command only
 when the retained IMPLEMENTATION history has a legal fresh ordinary R2 or R3;
 R3/R4/R5 and ambiguous or partial remote state stop at HUMAN without resetting

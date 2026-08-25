@@ -22,6 +22,18 @@ EXPIRE_AND_RECONCILE_ACTIVITY = "EXPIRE_AND_RECONCILE_ACTIVITY"
 
 TERMINAL_STATE = "FINAL_ACCEPTANCE_APPROVED"
 TERMINAL_QUEUE = "HELD"
+SELF_HOST_BOOTSTRAP_OPERATIONS = frozenset((
+    "VERIFY_FINAL_RECORD",
+    "SUBMIT_IMPLEMENTATION_WITH_RECEIPT",
+    "FORMAL_IMPLEMENTATION_REVIEW",
+    "PUBLICATION_POSTFLIGHT",
+))
+
+
+def assert_self_host_bootstrap_operation(operation):
+    if operation not in SELF_HOST_BOOTSTRAP_OPERATIONS:
+        raise ValueError("SELF_HOST_BOOTSTRAP_REFUSED")
+    return operation
 
 
 def _json(value):
@@ -245,6 +257,7 @@ TRANSITION_MATRIX = (
     "ORCHESTRATOR_RELEASE", "ORCHESTRATOR_RECOVER",
     EXPIRE_AND_RECONCILE_ACTIVITY, "PUBLICATION_AUTHORIZE",
     "PUBLICATION_POSTFLIGHT", "PUBLICATION_RETRY",
+    "VERIFY_OBSERVATION", "VERIFY_RECEIPT", "VERIFY_POLICY_OVERRIDE",
     RESET_ORPHAN_REVIEWER_TASK, "TERMINAL_ACTIVITY_CLEANUP",
 )
 
@@ -288,6 +301,9 @@ PUBLIC_MUTATION_INTENTS = {
     "candidate.build": "CANDIDATE_BUILD",
     "candidate.quarantine": "CANDIDATE_QUARANTINE",
     "candidate.finalize": "CANDIDATE_FINALIZE",
+    "verify.run.observation": "VERIFY_OBSERVATION",
+    "verify.run.receipt": "VERIFY_RECEIPT",
+    "verify.override": "VERIFY_POLICY_OVERRIDE",
 }
 
 
@@ -460,6 +476,10 @@ def invariant_violations(snapshot, allow_time_split=False):
             if (stage == "FINAL" and review.get("reviewedCandidate") is not None and
                     review.get("reviewedCandidate") != event.get("candidateAtReview")):
                 violations.append(_violation("REVIEW_CANDIDATE_ORDER_MISMATCH",
+                                             "review:" + str(row.get("review_id"))))
+            if (stage == "FINAL" and
+                    review.get("reviewedReceipt") != event.get("receiptAtReview")):
+                violations.append(_violation("REVIEW_RECEIPT_ORDER_MISMATCH",
                                              "review:" + str(row.get("review_id"))))
 
     for gate in snapshot.get("gateEvents", []):
@@ -1105,6 +1125,28 @@ def plan_audit_touch(snapshot, intent):
         intent.get("receipt", {"status": "OK"}),
         intent.get("nextStep", {"action": "NONE", "arguments": {}}),
     )
+
+
+def plan_verify_events(snapshot, intent):
+    """Plan one verifier mutation and its optional override-consumption event."""
+    events = []
+    for event in intent["events"]:
+        events.append({
+            "requestId": event["requestId"],
+            "eventType": event["eventType"],
+            "actorKind": event.get("actorKind", intent["actorKind"]),
+            "actorId": event.get("actorId", intent["actorId"]),
+            "payload": event["payload"],
+        })
+    bundle = dict(intent)
+    bundle.update({"writes": ({
+        "action": "UPDATE", "table": "work_items",
+        "values": (("row_version", snapshot["workItem"]["row_version"] + 1),
+                   ("updated_at", intent["now"])),
+        "where": (("work_item_id", intent["workItemId"]),
+                  ("row_version", snapshot["workItem"]["row_version"])),
+    },), "events": events})
+    return _plan_lifecycle_bundle(snapshot, bundle)
 
 
 def _plan_lifecycle_bundle(snapshot, intent):
