@@ -73,10 +73,16 @@ RELEASE_0_3_1B7_IDENTITY = {
     "sourceTree": "102cc5ef820b9f7d42166012c67dfd8708e61419",
     "sourceTag": "v0.3.1b7",
 }
+RELEASE_0_3_1B8_IDENTITY = {
+    "packageVersion": "0.3.1b8",
+    "sourceCommit": "a3c92ca43c3d325b183284a54768af3be5e064b6",
+    "sourceTree": "efc7b93ec5a42cee1bc2f398ecfb779f6e8dfe38",
+    "sourceTag": "v0.3.1b8",
+}
 SUPPORTED_UPGRADE_SOURCES = (
     RELEASE_0_3_1B3_IDENTITY, RELEASE_0_3_1B4_IDENTITY,
     RELEASE_0_3_1B5_IDENTITY, RELEASE_0_3_1B6_IDENTITY,
-    RELEASE_0_3_1B7_IDENTITY,
+    RELEASE_0_3_1B7_IDENTITY, RELEASE_0_3_1B8_IDENTITY,
 )
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
 
@@ -133,9 +139,18 @@ def _migration_graph():
             {
                 "edgeId": "B7_TO_B8_VERIFY_POLICY",
                 "from": dict(RELEASE_0_3_1B7_IDENTITY),
-                "to": dict(BUILD_IDENTITY),
+                "to": dict(RELEASE_0_3_1B8_IDENTITY),
                 "preconditionId": "EXACT_B7_PROJECT",
                 "transformId": "VERIFY_POLICY",
+                "schemaAction": "NO_DDL",
+                "rollback": "BOUND_BACKUP_RESTORE",
+            },
+            {
+                "edgeId": "B8_TO_B9_ROLE_MODEL_ROUTING",
+                "from": dict(RELEASE_0_3_1B8_IDENTITY),
+                "to": dict(BUILD_IDENTITY),
+                "preconditionId": "EXACT_B8_PROJECT",
+                "transformId": "ROLE_MODEL_ROUTING",
                 "schemaAction": "NO_DDL",
                 "rollback": "BOUND_BACKUP_RESTORE",
             },
@@ -554,7 +569,7 @@ def _validate_project_contract(root):
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
                   for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1",
                               "v0.3.1b2", "v0.3.1b3", "v0.3.1b4", "v0.3.1b5",
-                 "v0.3.1b6", "v0.3.1b7", "v0.3.1b8"))):
+                              "v0.3.1b6", "v0.3.1b7", "v0.3.1b8", "v0.3.1b9"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -1140,9 +1155,9 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.1b8" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b8"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.1b8 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b9" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b9"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b9 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
@@ -1152,7 +1167,7 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
             if (database_status["usageSchemaState"] != "INSTALLED" or
                     database_status["orchestratorSchemaState"] != "INSTALLED" or
                     database_status["gatePolicySchemaState"] != "INSTALLED"):
-                raise LiteError("same-identity 0.3.1b8 project is missing a required schema extension")
+                raise LiteError("same-identity 0.3.1b9 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -1460,7 +1475,7 @@ def _write_upgrade(plan):
                     human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("0.3.1b8 no-DDL extension validation failed")
+                raise LiteError("0.3.1b9 no-DDL extension validation failed")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1947,7 +1962,7 @@ def _write_rollback(plan):
 def upgrade_project(path, wheel_path=None, with_codex=False, check=False,
                     rollback_manifest=None, expected_stale_activity=None,
                     reconciliation_request_id=None):
-    """Check, execute, or exactly roll back a bounded graph upgrade to 0.3.1b8."""
+    """Check, execute, or exactly roll back a bounded graph upgrade to 0.3.1b9."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",
@@ -2056,6 +2071,112 @@ def _codex_targets(root):
     }
 
 
+CODEX_ROUTE_CLAUSES = (
+    "Planner=`planner`/`gpt-5.6-terra`/`high`",
+    "Implementer=`implementer`/`gpt-5.6-terra`/`high`",
+    "ordinary Reviewer=\n`reviewer`/`gpt-5.6-sol`/`high`",
+    "Convergence=`reviewer`/`gpt-5.6-sol`/`max`",
+    "Fast Worker=`worker`/`gpt-5.6-luna`/`medium`",
+    "For round 4, select built-in `reviewer` with explicit `gpt-5.6-sol`/`max`",
+    "`planner` Terra/high to\n`planner` Sol/high",
+    "`implementer` Terra/high to `implementer` Sol/high",
+    "`worker` Luna/medium to `worker` Terra/high",
+    "`MODEL_ROUTE_UNAVAILABLE` / `WAITING_HUMAN`",
+    "ordinary/Convergence Reviewer downshift is\n`WAITING_HUMAN` until an explicit HUMAN decision",
+)
+
+
+_TOML_MODEL_KEYS = frozenset(("model", "model_reasoning_effort"))
+
+
+def _toml_assignment(line):
+    """Return a TOML key/value pair without confusing quoted keys/comments."""
+    quote = None
+    escaped = False
+    for index, character in enumerate(line):
+        if quote is not None:
+            if quote == '"' and escaped:
+                escaped = False
+            elif quote == '"' and character == "\\\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ("'", '"'):
+            quote = character
+        elif character == "#":
+            return None
+        elif character == "=":
+            key = line[:index].strip()
+            if key.startswith('"') and key.endswith('"'):
+                try:
+                    key = json.loads(key)
+                except ValueError:
+                    return None
+            elif key.startswith("'") and key.endswith("'"):
+                key = key[1:-1]
+            return key, line[index + 1:]
+    return None
+
+
+def _toml_assignment_key(line):
+    assignment = _toml_assignment(line)
+    return None if assignment is None else assignment[0]
+
+
+def _basic_multiline_terminates(value):
+    """TOML basic strings close only on an unescaped triple-quote delimiter."""
+    index = 0
+    while True:
+        index = value.find('"""', index)
+        if index < 0:
+            return False
+        preceding = 0
+        cursor = index - 1
+        while cursor >= 0 and value[cursor] == "\\":
+            preceding += 1
+            cursor -= 1
+        if preceding % 2 == 0:
+            return True
+        index += 3
+
+
+def _toml_multiline_starts(value):
+    value = value.lstrip()
+    if value.startswith('"""'):
+        return '"""', value[3:]
+    if value.startswith("'''"):
+        return "'''", value[3:]
+    return None, None
+
+
+def _generic_toml_model_keys(template):
+    """Find top-level generic-template model assignments across legal spacing."""
+    found = set()
+    multiline = None
+    top_level = True
+    for line in template.splitlines():
+        if multiline is not None:
+            if ((multiline == '"""' and _basic_multiline_terminates(line)) or
+                    (multiline == "'''" and multiline in line)):
+                multiline = None
+            continue
+        assignment = _toml_assignment(line)
+        if assignment is None:
+            if line.lstrip().startswith("["):
+                top_level = False
+            continue
+        key, value = assignment
+        if top_level and key in _TOML_MODEL_KEYS:
+            found.add(key)
+        delimiter, remainder = _toml_multiline_starts(value)
+        if delimiter == '"""' and not _basic_multiline_terminates(remainder):
+            multiline = delimiter
+        elif delimiter == "'''" and delimiter not in remainder:
+            multiline = delimiter
+    return found
+
+
 def codex_install(path):
     root = _project_root(path)
     targets = _codex_targets(root)
@@ -2092,6 +2213,19 @@ def codex_check(path):
             "--replacement-file" not in skill or
             "caffeinate -di" not in skill or "last active WorkItem" not in skill):
         raise LiteError("Codex Skill contract is incomplete")
+    if ("host-supported built-in child types" not in skill or
+            "fork_turns=\"none\"" not in skill or
+            any(clause not in skill for clause in CODEX_ROUTE_CLAUSES)):
+        raise LiteError("Codex role routing contract is incomplete")
+    for name in ("planner", "implementer", "reviewer", "convergence-reviewer",
+                 "fast-worker"):
+        with open(os.path.join(root, ".codex", "agents", name + ".toml"),
+                  "r", encoding="utf-8") as handle:
+            template = handle.read()
+        model_keys = _generic_toml_model_keys(template)
+        if model_keys:
+            raise LiteError("Codex generic agent template has a model override: " +
+                            name + " (" + ", ".join(sorted(model_keys)) + ")")
     with open(os.path.join(root, ".codex", "skills", "awb-orchestrator", "references",
                            "upgrade-and-rollback.md"), "r", encoding="utf-8") as handle:
         runbook = handle.read()
@@ -2099,7 +2233,7 @@ def codex_check(path):
         raise LiteError("Codex upgrade runbook contract is incomplete")
     with open(os.path.join(root, ".codex", "agents", "convergence-reviewer.toml"), "r", encoding="utf-8") as handle:
         convergence = handle.read()
-    if "gpt-5.6-sol" not in convergence or "CONVERGENCE_REVISE" not in convergence:
+    if "CONVERGENCE_REVISE" not in convergence:
         raise LiteError("convergence reviewer contract is incomplete")
     return {"status": "ok"}
 

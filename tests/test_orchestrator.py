@@ -9,6 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+from agent_workboard._build import BUILD_IDENTITY
 from agent_workboard.cli import main as cli_main
 from agent_workboard.lite import (LiteError, acquire_claim, acquire_repository_lock,
                                   create_work_item, initialize_database,
@@ -35,9 +36,10 @@ class OrchestratorCoordinationTest(unittest.TestCase):
                 "configVersion": 1, "projectId": "orchestrator-test",
                 "repositoryKey": "test-repository", "database": "workboard.db",
                 "runtimeMode": "stable", "usagePolicy": "OFF",
-                "requiredPackageVersion": "0.3.1b8",
-                "requiredSourceCommit": "test", "requiredSourceTree": "test",
-                "requiredSourceTag": "test",
+                "requiredPackageVersion": BUILD_IDENTITY["packageVersion"],
+                "requiredSourceCommit": BUILD_IDENTITY["sourceCommit"] or "test",
+                "requiredSourceTree": BUILD_IDENTITY["sourceTree"] or "test",
+                "requiredSourceTag": BUILD_IDENTITY["sourceTag"] or "test",
             }, handle)
         initialize_database(self.database)
 

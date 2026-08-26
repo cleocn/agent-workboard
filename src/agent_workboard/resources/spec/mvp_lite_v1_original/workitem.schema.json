@@ -11,15 +11,6 @@
     "title": {"type": "string", "minLength": 1, "maxLength": 200},
     "mode": {"enum": ["STANDARD", "READ_ONLY_DIAGNOSIS"]},
     "priority": {"enum": ["P0", "P1", "P2", "P3"]},
-    "target": {"enum": ["PLAN_REVIEW_PENDING", "PLAN_REVIEW_APPROVED", "IMPLEMENTATION_COMPLETED", "FINAL_ACCEPTANCE_APPROVED"]},
-    "modelOverrides": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "PLANNER": {"enum": ["balanced", "frontier"]},
-        "IMPLEMENTER": {"enum": ["balanced", "frontier"]},
-        "REVIEWER": {"enum": ["balanced", "frontier"]}
-      }
-    }
+    "target": {"enum": ["PLAN_REVIEW_PENDING", "PLAN_REVIEW_APPROVED", "IMPLEMENTATION_COMPLETED", "FINAL_ACCEPTANCE_APPROVED"]}
   }
 }

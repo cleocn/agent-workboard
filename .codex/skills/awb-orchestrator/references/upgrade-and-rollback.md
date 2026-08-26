@@ -8,9 +8,9 @@ Use this runbook only for an existing stable managed project with
 `.awb/config.json` and an exact source/target pair listed by the installed AWB
 release. The current Preview matrix supports exact released
 `0.3.1b3/v0.3.1b3`, `0.3.1b4/v0.3.1b4`, `0.3.1b5/v0.3.1b5`,
-`0.3.1b6/v0.3.1b6`, and `0.3.1b7/v0.3.1b7` identities through the frozen
-`AWB-MIGRATION-GRAPH-v1` to the exact running `0.3.1b8/v0.3.1b8` wheel, and
-an exact same-identity 0.3.1b8 no-op when
+`0.3.1b6/v0.3.1b6`, `0.3.1b7/v0.3.1b7`, and `0.3.1b8/v0.3.1b8` identities
+through the frozen `AWB-MIGRATION-GRAPH-v1` to the exact running
+`0.3.1b9/v0.3.1b9` wheel, and an exact same-identity 0.3.1b9 no-op when
 the usage, Orchestrator, and auto-gate
 schemas are installed and valid. This recovery-only hotfix performs no schema DDL.
 
@@ -77,7 +77,7 @@ single `nextStep`, then run preflight again.
 Stop for an unsupported identity/pair, source or target drift, active claim,
 repository writer, or Orchestrator lease, a missing or invalid usage,
 Orchestrator, or auto-gate extension on a supported source or same-identity
-0.3.1b8 project,
+0.3.1b9 project,
 customized/unowned/symlink Codex content, wrong project, path traversal,
 duplicate target, manifest replay, or any live/backup/staging hash drift. Do not
 delete, copy, or edit files by hand to bypass the refusal.

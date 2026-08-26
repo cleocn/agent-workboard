@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1b9 Preview
+
+- Install the accepted built-in Codex role types with explicit model and
+  reasoning-effort routing, bounded/no-history forks, upward-only promotion,
+  observable same-type fallbacks, and HUMAN-only Reviewer downshift.
+- Keep root and packaged Agent/Skill resources aligned while removing the
+  unconsumed `modelOverrides` WorkItem schema surface.
+- Extend the frozen migration graph with exact public b8 to b9 using the
+  existing backup-bound transaction and `NO_DDL` rollback contract.
+
 ## 0.3.1b8 Preview
 
 - Centralize verification defaults, classifier, registered checks and the

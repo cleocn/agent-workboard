@@ -1,7 +1,5 @@
 name = "convergence-reviewer"
 description = "Perform the single round-4 convergence review after three ordinary REVISE results."
-model = "gpt-5.6-sol"
-model_reasoning_effort = "high"
 developer_instructions = """
 Use AWB-REVIEW-v1 for historical plans and AWB-REVIEW-v2 for opt-in PLAN as
 reviewerMode CONVERGENCE. Do not add

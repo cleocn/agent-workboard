@@ -79,6 +79,38 @@ never issue a separate Reviewer `task --status` mutation. Planner and
 Implementer submission should use `workflow advance`, which atomically completes
 the task and releases its exact claim/writer bundle.
 
+## Codex role model routing
+
+Use only the host-supported built-in child types with an explicit spawn `model`
+and `reasoning_effort`: Planner=`planner`/`gpt-5.6-terra`/`high`,
+Implementer=`implementer`/`gpt-5.6-terra`/`high`, ordinary Reviewer=
+`reviewer`/`gpt-5.6-sol`/`high`, Convergence=`reviewer`/`gpt-5.6-sol`/`max`,
+and Fast Worker=`worker`/`gpt-5.6-luna`/`medium`. Root Orchestrator is a host
+launch policy of `gpt-5.6-sol`/`high`, not a child spawn.
+
+Every routed child uses `fork_turns="none"` (or a documented independently
+sufficient bounded positive value), carries only WorkItem/runtime identifiers,
+artifact and evidence locations, open Findings, acceptance and required
+evidence, and recovers details from runtime/files. Never use full-history
+inheritance. The five generic Agent TOML templates intentionally omit `model`
+and `model_reasoning_effort`; do not add competing fixed model keys or request
+an unsupported custom agent type.
+
+For round 4, select built-in `reviewer` with explicit `gpt-5.6-sol`/`max` and
+include the convergence-only review instructions in its no-history prompt;
+runtime role remains REVIEWER and reviewerMode remains CONVERGENCE. State-machine,
+migration, rollback, publication, security and multi-round-unresolved
+Planner/Implementer work retains its built-in type but requests
+`gpt-5.6-sol`/`high`. The upward-only fallbacks are `planner` Terra/high to
+`planner` Sol/high, `implementer` Terra/high to `implementer` Sol/high, and
+`worker` Luna/medium to `worker` Terra/high. Any unavailable Sol or Convergence
+request, unsupported type, rejected request, or configuration mismatch is
+`MODEL_ROUTE_UNAVAILABLE` / `WAITING_HUMAN`; record requested type, model,
+effort and reason only, never provider-effective model or private content.
+Fast Worker is never high-risk. Any ordinary/Convergence Reviewer downshift is
+`WAITING_HUMAN` until an explicit HUMAN decision gives the lower built-in route
+and reason; it is orchestration output only and does not alter AWB SQLite.
+
 Reviewer feedback is evidence, not authority to expand scope.  Route only valid
 blocking Findings to authors.  On exhaustion, project the Finding disagreement
 table, passed acceptance/tests, open Findings, consumed rounds, risks of changing
@@ -98,9 +130,9 @@ projection. LIVE resources must be released by their exact owner. STALE rows
 remain visible history and may be reconciled only through the exact public
 request-id/owner/generation command. A true FINAL transition closes all activity
 atomically; BLOCKED, WAITING_HUMAN and nonterminal HELD never imply cleanup.
-For exact b3/b4/b5/b6/b7 upgrades, consume the single recovery-aware b8 nextStep unchanged;
+For exact b3/b4/b5/b6/b7/b8 upgrades, consume the single recovery-aware b9 nextStep unchanged;
 never ask the user to edit SQLite or perform a separate stale cleanup first.
-The b8 target owns the frozen `AWB-MIGRATION-GRAPH-v1`; never infer a route from
+The b9 target owns the frozen `AWB-MIGRATION-GRAPH-v1`; never infer a route from
 version ordering or install intermediate releases.
 
 Runtime events and the current `AWB-VERIFY-RECEIPT-v1` are the process audit and

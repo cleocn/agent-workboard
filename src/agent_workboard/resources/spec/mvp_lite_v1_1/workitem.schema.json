@@ -14,15 +14,7 @@
     "humanGatePolicy": {"enum": ["AUTO_ON_PASS", "MANUAL"]},
     "creationRisk": {"$ref": "#/$defs/creationRisk"},
     "management": {"$ref": "#/$defs/management"},
-    "target": {"enum": ["PLAN_REVIEW_PENDING", "PLAN_REVIEW_APPROVED", "IMPLEMENTATION_COMPLETED", "FINAL_ACCEPTANCE_APPROVED"]},
-    "modelOverrides": {
-      "type": "object", "additionalProperties": false,
-      "properties": {
-        "PLANNER": {"enum": ["balanced", "frontier"]},
-        "IMPLEMENTER": {"enum": ["balanced", "frontier"]},
-        "REVIEWER": {"enum": ["balanced", "frontier"]}
-      }
-    }
+    "target": {"enum": ["PLAN_REVIEW_PENDING", "PLAN_REVIEW_APPROVED", "IMPLEMENTATION_COMPLETED", "FINAL_ACCEPTANCE_APPROVED"]}
   },
   "$defs": {
     "creationRisk": {
