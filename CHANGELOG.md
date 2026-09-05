@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1b10 Preview
+
+- Route the root Orchestrator, ordinary Reviewer, convergence Reviewer and
+  high-risk work to GPT-6 Astra with high/max reasoning; preserve Terra and Luna
+  defaults, upward-only fallbacks and HUMAN-only Reviewer downshift.
+- Enforce the new root and high-risk routes in installed Codex contract checks.
+- Add exact public b9 to b10 to the frozen migration graph with the existing
+  backup-bound transaction, same-b10 no-op and no schema DDL.
+
 ## 0.3.1b9 Preview
 
 - Install the accepted built-in Codex role types with explicit model and

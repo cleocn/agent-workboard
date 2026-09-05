@@ -50,9 +50,9 @@ class ProjectLifecycleTest(unittest.TestCase):
                          digest + "\n")
 
     def target_wheel(self):
-        identity = {"packageVersion": "0.3.1b9", "sourceCommit": "3" * 40,
-                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b9"}
-        path = os.path.join(self.temporary.name, "agent_workboard-0.3.1b9-py3-none-any.whl")
+        identity = {"packageVersion": "0.3.1b10", "sourceCommit": "3" * 40,
+                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b10"}
+        path = os.path.join(self.temporary.name, "agent_workboard-0.3.1b10-py3-none-any.whl")
         self.fake_wheel(path, identity, include_codex=True)
         return path, identity
 
@@ -342,6 +342,17 @@ class ProjectLifecycleTest(unittest.TestCase):
         for clause in (("host-supported built-in child types", "fork_turns=\"none\"") +
                        project_module.CODEX_ROUTE_CLAUSES):
             self.assertIn(clause, skill)
+        self.assertNotIn("gpt-5.6-sol", skill)
+        self.assertNotIn("Sol/high", skill)
+        for clause in (
+                "Root Orchestrator is a host\nlaunch policy of `gpt-6-astra`/`high`",
+                "Planner/Implementer work retains its built-in type but requests\n`gpt-6-astra`/`high`",
+                "ordinary Reviewer=\n`reviewer`/`gpt-6-astra`/`high`",
+                "Convergence=`reviewer`/`gpt-6-astra`/`max`",
+                "`worker` Luna/medium to `worker` Terra/high",
+                "`planner` Terra/high to\n`planner` Astra/high",
+                "`implementer` Terra/high to `implementer` Astra/high"):
+            self.assertIn(clause, skill)
         for name in ("planner", "implementer", "reviewer", "convergence-reviewer",
                      "fast-worker"):
             template_path = os.path.join(self.root, ".codex", "agents", name + ".toml")
@@ -351,6 +362,20 @@ class ProjectLifecycleTest(unittest.TestCase):
             self.assertEqual(pkgutil.get_data("agent_workboard", "resources/" + resource), installed)
             self.assertNotIn(b"model =", installed)
             self.assertNotIn(b"model_reasoning_effort =", installed)
+
+    def test_root_and_packaged_astra_skill_and_upgrade_runbook_match(self):
+        repository = os.path.dirname(os.path.dirname(__file__))
+        for relative in ("SKILL.md", "references/upgrade-and-rollback.md"):
+            with open(os.path.join(repository, ".codex", "skills",
+                                   "awb-orchestrator", relative), "rb") as handle:
+                root_bytes = handle.read()
+            self.assertEqual(root_bytes, pkgutil.get_data(
+                "agent_workboard", "resources/codex/skills/awb-orchestrator/" + relative))
+        runbook = root_bytes.decode("utf-8")
+        for version in range(3, 11):
+            self.assertIn("0.3.1b{0}/v0.3.1b{0}".format(version), runbook)
+        self.assertIn("exact same-identity 0.3.1b10 no-op", runbook)
+        self.assertIn("PREFLIGHT_FIRST", runbook)
 
     def test_codex_check_rejects_missing_route_clause_and_toml_model_variants(self):
         init_project(self.root, development=True)
@@ -365,6 +390,10 @@ class ProjectLifecycleTest(unittest.TestCase):
                     handle.write(original_skill.replace(clause, "", 1))
                 with self.assertRaises(LiteError):
                     codex_check(self.root)
+        with open(skill_path, "w", encoding="utf-8") as handle:
+            handle.write(original_skill.replace("gpt-6-astra", "gpt-5.6-sol"))
+        with self.assertRaises(LiteError):
+            codex_check(self.root)
         with open(skill_path, "w", encoding="utf-8") as handle:
             handle.write(original_skill)
         template_path = os.path.join(self.root, ".codex", "agents", "planner.toml")
@@ -782,9 +811,9 @@ class ProjectLifecycleTest(unittest.TestCase):
         with open(os.path.join(self.root, ".awb", "requirements-awb.txt"), "w", encoding="utf-8") as handle:
             handle.write("--require-hashes\nhttps://github.com/cleocn/agent-workboard/releases/download/v0.3.1b3/" +
                          os.path.basename(old_wheel) + "#egg=agent-workboard --hash=sha256:" + old_digest + "\n")
-        target_identity = {"packageVersion": "0.3.1b9", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b9"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b9-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b10", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b10"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b10-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity), \
                 mock.patch.object(project_module, "_is_editable", return_value=False):
@@ -799,6 +828,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                 "B6_TO_B7_STATE_RELIABILITY",
                 "B7_TO_B8_VERIFY_POLICY",
                 "B8_TO_B9_ROLE_MODEL_ROUTING",
+                "B9_TO_B10_ASTRA_MODEL_ROUTING",
             ], route["edgeIds"])
             self.assert_one_next_step(result)
             self.assertTrue(os.path.isfile(result["rollback"]["databaseBackup"]))
@@ -818,7 +848,7 @@ class ProjectLifecycleTest(unittest.TestCase):
             self.assertEqual("ok", transfer_import(imported, bundle)["status"])
             self.assertEqual("AUTO_ON_PASS", get_work_item(imported, "AWB-LEGACY")["humanGatePolicy"])
         with open(os.path.join(self.root, ".awb", "config.json"), "r", encoding="utf-8") as handle:
-            self.assertEqual("0.3.1b9", json.load(handle)["requiredPackageVersion"])
+            self.assertEqual("0.3.1b10", json.load(handle)["requiredPackageVersion"])
 
     def test_exact_0_3_1b3_source_upgrades_and_rolls_back_missing_usage_policy_bytes(self):
         old_wheel = self.prepare_old_project(
@@ -877,6 +907,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                 "B6_TO_B7_STATE_RELIABILITY",
                 "B7_TO_B8_VERIFY_POLICY",
                 "B8_TO_B9_ROLE_MODEL_ROUTING",
+                "B9_TO_B10_ASTRA_MODEL_ROUTING",
             ], next(value for value in checked["evidence"]
                     if value["id"] == "MIGRATION_ROUTE")["edgeIds"])
             upgraded = upgrade_project(self.root, target_wheel)
@@ -917,6 +948,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                     "B6_TO_B7_STATE_RELIABILITY",
                     "B7_TO_B8_VERIFY_POLICY",
                     "B8_TO_B9_ROLE_MODEL_ROUTING",
+                    "B9_TO_B10_ASTRA_MODEL_ROUTING",
                 ], next(value for value in checked["evidence"]
                         if value["id"] == "MIGRATION_ROUTE")["edgeIds"])
                 arguments = checked["nextStep"]["arguments"]
@@ -968,6 +1000,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                 "B5_TO_B6_FINDING_CORRECTION", "B6_TO_B7_STATE_RELIABILITY",
                 "B7_TO_B8_VERIFY_POLICY",
                 "B8_TO_B9_ROLE_MODEL_ROUTING",
+                "B9_TO_B10_ASTRA_MODEL_ROUTING",
             ], route["edgeIds"])
             upgraded = upgrade_project(self.root, target_wheel)
             self.assertEqual("OK", upgraded["status"])
@@ -1004,7 +1037,8 @@ class ProjectLifecycleTest(unittest.TestCase):
                          if value["id"] == "MIGRATION_ROUTE")
             self.assertEqual(["B6_TO_B7_STATE_RELIABILITY",
                               "B7_TO_B8_VERIFY_POLICY",
-                              "B8_TO_B9_ROLE_MODEL_ROUTING"], route["edgeIds"])
+                              "B8_TO_B9_ROLE_MODEL_ROUTING",
+                              "B9_TO_B10_ASTRA_MODEL_ROUTING"], route["edgeIds"])
             upgraded = upgrade_project(self.root, target_wheel)
             self.assertEqual("OK", upgraded["status"])
             rolled_back = upgrade_project(
@@ -1032,7 +1066,8 @@ class ProjectLifecycleTest(unittest.TestCase):
             route = next(value for value in checked["evidence"]
                          if value["id"] == "MIGRATION_ROUTE")
             self.assertEqual(["B7_TO_B8_VERIFY_POLICY",
-                              "B8_TO_B9_ROLE_MODEL_ROUTING"], route["edgeIds"])
+                              "B8_TO_B9_ROLE_MODEL_ROUTING",
+                              "B9_TO_B10_ASTRA_MODEL_ROUTING"], route["edgeIds"])
             upgraded = upgrade_project(self.root, target_wheel)
             self.assertEqual("OK", upgraded["status"])
             rolled_back = upgrade_project(
@@ -1045,7 +1080,7 @@ class ProjectLifecycleTest(unittest.TestCase):
             for name in project_module.MANAGED
         })
 
-    def test_exact_b8_direct_upgrade_rollback_and_same_b9_noop(self):
+    def test_exact_b8_direct_upgrade_rollback_and_same_b10_noop(self):
         old_wheel = self.prepare_old_project(
             source_identity=project_module.RELEASE_0_3_1B8_IDENTITY
         )
@@ -1060,11 +1095,58 @@ class ProjectLifecycleTest(unittest.TestCase):
             self.assertEqual("EXECUTE_UPGRADE", checked["nextStep"]["action"])
             route = next(value for value in checked["evidence"]
                          if value["id"] == "MIGRATION_ROUTE")
-            self.assertEqual(["B8_TO_B9_ROLE_MODEL_ROUTING"], route["edgeIds"])
+            self.assertEqual(["B8_TO_B9_ROLE_MODEL_ROUTING",
+                              "B9_TO_B10_ASTRA_MODEL_ROUTING"], route["edgeIds"])
             edges, unused_fingerprint = project_module._migration_route(
                 project_module.RELEASE_0_3_1B8_IDENTITY, target_identity,
             )
+            self.assertEqual(["NO_DDL", "NO_DDL"], [edge["schemaAction"] for edge in edges])
+            upgraded = upgrade_project(self.root, target_wheel)
+            self.assertEqual("OK", upgraded["status"])
+            same = upgrade_project(self.root, target_wheel, check=True)
+            self.assertEqual("NO_OP", same["status"])
+            self.assertEqual({"action": "NONE", "arguments": {}}, same["nextStep"])
+            rollback_check = upgrade_project(
+                self.root, rollback_manifest=upgraded["rollback"]["manifest"],
+                check=True,
+            )
+            self.assertEqual("READY", rollback_check["status"])
+            rolled_back = upgrade_project(
+                self.root, rollback_manifest=upgraded["rollback"]["manifest"]
+            )
+        self.assertEqual("OK", rolled_back["status"])
+        self.assertEqual(old_wheel, rolled_back["nextStep"]["arguments"]["wheel"])
+        self.assertEqual(managed_before, {
+            name: self.read_bytes(os.path.join(self.root, ".awb", name))
+            for name in project_module.MANAGED
+        })
+
+    def test_exact_b9_direct_upgrade_rollback_and_same_b10_noop(self):
+        old_wheel = self.prepare_old_project(
+            source_identity=project_module.RELEASE_0_3_1B9_IDENTITY
+        )
+        managed_before = {
+            name: self.read_bytes(os.path.join(self.root, ".awb", name))
+            for name in project_module.MANAGED
+        }
+        target_wheel, target_identity = self.target_wheel()
+        with mock.patch.object(project_module, "BUILD_IDENTITY", target_identity):
+            checked = upgrade_project(self.root, target_wheel, check=True)
+            self.assertEqual("READY", checked["status"])
+            self.assertEqual("EXECUTE_UPGRADE", checked["nextStep"]["action"])
+            route = next(value for value in checked["evidence"]
+                         if value["id"] == "MIGRATION_ROUTE")
+            self.assertEqual(["B9_TO_B10_ASTRA_MODEL_ROUTING"], route["edgeIds"])
+            edges, unused_fingerprint = project_module._migration_route(
+                project_module.RELEASE_0_3_1B9_IDENTITY, target_identity,
+            )
             self.assertEqual(["NO_DDL"], [edge["schemaAction"] for edge in edges])
+            self.assertEqual("EXACT_B9_PROJECT", edges[0]["preconditionId"])
+            self.assertEqual("ASTRA_MODEL_ROUTING", edges[0]["transformId"])
+            self.assertEqual("BOUND_BACKUP_RESTORE", edges[0]["rollback"])
+            drift = dict(project_module.RELEASE_0_3_1B9_IDENTITY, sourceTree="f" * 40)
+            with self.assertRaisesRegex(LiteError, "MIGRATION_ROUTE_MISSING"):
+                project_module._migration_route(drift, target_identity)
             upgraded = upgrade_project(self.root, target_wheel)
             self.assertEqual("OK", upgraded["status"])
             same = upgrade_project(self.root, target_wheel, check=True)
@@ -1092,7 +1174,7 @@ class ProjectLifecycleTest(unittest.TestCase):
             route, fingerprint = project_module._migration_route(
                 project_module.RELEASE_0_3_1B3_IDENTITY, target_identity,
             )
-            self.assertEqual(6, len(route))
+            self.assertEqual(7, len(route))
             self.assertEqual(64, len(fingerprint))
             missing = dict(graph)
             missing["edges"] = list(graph["edges"][:-1])
@@ -1114,9 +1196,9 @@ class ProjectLifecycleTest(unittest.TestCase):
 
     def test_upgrade_refuses_customized_codex_without_changing_contract(self):
         self.prepare_old_project(with_codex=True)
-        target_identity = {"packageVersion": "0.3.1b9", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b9"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b9-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b10", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b10"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b10-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         config_path = os.path.join(self.root, ".awb", "config.json")
         with open(config_path, "rb") as handle:
@@ -1597,9 +1679,9 @@ class ProjectLifecycleTest(unittest.TestCase):
         create_work_item(database, "AWB-777", "AWB", "active", management=self.management("AWB-777"))
         acquire_claim(database, "AWB-777", "AWB-777-T01", "planner", "PLANNER",
                       "2099-01-01T00:00:00+00:00")
-        target_identity = {"packageVersion": "0.3.1b9", "sourceCommit": "3" * 40,
-                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b9"}
-        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b9-py3-none-any.whl")
+        target_identity = {"packageVersion": "0.3.1b10", "sourceCommit": "3" * 40,
+                           "sourceTree": "4" * 40, "sourceTag": "v0.3.1b10"}
+        target_wheel = os.path.join(self.temporary.name, "agent_workboard-0.3.1b10-py3-none-any.whl")
         self.fake_wheel(target_wheel, target_identity)
         config_path = os.path.join(self.root, ".awb", "config.json")
         with open(config_path, "rb") as handle:
@@ -1821,7 +1903,7 @@ class ProjectLifecycleTest(unittest.TestCase):
 
     def test_real_pip_wheel_init_and_doctor_work_from_an_unrelated_directory(self):
         repository = os.path.dirname(os.path.dirname(__file__))
-        wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b9-py3-none-any.whl")
+        wheel = os.path.join(repository, "dist", "agent_workboard-0.3.1b10-py3-none-any.whl")
         self.assertTrue(os.path.isfile(wheel), "final candidate wheel must be present for this lifecycle test")
         with tempfile.TemporaryDirectory() as temporary:
             environment = dict(os.environ)
@@ -1842,7 +1924,7 @@ class ProjectLifecycleTest(unittest.TestCase):
                 os.unlink(direct_url)
             subprocess.check_call([awb, "init", "--project", project], cwd=unrelated, env=environment)
             subprocess.check_call([awb, "doctor", "--project", project], cwd=unrelated, env=environment)
-            artifact = os.path.join(project, ".awb", "artifacts", "agent_workboard-0.3.1b9-py3-none-any.whl")
+            artifact = os.path.join(project, ".awb", "artifacts", "agent_workboard-0.3.1b10-py3-none-any.whl")
             requirements = os.path.join(project, ".awb", "requirements-awb.txt")
             self.assertTrue(os.path.isfile(artifact))
             with open(requirements, encoding="utf-8") as handle:
@@ -1869,17 +1951,17 @@ class ProjectLifecycleTest(unittest.TestCase):
     def test_installed_wheel_rebuild_accepts_only_owned_nested_empty_cache_rows(self):
         installation = os.path.join(self.temporary.name, "installed")
         package = os.path.join(installation, "agent_workboard")
-        metadata = os.path.join(installation, "agent_workboard-0.3.1b9.dist-info")
+        metadata = os.path.join(installation, "agent_workboard-0.3.1b10.dist-info")
         os.makedirs(os.path.join(package, "usage_adapters", "nested", "__pycache__"))
         os.makedirs(metadata)
-        identity = {"packageVersion": "0.3.1b9", "sourceCommit": "3" * 40,
-                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b9"}
+        identity = {"packageVersion": "0.3.1b10", "sourceCommit": "3" * 40,
+                    "sourceTree": "4" * 40, "sourceTag": "v0.3.1b10"}
         files = {
             "agent_workboard/__init__.py": b"",
             "agent_workboard/_build.py": ("BUILD_IDENTITY = " + repr(identity) + "\n").encode("utf-8"),
-            "agent_workboard-0.3.1b9.dist-info/METADATA":
-                b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b9\n\n",
-            "agent_workboard-0.3.1b9.dist-info/WHEEL":
+            "agent_workboard-0.3.1b10.dist-info/METADATA":
+                b"Metadata-Version: 2.1\nName: agent-workboard\nVersion: 0.3.1b10\n\n",
+            "agent_workboard-0.3.1b10.dist-info/WHEEL":
                 b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         }
         for relative, raw in files.items():
@@ -1905,7 +1987,7 @@ class ProjectLifecycleTest(unittest.TestCase):
         record = os.path.join(metadata, "RECORD")
         base_rows = [hashed_row(relative) for relative in sorted(files)]
         base_rows.extend([[relative, "", ""] for relative in caches])
-        base_rows.append(["agent_workboard-0.3.1b9.dist-info/RECORD", "", ""])
+        base_rows.append(["agent_workboard-0.3.1b10.dist-info/RECORD", "", ""])
 
         def write_rows(rows):
             import csv

@@ -79,10 +79,17 @@ RELEASE_0_3_1B8_IDENTITY = {
     "sourceTree": "efc7b93ec5a42cee1bc2f398ecfb779f6e8dfe38",
     "sourceTag": "v0.3.1b8",
 }
+RELEASE_0_3_1B9_IDENTITY = {
+    "packageVersion": "0.3.1b9",
+    "sourceCommit": "98d063c73171739fe1722a1d21e8180f72ee6b63",
+    "sourceTree": "94208789a5981d7c7570ce8a26d34a1a9b5dbb92",
+    "sourceTag": "v0.3.1b9",
+}
 SUPPORTED_UPGRADE_SOURCES = (
     RELEASE_0_3_1B3_IDENTITY, RELEASE_0_3_1B4_IDENTITY,
     RELEASE_0_3_1B5_IDENTITY, RELEASE_0_3_1B6_IDENTITY,
     RELEASE_0_3_1B7_IDENTITY, RELEASE_0_3_1B8_IDENTITY,
+    RELEASE_0_3_1B9_IDENTITY,
 )
 IDENTITY_KEYS = ("packageVersion", "sourceCommit", "sourceTree", "sourceTag")
 
@@ -148,9 +155,18 @@ def _migration_graph():
             {
                 "edgeId": "B8_TO_B9_ROLE_MODEL_ROUTING",
                 "from": dict(RELEASE_0_3_1B8_IDENTITY),
-                "to": dict(BUILD_IDENTITY),
+                "to": dict(RELEASE_0_3_1B9_IDENTITY),
                 "preconditionId": "EXACT_B8_PROJECT",
                 "transformId": "ROLE_MODEL_ROUTING",
+                "schemaAction": "NO_DDL",
+                "rollback": "BOUND_BACKUP_RESTORE",
+            },
+            {
+                "edgeId": "B9_TO_B10_ASTRA_MODEL_ROUTING",
+                "from": dict(RELEASE_0_3_1B9_IDENTITY),
+                "to": dict(BUILD_IDENTITY),
+                "preconditionId": "EXACT_B9_PROJECT",
+                "transformId": "ASTRA_MODEL_ROUTING",
                 "schemaAction": "NO_DDL",
                 "rollback": "BOUND_BACKUP_RESTORE",
             },
@@ -569,7 +585,7 @@ def _validate_project_contract(root):
           not any(parsed.path.startswith("/cleocn/agent-workboard/releases/download/{0}/".format(tag))
                   for tag in ("v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0b1", "v0.3.1b1",
                               "v0.3.1b2", "v0.3.1b3", "v0.3.1b4", "v0.3.1b5",
-                              "v0.3.1b6", "v0.3.1b7", "v0.3.1b8", "v0.3.1b9"))):
+                              "v0.3.1b6", "v0.3.1b7", "v0.3.1b8", "v0.3.1b9", "v0.3.1b10"))):
         raise LiteError("requirements-awb.txt is not an approved release wheel URL")
     try:
         with open(os.path.join(_awb(root), "project.md"), "r", encoding="utf-8") as handle:
@@ -1155,9 +1171,9 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
         target_wheel = os.path.realpath(original_wheel)
         target_identity = _wheel_identity(target_wheel)
         if (target_identity != BUILD_IDENTITY or
-                BUILD_IDENTITY.get("packageVersion") != "0.3.1b9" or
-                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b9"):
-            raise LiteError("upgrade target wheel does not match the running 0.3.1b9 Preview release")
+                BUILD_IDENTITY.get("packageVersion") != "0.3.1b10" or
+                BUILD_IDENTITY.get("sourceTag") != "v0.3.1b10"):
+            raise LiteError("upgrade target wheel does not match the running 0.3.1b10 Preview release")
         target_digest = _file_sha(target_wheel)
         evidence.append({"id": "TARGET_WHEEL", "status": "PASS", "sha256": target_digest})
         database_status = _database_preflight(database)
@@ -1167,7 +1183,7 @@ def _upgrade_preflight(path, wheel_path, with_codex, operation,
             if (database_status["usageSchemaState"] != "INSTALLED" or
                     database_status["orchestratorSchemaState"] != "INSTALLED" or
                     database_status["gatePolicySchemaState"] != "INSTALLED"):
-                raise LiteError("same-identity 0.3.1b9 project is missing a required schema extension")
+                raise LiteError("same-identity 0.3.1b10 project is missing a required schema extension")
             result = _upgrade_envelope(
                 operation, "NO_OP", root, current_identity, target_identity,
                 applicability="NO_OP", evidence=evidence,
@@ -1475,7 +1491,7 @@ def _write_upgrade(plan):
                     human_gate_schema_state(connection) != "INSTALLED" or
                     connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or
                     connection.execute("PRAGMA foreign_key_check").fetchall()):
-                raise LiteError("0.3.1b9 no-DDL extension validation failed")
+                raise LiteError("0.3.1b10 no-DDL extension validation failed")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1962,7 +1978,7 @@ def _write_rollback(plan):
 def upgrade_project(path, wheel_path=None, with_codex=False, check=False,
                     rollback_manifest=None, expected_stale_activity=None,
                     reconciliation_request_id=None):
-    """Check, execute, or exactly roll back a bounded graph upgrade to 0.3.1b9."""
+    """Check, execute, or exactly roll back a bounded graph upgrade to 0.3.1b10."""
     if bool(wheel_path) == bool(rollback_manifest):
         return _upgrade_refused("CHECK" if check else "UPGRADE", _project_root(path),
                                  "exactly one of wheel or rollback manifest is required",
@@ -2074,12 +2090,15 @@ def _codex_targets(root):
 CODEX_ROUTE_CLAUSES = (
     "Planner=`planner`/`gpt-5.6-terra`/`high`",
     "Implementer=`implementer`/`gpt-5.6-terra`/`high`",
-    "ordinary Reviewer=\n`reviewer`/`gpt-5.6-sol`/`high`",
-    "Convergence=`reviewer`/`gpt-5.6-sol`/`max`",
+    "ordinary Reviewer=\n`reviewer`/`gpt-6-astra`/`high`",
+    "Convergence=`reviewer`/`gpt-6-astra`/`max`",
     "Fast Worker=`worker`/`gpt-5.6-luna`/`medium`",
-    "For round 4, select built-in `reviewer` with explicit `gpt-5.6-sol`/`max`",
-    "`planner` Terra/high to\n`planner` Sol/high",
-    "`implementer` Terra/high to `implementer` Sol/high",
+    "Root Orchestrator is a host\nlaunch policy of `gpt-6-astra`/`high`",
+    "Planner/Implementer work retains its built-in type but requests\n`gpt-6-astra`/`high`",
+    "Any unavailable Astra or Convergence",
+    "For round 4, select built-in `reviewer` with explicit `gpt-6-astra`/`max`",
+    "`planner` Terra/high to\n`planner` Astra/high",
+    "`implementer` Terra/high to `implementer` Astra/high",
     "`worker` Luna/medium to `worker` Terra/high",
     "`MODEL_ROUTE_UNAVAILABLE` / `WAITING_HUMAN`",
     "ordinary/Convergence Reviewer downshift is\n`WAITING_HUMAN` until an explicit HUMAN decision",
